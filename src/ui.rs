@@ -1,3 +1,4 @@
+use edtui::{EditorTheme, EditorView, LineNumbers, SyntaxHighlighter};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -14,12 +15,12 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(1)])
-        .split(f.size());
+        .split(f.area());
 
-    let acsent_color = Color::LightGreen;
+    let accent_color = Color::LightGreen;
     let normal_style = Style::default().fg(Color::White);
     let active_style = Style::default()
-        .fg(acsent_color)
+        .fg(accent_color)
         .add_modifier(Modifier::BOLD);
 
     // Top section
@@ -29,24 +30,25 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 
     let title = Paragraph::new(Text::styled(
         format!("File path: {}", app.file_path),
-        Style::default().fg(acsent_color),
+        Style::default().fg(accent_color),
     ))
     .block(title_block);
 
     f.render_widget(title, chunks[0]);
 
-    // Middle section - JSON pairs
+    // Middle section
     let sections = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(chunks[1]);
 
+    // Tree widget
     let tree_widget = Tree::new(&app.tree_items)
         .expect("all item identifiers are unique")
         .block(
             Block::bordered()
                 .title("Document Inspector")
-                .title_top(Line::from("[Ctrl+2]").right_aligned())
+                .title_top(Line::from("[Tab]").right_aligned())
                 .border_style(if app.current_widget == CurrentWidget::Tree {
                     active_style
                 } else {
@@ -62,23 +64,34 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         .highlight_style(
             Style::new()
                 .fg(Color::Black)
-                .bg(acsent_color)
+                .bg(accent_color)
                 .add_modifier(Modifier::BOLD),
         );
 
     f.render_stateful_widget(tree_widget, sections[0], &mut app.tree_state);
 
-    app.textarea.set_block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("File content")
-            .title_top(Line::from("[Ctrl+3]").right_aligned())
-            .border_style(if app.current_widget == CurrentWidget::TextArea {
-                active_style
-            } else {
-                normal_style
-            }),
-    );
+    // Editor widget with XML syntax highlighting
+    let editor_block = Block::default()
+        .borders(Borders::ALL)
+        .title("File content [Vim mode]")
+        .title_top(Line::from("[Tab]").right_aligned())
+        .border_style(if app.current_widget == CurrentWidget::TextArea {
+            active_style
+        } else {
+            normal_style
+        });
 
-    f.render_widget(app.textarea.widget(), sections[1]);
+    let theme = EditorTheme::default()
+        .block(editor_block)
+        .cursor_style(Style::default().bg(accent_color).fg(Color::Black))
+        .selection_style(Style::default().bg(Color::LightYellow).fg(Color::Black));
+
+    let syntax_highlighter = SyntaxHighlighter::new("dracula", "xml").ok();
+
+    let editor_view = EditorView::new(&mut app.editor_state)
+        .theme(theme)
+        .line_numbers(LineNumbers::Absolute)
+        .syntax_highlighter(syntax_highlighter);
+
+    f.render_widget(editor_view, sections[1]);
 }
