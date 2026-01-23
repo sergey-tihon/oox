@@ -1,6 +1,6 @@
 use std::io::{self, Read};
 
-use tui_textarea::TextArea;
+use edtui::{EditorState, Lines};
 use tui_tree_widget::{TreeItem, TreeState};
 use xml::{EmitterConfig, EventReader};
 
@@ -38,7 +38,7 @@ pub struct App {
     pub root: Node,
     pub tree_state: TreeState<String>,
     pub tree_items: Vec<TreeItem<'static, String>>,
-    pub textarea: TextArea<'static>,
+    pub editor_state: EditorState,
     pub current_widget: CurrentWidget,
 }
 
@@ -67,7 +67,7 @@ impl App {
             root,
             tree_state: TreeState::default(),
             tree_items,
-            textarea: TextArea::default(),
+            editor_state: EditorState::default(),
             current_widget: CurrentWidget::Tree,
         })
     }
@@ -88,7 +88,7 @@ impl App {
             entry.read_to_string(&mut buf)?;
 
             let formatted = Self::pretty_print_xml(&buf)?;
-            self.textarea = formatted.lines().collect();
+            self.editor_state = EditorState::new(Lines::from(formatted.as_str()));
         }
 
         Ok(())

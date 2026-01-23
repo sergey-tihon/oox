@@ -4,9 +4,9 @@ version = "0.1.1"
 edition = "2021"
 
 [dependencies]
-crossterm = "0.28.1"
-ratatui = "0.29.0"
-tui-tree-widget = "0.23.0"
-tui-textarea = "0.7.0"
-zip = "2.1.2"
-xml-rs = "0.8.20"
+crossterm = "0.29"
+ratatui = "0.30"
+tui-tree-widget = "0.24"
+edtui = { version = "0.11", features = ["syntax-highlighting"] }
+zip = "7.2"
+xml-rs = "1.0"
