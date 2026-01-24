@@ -1,4 +1,4 @@
-use edtui::{EditorTheme, EditorView, LineNumbers, SyntaxHighlighter};
+use edtui::{EditorStatusLine, EditorTheme, EditorView, LineNumbers, SyntaxHighlighter};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -81,10 +81,18 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             normal_style
         });
 
+    let status_line = EditorStatusLine::default()
+        .style_mode(Style::default().fg(Color::Black).bg(accent_color).bold())
+        .style_search(Style::default().fg(Color::White))
+        .style_line(Style::default());
+
     let theme = EditorTheme::default()
+        .base(Style::default())
         .block(editor_block)
         .cursor_style(Style::default().bg(accent_color).fg(Color::Black))
-        .selection_style(Style::default().bg(Color::LightYellow).fg(Color::Black));
+        .selection_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .line_numbers_style(Style::default().fg(Color::DarkGray))
+        .status_line(status_line);
 
     let syntax_highlighter = SyntaxHighlighter::new("dracula", "xml").ok();
 
