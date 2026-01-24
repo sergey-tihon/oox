@@ -1,4 +1,4 @@
-use std::{error::Error, io};
+use std::{env, error::Error, io};
 
 use app::{App, CurrentWidget};
 use crossterm::{
@@ -13,6 +13,12 @@ mod app;
 mod ui;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = env::args().collect();
+    let filename = args
+        .get(1)
+        .map(|s| s.as_str())
+        .unwrap_or("data/sample.pptx");
+
     // setup terminal
     enable_raw_mode()?;
     let mut stderr = io::stderr();
@@ -21,7 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // create app and run it
-    let mut app = App::from_file("data/sample.pptx".to_string())?;
+    let mut app = App::from_file(filename.to_string())?;
     let mut editor_handler = EditorEventHandler::default();
     run_app(&mut terminal, &mut app, &mut editor_handler)?;
 

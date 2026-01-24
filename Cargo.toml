@@ -3,6 +3,10 @@ name = "ooxml-tui"
 version = "0.1.1"
 edition = "2021"
 
+[[bin]]
+name = "ooxml"
+path = "src/main.rs"
+
 [dependencies]
 crossterm = "0.29"
 ratatui = "0.30"
