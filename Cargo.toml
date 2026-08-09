@@ -4,13 +4,15 @@ version = "0.1.1"
 edition = "2021"
 
 [[bin]]
-name = "ooxml"
+name = "oox"
 path = "src/main.rs"
 
 [dependencies]
 crossterm = "0.29"
 ratatui = "0.30"
 tui-tree-widget = "0.24"
-edtui = { version = "0.11", features = ["syntax-highlighting"] }
-zip = "8.6"
-xml-rs = "1.0"
+edtui = { version = "0.11", default-features = false, features = ["syntax-highlighting"] }
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+quick-xml = "0.41"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+ratatui-image = { version = "11.0", default-features = false, features = ["crossterm"] }

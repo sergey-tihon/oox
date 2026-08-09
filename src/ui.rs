@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
+use ratatui_image::{Resize, StatefulImage};
 use tui_tree_widget::Tree;
 
 use crate::app::{App, CurrentWidget};
@@ -101,5 +102,22 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         .line_numbers(LineNumbers::Absolute)
         .syntax_highlighter(syntax_highlighter);
 
-    f.render_widget(editor_view, sections[1]);
+    if let Some(image_state) = app.image_state.as_mut() {
+        let image_block = Block::default()
+            .borders(Borders::ALL)
+            .title("Image preview")
+            .title_top(Line::from("[Tab]").right_aligned())
+            .border_style(if app.current_widget == CurrentWidget::TextArea {
+                active_style
+            } else {
+                normal_style
+            });
+        let image_area = image_block.inner(sections[1]);
+        f.render_widget(image_block, sections[1]);
+
+        let image = StatefulImage::default().resize(Resize::Fit(None));
+        f.render_stateful_widget(image, image_area, image_state);
+    } else {
+        f.render_widget(editor_view, sections[1]);
+    }
 }

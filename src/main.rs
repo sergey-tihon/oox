@@ -8,6 +8,7 @@ use crossterm::{
 };
 use edtui::{EditorEventHandler, EditorMode};
 use ratatui::prelude::*;
+use ratatui_image::picker::Picker;
 
 mod app;
 mod ui;
@@ -27,7 +28,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // create app and run it
-    let mut app = App::from_file(filename.to_string())?;
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let mut app = App::from_file(filename.to_string(), picker)?;
     let mut editor_handler = EditorEventHandler::default();
     run_app(&mut terminal, &mut app, &mut editor_handler)?;
 
