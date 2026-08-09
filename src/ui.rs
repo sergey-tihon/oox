@@ -44,32 +44,39 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         .split(chunks[1]);
 
     // Tree widget
-    let tree_widget = Tree::new(&app.tree_items)
-        .expect("all item identifiers are unique")
-        .block(
-            Block::bordered()
-                .title("Document Inspector")
-                .title_top(Line::from("[Tab]").right_aligned())
-                .border_style(if app.current_widget == CurrentWidget::Tree {
-                    active_style
-                } else {
-                    normal_style
-                }),
-        )
-        .experimental_scrollbar(Some(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .track_symbol(None)
-                .end_symbol(None),
-        ))
-        .highlight_style(
-            Style::new()
-                .fg(Color::Black)
-                .bg(accent_color)
-                .add_modifier(Modifier::BOLD),
-        );
+    let tree_block = Block::bordered()
+        .title("Document Inspector")
+        .title_top(Line::from("[Tab]").right_aligned())
+        .border_style(if app.current_widget == CurrentWidget::Tree {
+            active_style
+        } else {
+            normal_style
+        });
 
-    f.render_stateful_widget(tree_widget, sections[0], &mut app.tree_state);
+    match Tree::new(&app.tree_items) {
+        Ok(tree_widget) => {
+            let tree_widget = tree_widget
+                .block(tree_block)
+                .experimental_scrollbar(Some(
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .begin_symbol(None)
+                        .track_symbol(None)
+                        .end_symbol(None),
+                ))
+                .highlight_style(
+                    Style::new()
+                        .fg(Color::Black)
+                        .bg(accent_color)
+                        .add_modifier(Modifier::BOLD),
+                );
+            f.render_stateful_widget(tree_widget, sections[0], &mut app.tree_state);
+        }
+        Err(error) => {
+            let message = Paragraph::new(format!("Unable to render document tree: {error}"))
+                .block(tree_block);
+            f.render_widget(message, sections[0]);
+        }
+    }
 
     // Editor widget with XML syntax highlighting
     let editor_block = Block::default()
@@ -81,26 +88,6 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         } else {
             normal_style
         });
-
-    let status_line = EditorStatusLine::default()
-        .style_mode(Style::default().fg(Color::Black).bg(accent_color).bold())
-        .style_search(Style::default().fg(Color::White))
-        .style_line(Style::default());
-
-    let theme = EditorTheme::default()
-        .base(Style::default())
-        .block(editor_block)
-        .cursor_style(Style::default().bg(accent_color).fg(Color::Black))
-        .selection_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-        .line_numbers_style(Style::default().fg(Color::DarkGray))
-        .status_line(status_line);
-
-    let syntax_highlighter = SyntaxHighlighter::new("dracula", "xml").ok();
-
-    let editor_view = EditorView::new(&mut app.editor_state)
-        .theme(theme)
-        .line_numbers(LineNumbers::Absolute)
-        .syntax_highlighter(syntax_highlighter);
 
     if let Some(image_state) = app.image_state.as_mut() {
         let image_block = Block::default()
@@ -117,7 +104,30 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 
         let image = StatefulImage::default().resize(Resize::Fit(None));
         f.render_stateful_widget(image, image_area, image_state);
+    } else if let Some(message) = app.status_message.as_deref() {
+        let message = Paragraph::new(message)
+            .block(editor_block)
+            .style(Style::default().fg(Color::Yellow));
+        f.render_widget(message, sections[1]);
     } else {
+        let status_line = EditorStatusLine::default()
+            .style_mode(Style::default().fg(Color::Black).bg(accent_color).bold())
+            .style_search(Style::default().fg(Color::White))
+            .style_line(Style::default());
+
+        let theme = EditorTheme::default()
+            .base(Style::default())
+            .block(editor_block)
+            .cursor_style(Style::default().bg(accent_color).fg(Color::Black))
+            .selection_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+            .line_numbers_style(Style::default().fg(Color::DarkGray))
+            .status_line(status_line);
+
+        let syntax_highlighter = SyntaxHighlighter::new("dracula", "xml").ok();
+        let editor_view = EditorView::new(&mut app.editor_state)
+            .theme(theme)
+            .line_numbers(LineNumbers::Absolute)
+            .syntax_highlighter(syntax_highlighter);
         f.render_widget(editor_view, sections[1]);
     }
 }
