@@ -21,18 +21,6 @@ impl Node {
             children: Vec::<Self>::new(),
         }
     }
-
-    fn find_child(&mut self, name: &str) -> Option<&mut Self> {
-        self.children.iter_mut().find(|c| c.name == name)
-    }
-
-    fn add_child<T>(&mut self, leaf: T) -> &mut Self
-    where
-        T: Into<Self>,
-    {
-        self.children.push(leaf.into());
-        self
-    }
 }
 
 pub struct App {
@@ -63,7 +51,7 @@ impl App {
             App::build_tree(&mut root, &path, 0);
         }
 
-        let tree_items = App::create_tree(&root);
+        let tree_items = App::create_tree(&root)?;
 
         Ok(Self {
             file_path: path,
@@ -157,38 +145,33 @@ impl App {
         String::from_utf8(output).map_err(io::Error::other)
     }
 
-    fn build_tree(node: &mut Node, parts: &Vec<&str>, depth: usize) {
+    fn build_tree(node: &mut Node, parts: &[&str], depth: usize) {
         if depth < parts.len() {
-            let item = &parts[depth];
-
-            let dir = match node.find_child(item) {
-                Some(d) => d,
+            let item = parts[depth];
+            let child_index = match node.children.iter().position(|child| child.name == item) {
+                Some(index) => index,
                 None => {
-                    let path = node.path.to_owned() + "/" + item;
-                    let d = Node::new(item, &path);
-                    node.add_child(d);
-                    match node.find_child(item) {
-                        Some(d2) => d2,
-                        None => panic!("Got here!"),
-                    }
+                    let path = format!("{}/{}", node.path, item);
+                    node.children.push(Node::new(item, &path));
+                    node.children.len() - 1
                 }
             };
-            App::build_tree(dir, parts, depth + 1);
+            App::build_tree(&mut node.children[child_index], parts, depth + 1);
         }
     }
 
-    fn create_tree(root: &Node) -> Vec<TreeItem<'static, String>> {
-        fn to_tree_item(node: &Node) -> TreeItem<'static, String> {
+    fn create_tree(root: &Node) -> io::Result<Vec<TreeItem<'static, String>>> {
+        fn to_tree_item(node: &Node) -> io::Result<TreeItem<'static, String>> {
             let text = node.name.to_owned();
             let identifier = node.path.to_owned();
 
             if node.children.is_empty() {
-                TreeItem::new_leaf(identifier, text)
+                Ok(TreeItem::new_leaf(identifier, text))
             } else {
-                TreeItem::new(identifier, text, parse_children(node)).unwrap()
+                TreeItem::new(identifier, text, parse_children(node)?).map_err(io::Error::other)
             }
         }
-        fn parse_children(node: &Node) -> Vec<TreeItem<'static, String>> {
+        fn parse_children(node: &Node) -> io::Result<Vec<TreeItem<'static, String>>> {
             node.children.iter().map(to_tree_item).collect()
         }
 

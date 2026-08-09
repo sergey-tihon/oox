@@ -1,4 +1,6 @@
-use std::{env, error::Error, io};
+use std::{error::Error, io, path::PathBuf};
+
+use clap::Parser;
 
 use app::{App, CurrentWidget};
 use crossterm::{
@@ -13,27 +15,37 @@ use ratatui_image::picker::Picker;
 mod app;
 mod ui;
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = env::args().collect();
-    let filename = args
-        .get(1)
-        .map(|s| s.as_str())
-        .unwrap_or("data/sample.pptx");
+#[derive(Debug, Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// OOXML document to inspect
+    #[arg(value_name = "FILE", default_value = "data/sample.pptx")]
+    file: PathBuf,
+}
 
-    // setup terminal
+fn main() -> Result<(), Box<dyn Error>> {
+    let cli = Cli::parse();
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let mut app = App::from_file(cli.file.to_string_lossy().into_owned(), picker)?;
+
     enable_raw_mode()?;
     let mut stderr = io::stderr();
-    execute!(stderr, EnterAlternateScreen, EnableMouseCapture)?;
+    if let Err(error) = execute!(stderr, EnterAlternateScreen, EnableMouseCapture) {
+        disable_raw_mode()?;
+        return Err(error.into());
+    }
     let backend = CrosstermBackend::new(stderr);
     let mut terminal = Terminal::new(backend)?;
-
-    // create app and run it
-    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-    let mut app = App::from_file(filename.to_string(), picker)?;
     let mut editor_handler = EditorEventHandler::default();
-    run_app(&mut terminal, &mut app, &mut editor_handler)?;
+    let result = run_app(&mut terminal, &mut app, &mut editor_handler);
+    let restore_result = restore_terminal(&mut terminal);
 
-    // restore terminal
+    result?;
+    restore_result?;
+    Ok(())
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stderr>>) -> io::Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -41,7 +53,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         DisableMouseCapture,
     )?;
     terminal.show_cursor()?;
-
     Ok(())
 }
 

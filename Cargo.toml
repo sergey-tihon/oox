@@ -1,7 +1,14 @@
 [package]
-name = "ooxml-tui"
+name = "oox"
 version = "0.1.1"
 edition = "2021"
+rust-version = "1.86"
+description = "A terminal UI for inspecting Office Open XML documents"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/sergey-tihon/ooxml-tui"
+keywords = ["ooxml", "office", "tui", "xml", "terminal"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "oox"
@@ -16,3 +23,4 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 quick-xml = "0.41"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 ratatui-image = { version = "11.0", default-features = false, features = ["crossterm"] }
+clap = { version = "4.5", features = ["derive"] }
