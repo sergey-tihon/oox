@@ -53,15 +53,35 @@ oox --version
 
 | Key       | Action                                    |
 | --------- | ----------------------------------------- |
-| `j` / `↓` | Move down in the tree                     |
-| `k` / `↑` | Move up in the tree                       |
-| `Enter`   | Toggle directory / load file content      |
-| `Tab`     | Switch focus between tree and content     |
-| `q`       | Quit (only when editor is in Normal mode) |
+| `j` / `↓` | Move down in the tree                       |
+| `k` / `↑` | Move up in the tree                         |
+| `Ctrl-d` / `Ctrl-u` | Scroll down / up in the tree       |
+| `g` / `G` | Select the first / last visible item        |
+| `/`       | Search package paths                        |
+| `n` / `N` | Select the next / previous search match     |
+| `Enter`   | Toggle directory / load file content        |
+| `Tab`     | Switch focus between tree and content       |
+| `?` / `F1` | Show the help screen                        |
+| `Esc`     | Cancel search or close help                 |
+| `q`       | Quit (only when editor is in Normal mode)   |
 
 ## Terminal image support
 
 Image previews work in all terminals using a Unicode half-block fallback. For sharper previews, use a terminal with Kitty graphics, iTerm2, or Sixel support, such as Ghostty, Kitty, WezTerm, or iTerm2.
+
+## Debugging
+
+Enable key and event logging while troubleshooting terminal input:
+
+```bash
+OOX_DEBUG=1 cargo run -- data/sample.pptx
+```
+
+Debug messages are written to `/tmp/oox-debug.log`, so they do not corrupt the TUI:
+
+```bash
+tail -f /tmp/oox-debug.log
+```
 
 ## Development
 

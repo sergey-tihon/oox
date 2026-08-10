@@ -35,6 +35,11 @@ pub struct App {
     pub picker: Picker,
     pub current_widget: CurrentWidget,
     pub status_message: Option<String>,
+    pub show_help: bool,
+    pub search_active: bool,
+    pub search_query: String,
+    search_matches: Vec<String>,
+    search_index: Option<usize>,
     archive_paths: HashMap<String, String>,
 }
 
@@ -78,8 +83,113 @@ impl App {
             picker,
             current_widget: CurrentWidget::Tree,
             status_message: Some("Select a package part to inspect".to_string()),
+            show_help: false,
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_index: None,
             archive_paths,
         })
+    }
+
+    pub fn open_help(&mut self) {
+        self.show_help = true;
+    }
+
+    pub fn close_help(&mut self) {
+        self.show_help = false;
+    }
+
+    pub fn start_search(&mut self) {
+        self.search_active = true;
+        if self
+            .status_message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("No package parts match:"))
+        {
+            self.status_message = None;
+        }
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_index = None;
+    }
+
+    pub fn search_input_char(&mut self, character: char) {
+        self.search_query.push(character);
+    }
+
+    pub fn search_backspace(&mut self) {
+        self.search_query.pop();
+    }
+
+    pub fn finish_search(&mut self) {
+        self.search_active = false;
+        self.update_search_matches();
+    }
+
+    pub fn cancel_search(&mut self) {
+        self.search_active = false;
+        if self
+            .status_message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("No package parts match:"))
+        {
+            self.status_message = None;
+        }
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_index = None;
+    }
+
+    pub fn next_search_match(&mut self, reverse: bool) {
+        if self.search_matches.is_empty() {
+            self.update_search_matches();
+        }
+        if self.search_matches.is_empty() {
+            return;
+        }
+
+        let current = self.search_index.unwrap_or(0);
+        let next = if reverse {
+            if current == 0 {
+                self.search_matches.len() - 1
+            } else {
+                current - 1
+            }
+        } else {
+            (current + 1) % self.search_matches.len()
+        };
+        self.search_index = Some(next);
+        self.select_path(&self.search_matches[next].clone());
+    }
+
+    pub fn selection_status(&self) -> String {
+        let Some(selected) = self.tree_state.selected().last() else {
+            return if self.search_active {
+                format!("Search: {}_ | Enter select, Esc cancel", self.search_query)
+            } else {
+                "No package part selected".to_string()
+            };
+        };
+
+        let display_name = selected.trim_start_matches('/');
+        let part_type = if self.is_directory(selected) {
+            "Directory"
+        } else if Self::is_xml(display_name) {
+            "XML"
+        } else if Self::is_image(display_name) {
+            "Image"
+        } else {
+            "Binary/unsupported"
+        };
+
+        let mut status = format!("Part: {display_name} | Type: {part_type}");
+        if self.search_active {
+            status.push_str(&format!(" | Search: {}", self.search_query));
+        } else if !self.search_query.is_empty() {
+            status.push_str(&format!(" | Search: {} (n/N next)", self.search_query));
+        }
+        status
     }
 
     pub fn load_selected_file_content(&mut self) -> io::Result<()> {
@@ -104,10 +214,7 @@ impl App {
 
         let file = std::fs::File::open(self.file_path.clone())?;
         let mut zip = zip::ZipArchive::new(file)?;
-        let is_directory = self
-            .archive_paths
-            .keys()
-            .any(|path| path.starts_with(&format!("{selected}/")));
+        let is_directory = self.is_directory(&selected);
         let mut entry = match zip.by_name(file_name) {
             Ok(entry) => entry,
             Err(_) if is_directory => {
@@ -159,6 +266,61 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn is_directory(&self, path: &str) -> bool {
+        self.archive_paths
+            .get(path)
+            .is_some_and(|archive_path| archive_path.ends_with('/'))
+            || self
+                .archive_paths
+                .keys()
+                .any(|child| child.starts_with(&format!("{path}/")))
+    }
+
+    fn select_path(&mut self, path: &str) {
+        let mut identifiers = Vec::new();
+        let mut current = String::new();
+        for component in path.trim_start_matches('/').split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            current.push('/');
+            current.push_str(component);
+            identifiers.push(current.clone());
+        }
+        for index in 0..identifiers.len().saturating_sub(1) {
+            self.tree_state.open(identifiers[..=index].to_vec());
+        }
+        self.tree_state.select(identifiers);
+        self.tree_state.scroll_selected_into_view();
+    }
+
+    fn update_search_matches(&mut self) {
+        let query = self.search_query.to_ascii_lowercase();
+        if query.is_empty() {
+            self.search_matches.clear();
+            self.search_index = None;
+            return;
+        }
+
+        self.search_matches = self
+            .archive_paths
+            .keys()
+            .filter(|path| path.to_ascii_lowercase().contains(&query))
+            .cloned()
+            .collect();
+        self.search_matches.sort();
+
+        if self.search_matches.is_empty() {
+            self.search_index = None;
+            self.status_message = Some(format!("No package parts match: {}", self.search_query));
+            return;
+        }
+
+        self.search_index = Some(0);
+        let path = self.search_matches[0].clone();
+        self.select_path(&path);
     }
 
     fn normalize_path(path: &str) -> String {
@@ -318,5 +480,24 @@ mod tests {
             App::image_format("media/PHOTO.JpEg"),
             image::ImageFormat::Jpeg
         );
+    }
+
+    #[test]
+    fn search_selects_matching_package_parts() -> io::Result<()> {
+        let mut app = App::from_file("data/sample.pptx".to_string(), Picker::halfblocks())?;
+        app.start_search();
+        for character in "/ppt/slides/slide1.xml".chars() {
+            app.search_input_char(character);
+        }
+        app.finish_search();
+
+        assert_eq!(
+            app.tree_state.selected().last().map(String::as_str),
+            Some("/ppt/slides/slide1.xml")
+        );
+        assert_eq!(app.search_matches.len(), 1);
+        assert!(app.selection_status().contains("Type: XML"));
+
+        Ok(())
     }
 }

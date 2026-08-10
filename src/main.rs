@@ -1,10 +1,15 @@
-use std::{error::Error, io, path::PathBuf};
+use std::{
+    error::Error,
+    fs::OpenOptions,
+    io::{self, Write},
+    path::PathBuf,
+};
 
 use clap::Parser;
 
 use app::{App, CurrentWidget};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -45,6 +50,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+const DEBUG_LOG_PATH: &str = "/tmp/oox-debug.log";
+
+fn debug_log(message: impl std::fmt::Display) {
+    if std::env::var_os("OOX_DEBUG").is_none() {
+        return;
+    }
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(DEBUG_LOG_PATH)
+    {
+        let _ = writeln!(file, "[oox-debug] {message}");
+    }
+}
+
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stderr>>) -> io::Result<()> {
     disable_raw_mode()?;
     execute!(
@@ -65,9 +86,68 @@ fn run_app(
         terminal.draw(|f| ui::ui(f, app))?;
 
         let event = event::read()?;
+        debug_log(format!("event={event:?}"));
 
         if let Event::Key(key) = &event {
             if key.kind == event::KeyEventKind::Release {
+                continue;
+            }
+
+            debug_log(format!(
+                "key={:?} modifiers={:?} focus={:?} editor_mode={:?} help={} search={}",
+                key.code,
+                key.modifiers,
+                app.current_widget,
+                app.editor_state.mode,
+                app.show_help,
+                app.search_active,
+            ));
+
+            if app.show_help {
+                if matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?')) {
+                    debug_log("closing help");
+                    app.close_help();
+                }
+                continue;
+            }
+
+            if app.search_active && app.current_widget == CurrentWidget::Tree {
+                match key.code {
+                    KeyCode::Esc => {
+                        debug_log("canceling search");
+                        app.cancel_search();
+                    }
+                    KeyCode::Enter => {
+                        debug_log(format!("finishing search query={:?}", app.search_query));
+                        app.finish_search();
+                    }
+                    KeyCode::Backspace => app.search_backspace(),
+                    KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.search_input_char(character);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            let can_show_help = match app.current_widget {
+                CurrentWidget::Tree => true,
+                CurrentWidget::TextArea => app.editor_state.mode == EditorMode::Normal,
+            };
+            // F1 is handled here in every editor mode. edtui does not support
+            // function keys and would panic if it received one.
+            if key.code == KeyCode::F(1) {
+                debug_log("opening help via F1");
+                app.open_help();
+                continue;
+            }
+            if app.current_widget == CurrentWidget::TextArea && matches!(key.code, KeyCode::F(_)) {
+                continue;
+            }
+
+            if key.code == KeyCode::Char('?') && can_show_help {
+                debug_log("opening help via ?");
+                app.open_help();
                 continue;
             }
 
@@ -107,6 +187,27 @@ fn run_app(
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             app.tree_state.key_up();
+                        }
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.tree_state.scroll_down(10);
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.tree_state.scroll_up(10);
+                        }
+                        KeyCode::Char('g') => {
+                            app.tree_state.select_first();
+                        }
+                        KeyCode::Char('G') => {
+                            app.tree_state.select_last();
+                        }
+                        KeyCode::Char('/') => {
+                            app.start_search();
+                        }
+                        KeyCode::Char('n') => {
+                            app.next_search_match(false);
+                        }
+                        KeyCode::Char('N') => {
+                            app.next_search_match(true);
                         }
                         KeyCode::Enter => {
                             app.tree_state.toggle_selected();

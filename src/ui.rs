@@ -1,10 +1,10 @@
 use edtui::{EditorStatusLine, EditorTheme, EditorView, LineNumbers, SyntaxHighlighter};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Line,
     text::Text,
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation},
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
 use ratatui_image::{Resize, StatefulImage};
@@ -15,7 +15,11 @@ use crate::app::{App, CurrentWidget};
 pub fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(f.area());
 
     let accent_color = Color::LightGreen;
@@ -46,7 +50,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     // Tree widget
     let tree_block = Block::bordered()
         .title("Document Inspector")
-        .title_top(Line::from("[Tab]").right_aligned())
+        .title_top(Line::from("[?] Help  [Tab]").right_aligned())
         .border_style(if app.current_widget == CurrentWidget::Tree {
             active_style
         } else {
@@ -93,7 +97,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         let image_block = Block::default()
             .borders(Borders::ALL)
             .title("Image preview")
-            .title_top(Line::from("[Tab]").right_aligned())
+            .title_top(Line::from("[?] Help  [Tab]").right_aligned())
             .border_style(if app.current_widget == CurrentWidget::TextArea {
                 active_style
             } else {
@@ -130,4 +134,57 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             .syntax_highlighter(syntax_highlighter);
         f.render_widget(editor_view, sections[1]);
     }
+
+    let status = Paragraph::new(app.selection_status()).style(Style::default().fg(Color::DarkGray));
+    f.render_widget(status, chunks[2]);
+
+    if app.show_help {
+        let help_area = centered_rect(f.area(), 72, 78);
+        f.render_widget(Clear, help_area);
+        let help = Paragraph::new(Text::from(vec![
+            Line::from("Navigation"),
+            Line::from("  j / ↓        Move down"),
+            Line::from("  k / ↑        Move up"),
+            Line::from("  Ctrl-d       Scroll down"),
+            Line::from("  Ctrl-u       Scroll up"),
+            Line::from("  g / G         First / last item"),
+            Line::from("  Enter         Expand or inspect part"),
+            Line::from("  Tab           Switch tree/editor focus"),
+            Line::from(""),
+            Line::from("Search"),
+            Line::from("  /             Search package paths"),
+            Line::from("  Enter         Select first matching part"),
+            Line::from("  n / N         Next / previous match"),
+            Line::from("  Esc           Cancel search"),
+            Line::from(""),
+            Line::from("  ? / F1         Show this help"),
+            Line::from("  q              Quit from tree or Vim Normal mode"),
+        ]))
+        .block(
+            Block::bordered()
+                .title("Help")
+                .title_bottom(Line::from("[Esc] Close").right_aligned()),
+        )
+        .style(Style::default().fg(Color::White));
+        f.render_widget(help, help_area);
+    }
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height) / 2),
+            Constraint::Percentage(height),
+            Constraint::Percentage((100 - height) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width) / 2),
+            Constraint::Percentage(width),
+            Constraint::Percentage((100 - width) / 2),
+        ])
+        .split(vertical[1])[1]
 }
