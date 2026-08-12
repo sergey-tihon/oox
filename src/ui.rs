@@ -11,7 +11,7 @@ use ratatui_image::{Resize, StatefulImage};
 use tui_tree_widget::Tree;
 
 use crate::{
-    app::{App, CurrentWidget},
+    app::{App, CurrentWidget, PreviewKind},
     keybindings::Action,
 };
 
@@ -161,7 +161,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     // Content preview with XML syntax highlighting
     let editor_block = Block::default()
         .borders(Borders::ALL)
-        .title("[3] File content")
+        .title(format!("[3] {}", content_title(app.preview_kind)))
         .title_top(Line::from("[Tab]").right_aligned())
         .border_style(if app.current_widget == CurrentWidget::TextArea {
             active_style
@@ -172,7 +172,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     if let Some(image_state) = app.image_state.as_mut() {
         let image_block = Block::default()
             .borders(Borders::ALL)
-            .title("[3] Image preview")
+            .title(format!("[3] {}", content_title(app.preview_kind)))
             .title_top(Line::from("[Tab]").right_aligned())
             .border_style(if app.current_widget == CurrentWidget::TextArea {
                 active_style
@@ -185,9 +185,14 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         let image = StatefulImage::default().resize(Resize::Fit(None));
         f.render_stateful_widget(image, image_area, image_state);
     } else if let Some(message) = app.status_message.as_deref() {
+        let color = if app.preview_kind == PreviewKind::Info {
+            Color::White
+        } else {
+            Color::Yellow
+        };
         let message = Paragraph::new(message)
             .block(editor_block)
-            .style(Style::default().fg(Color::Yellow));
+            .style(Style::default().fg(color));
         f.render_widget(message, sections[1]);
     } else {
         let status_line = EditorStatusLine::default()
@@ -203,10 +208,19 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             .line_numbers_style(Style::default().fg(Color::DarkGray))
             .status_line(status_line);
 
-        let syntax_highlighter = SyntaxHighlighter::new("dracula", "xml").ok();
+        let syntax_highlighter = match app.preview_kind {
+            PreviewKind::Xml => SyntaxHighlighter::new("dracula", "xml").ok(),
+            PreviewKind::Json => SyntaxHighlighter::new("dracula", "json").ok(),
+            _ => None,
+        };
+        let line_numbers = if app.preview_kind == PreviewKind::Hex {
+            LineNumbers::None
+        } else {
+            LineNumbers::Absolute
+        };
         let editor_view = EditorView::new(&mut app.editor_state)
             .theme(theme)
-            .line_numbers(LineNumbers::Absolute)
+            .line_numbers(line_numbers)
             .syntax_highlighter(syntax_highlighter);
         f.render_widget(editor_view, sections[1]);
     }
@@ -327,6 +341,18 @@ pub fn metadata_line_at(area: Rect, app: &App, x: u16, y: u16) -> Option<(usize,
         ))
     } else {
         None
+    }
+}
+
+fn content_title(kind: PreviewKind) -> &'static str {
+    match kind {
+        PreviewKind::Xml => "XML content",
+        PreviewKind::PlainText => "Text content",
+        PreviewKind::Json => "JSON preview",
+        PreviewKind::Hex => "Hex dump",
+        PreviewKind::Image => "Image preview",
+        PreviewKind::Info => "Binary information",
+        PreviewKind::Error | PreviewKind::Empty => "File content",
     }
 }
 

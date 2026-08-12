@@ -1214,6 +1214,7 @@ dependencies = [
  "ratatui",
  "ratatui-image",
  "serde",
+ "serde_json",
  "tui-tree-widget",
  "zip",
 ]

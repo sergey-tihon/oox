@@ -1,10 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    fmt::Write as _,
     io::{self, Read},
 };
 
 use edtui::{EditorState, Lines};
-use image::ImageFormat;
+use image::{DynamicImage, ImageFormat};
 use quick_xml::{
     events::{BytesStart, Event},
     Reader, Writer,
@@ -36,6 +37,28 @@ pub enum PartKind {
     Binary,
     Directory,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewKind {
+    Empty,
+    Xml,
+    PlainText,
+    Json,
+    Hex,
+    Image,
+    Info,
+    Error,
+}
+
+#[derive(Debug)]
+enum Preview {
+    Editor { kind: PreviewKind, text: String },
+    Image(DynamicImage),
+    Info(String),
+    Error(String),
+}
+
+const MAX_HEX_PREVIEW_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct PartInfo {
@@ -99,6 +122,7 @@ pub struct App {
     pub tree_items: Vec<TreeItem<'static, String>>,
     pub editor_state: EditorState,
     pub image_state: Option<StatefulProtocol>,
+    pub preview_kind: PreviewKind,
     pub picker: Picker,
     pub current_widget: CurrentWidget,
     pub status_message: Option<String>,
@@ -409,6 +433,228 @@ fn push_detail_line(text: &mut String, line: &str) -> usize {
     line_number
 }
 
+fn build_preview(
+    path: &str,
+    content_type: Option<&str>,
+    size: u64,
+    compressed_size: u64,
+    bytes: &[u8],
+) -> Preview {
+    if App::is_image(path) {
+        return match image::load_from_memory_with_format(bytes, App::image_format(path)) {
+            Ok(image) => Preview::Image(image),
+            Err(error) => Preview::Error(format!("image decode failed: {error}")),
+        };
+    }
+
+    if App::is_xml(path) {
+        let text = String::from_utf8_lossy(bytes);
+        return match App::pretty_print_xml(&text) {
+            Ok(formatted) => Preview::Editor {
+                kind: PreviewKind::Xml,
+                text: formatted,
+            },
+            Err(error) => Preview::Error(format!("XML parsing failed: {error}")),
+        };
+    }
+
+    if is_json_file(path, content_type) {
+        let Some(text) = utf8_text(bytes) else {
+            return Preview::Error("JSON is not valid UTF-8".to_string());
+        };
+        let formatted = match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(value) => serde_json::to_string_pretty(&value).unwrap_or(text),
+            Err(_) => text,
+        };
+        return Preview::Editor {
+            kind: PreviewKind::Json,
+            text: formatted,
+        };
+    }
+
+    if is_ole_file(path, content_type) {
+        return Preview::Info(binary_info(
+            path,
+            "OLE/VBA object",
+            content_type,
+            size,
+            compressed_size,
+        ));
+    }
+
+    if is_font_file(path, content_type) {
+        return Preview::Info(binary_info(
+            path,
+            "Font",
+            content_type,
+            size,
+            compressed_size,
+        ));
+    }
+
+    if is_media_file(path, content_type) {
+        return Preview::Info(binary_info(
+            path,
+            "Media",
+            content_type,
+            size,
+            compressed_size,
+        ));
+    }
+
+    if is_bin_file(path) {
+        return Preview::Editor {
+            kind: PreviewKind::Hex,
+            text: format_hex_preview(bytes),
+        };
+    }
+
+    if let Some(text) = utf8_text(bytes).filter(|text| is_probably_text(text)) {
+        return Preview::Editor {
+            kind: PreviewKind::PlainText,
+            text,
+        };
+    }
+
+    Preview::Info(binary_info(
+        path,
+        "Binary data",
+        content_type,
+        size,
+        compressed_size,
+    ))
+}
+
+fn is_json_file(path: &str, content_type: Option<&str>) -> bool {
+    path_extension(path).is_some_and(|extension| extension == "json")
+        || content_type.is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            value == "application/json" || value.ends_with("+json")
+        })
+}
+
+fn is_bin_file(path: &str) -> bool {
+    path_extension(path).is_some_and(|extension| extension == "bin")
+}
+
+fn is_font_file(path: &str, content_type: Option<&str>) -> bool {
+    let extension_match = path_extension(path).is_some_and(|extension| {
+        matches!(extension.as_str(), "ttf" | "otf" | "woff" | "woff2" | "eot")
+    });
+    extension_match || content_type.is_some_and(|value| value.to_ascii_lowercase().contains("font"))
+}
+
+fn is_media_file(path: &str, content_type: Option<&str>) -> bool {
+    let extension_match = path_extension(path).is_some_and(|extension| {
+        matches!(
+            extension.as_str(),
+            "mp3" | "wav" | "m4a" | "aac" | "ogg" | "mp4" | "avi" | "mov" | "wmv" | "mkv"
+        )
+    });
+    let content_type_match = content_type.is_some_and(|value| {
+        let value = value.to_ascii_lowercase();
+        value.starts_with("audio/") || value.starts_with("video/")
+    });
+    extension_match || content_type_match
+}
+
+fn is_ole_file(path: &str, content_type: Option<&str>) -> bool {
+    let content_type_match = content_type.is_some_and(|value| {
+        let value = value.to_ascii_lowercase();
+        value.contains("ole") || value.contains("vba") || value.contains("ms-office")
+    });
+    content_type_match
+        || path.to_ascii_lowercase().contains("oleobject")
+        || path.to_ascii_lowercase().contains("vbaproject")
+}
+
+fn path_extension(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+}
+
+fn utf8_text(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    Some(text.strip_prefix('\u{feff}').unwrap_or(text).to_string())
+}
+
+fn is_probably_text(text: &str) -> bool {
+    text.chars()
+        .all(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+}
+
+fn format_hex_preview(bytes: &[u8]) -> String {
+    let shown = &bytes[..bytes.len().min(MAX_HEX_PREVIEW_BYTES)];
+    let mut output = format_hex_dump(shown);
+    if shown.len() < bytes.len() {
+        let _ = writeln!(
+            output,
+            "\n[preview truncated: showing {} of {} bytes]",
+            shown.len(),
+            bytes.len()
+        );
+    }
+    output
+}
+
+fn format_hex_dump(bytes: &[u8]) -> String {
+    let mut output = String::new();
+    for (line, chunk) in bytes.chunks(16).enumerate() {
+        let offset = line * 16;
+        let _ = write!(output, "{offset:08x}  ");
+        for index in 0..16 {
+            if index == 8 {
+                output.push(' ');
+            }
+            if let Some(byte) = chunk.get(index) {
+                let _ = write!(output, "{byte:02x} ");
+            } else {
+                output.push_str("   ");
+            }
+        }
+        output.push_str(" |");
+        for byte in chunk {
+            output.push(if byte.is_ascii_graphic() || *byte == b' ' {
+                *byte as char
+            } else {
+                '.'
+            });
+        }
+        output.push('|');
+        output.push('\n');
+    }
+    output
+}
+
+fn binary_info(
+    path: &str,
+    category: &str,
+    content_type: Option<&str>,
+    size: u64,
+    compressed_size: u64,
+) -> String {
+    let mime_type = content_type.unwrap_or_else(|| fallback_mime_type(path));
+    format!(
+        "Binary file\n\nName:       {path}\nCategory:   {category}\nMIME type:  {mime_type}\nSize:       {size} bytes\nCompressed: {compressed_size} bytes\n\nRaw bytes are not rendered for this file type."
+    )
+}
+
+fn fallback_mime_type(path: &str) -> &'static str {
+    match path_extension(path).as_deref() {
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("mp4") => "video/mp4",
+        Some("avi") => "video/x-msvideo",
+        _ => "application/octet-stream",
+    }
+}
+
 impl App {
     pub fn from_file(path: String, picker: Picker) -> io::Result<Self> {
         let file = std::fs::File::open(path.clone())?;
@@ -441,6 +687,7 @@ impl App {
             tree_items,
             editor_state: EditorState::default(),
             image_state: None,
+            preview_kind: PreviewKind::Empty,
             picker,
             current_widget: CurrentWidget::Tree,
             status_message: Some(
@@ -816,6 +1063,7 @@ impl App {
         // directory or unsupported package part is selected.
         self.image_state = None;
         self.editor_state = EditorState::default();
+        self.preview_kind = PreviewKind::Empty;
         self.status_message = Some("Select a package part to inspect".to_string());
 
         let selected = match self.tree_state.selected().last().cloned() {
@@ -856,34 +1104,36 @@ impl App {
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes)?;
 
-        if Self::is_image(file_name) {
-            match image::load_from_memory_with_format(&bytes, Self::image_format(file_name)) {
-                Ok(image) => {
-                    self.image_state = Some(self.picker.new_resize_protocol(image));
-                    self.status_message = None;
-                }
-                Err(error) => {
-                    self.status_message =
-                        Some(format!("Could not decode image {display_name}: {error}"));
-                }
+        let content_type = self
+            .package_index
+            .parts
+            .get(&selected)
+            .and_then(|part| part.content_type.as_deref());
+        match build_preview(
+            file_name,
+            content_type,
+            entry.size(),
+            entry.compressed_size(),
+            &bytes,
+        ) {
+            Preview::Editor { kind, text } => {
+                self.preview_kind = kind;
+                self.editor_state = EditorState::new(Lines::from(text.as_str()));
+                self.status_message = None;
             }
-        } else if Self::is_xml(file_name) {
-            let text = String::from_utf8_lossy(&bytes);
-            match Self::pretty_print_xml(&text) {
-                Ok(formatted) => {
-                    self.editor_state = EditorState::new(Lines::from(formatted.as_str()));
-                    self.status_message = None;
-                }
-                Err(error) => {
-                    self.status_message =
-                        Some(format!("Could not parse XML {display_name}: {error}"));
-                }
+            Preview::Image(image) => {
+                self.preview_kind = PreviewKind::Image;
+                self.image_state = Some(self.picker.new_resize_protocol(image));
+                self.status_message = None;
             }
-        } else {
-            self.status_message = Some(format!(
-                "Binary or unsupported file: {display_name} ({} bytes)",
-                bytes.len()
-            ));
+            Preview::Info(message) => {
+                self.preview_kind = PreviewKind::Info;
+                self.status_message = Some(message);
+            }
+            Preview::Error(message) => {
+                self.preview_kind = PreviewKind::Error;
+                self.status_message = Some(format!("Could not preview {display_name}: {message}"));
+            }
         }
 
         Ok(())
@@ -1080,6 +1330,65 @@ mod tests {
     #[test]
     fn malformed_xml_is_reported_as_an_error() {
         assert!(App::pretty_print_xml("<root><item></root>").is_err());
+    }
+
+    #[test]
+    fn preview_factory_formats_json_and_text() {
+        let json = super::build_preview(
+            "custom.json",
+            Some("application/json"),
+            13,
+            9,
+            br#"{"answer":42}"#,
+        );
+        match json {
+            super::Preview::Editor { kind, text } => {
+                assert_eq!(kind, super::PreviewKind::Json);
+                assert!(text.contains("  \"answer\": 42"));
+            }
+            other => panic!("expected JSON editor preview, got {other:?}"),
+        }
+
+        let text = super::build_preview("notes.txt", None, 11, 7, b"hello\nworld");
+        assert!(matches!(
+            text,
+            super::Preview::Editor {
+                kind: super::PreviewKind::PlainText,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn preview_factory_formats_hex_and_binary_information() {
+        let hex = super::build_preview("payload.bin", None, 3, 5, &[0, 1, b'A']);
+        match hex {
+            super::Preview::Editor { kind, text } => {
+                assert_eq!(kind, super::PreviewKind::Hex);
+                assert!(text.contains("00000000"));
+                assert!(text.contains("00 01 41"));
+                assert!(text.contains("|..A|"));
+            }
+            other => panic!("expected hex preview, got {other:?}"),
+        }
+
+        let font = super::build_preview("font.ttf", None, 100, 50, &[0, 1, 2]);
+        match font {
+            super::Preview::Info(message) => {
+                assert!(message.contains("Category:   Font"));
+                assert!(message.contains("MIME type:  font/ttf"));
+            }
+            other => panic!("expected binary information preview, got {other:?}"),
+        }
+
+        let ole = super::build_preview(
+            "embeddings/object.bin",
+            Some("application/vnd.ms-office.vbaProject"),
+            100,
+            50,
+            &[0, 1, 2],
+        );
+        assert!(matches!(ole, super::Preview::Info(message) if message.contains("OLE/VBA object")));
     }
 
     #[test]
