@@ -57,17 +57,58 @@ oox --version
 | `k` / `↑` | Move up in the tree                         |
 | `Ctrl-d` / `Ctrl-u` | Scroll down / up in the tree       |
 | `g` / `G` | Select the first / last visible item        |
+| `E` / `C` | Expand / collapse all tree nodes              |
 | `/`       | Search package paths                        |
 | `n` / `N` | Select the next / previous search match     |
-| `Enter`   | Toggle directory / load file content        |
-| `Tab`     | Switch focus between tree and content       |
+| `Enter`   | Toggle directory / preview file content     |
+| `1` / `2` / `3` | Focus tree / metadata / content panels  |
+| `Tab`     | Cycle tree / metadata / content focus       |
 | `?` / `F1` | Show the help screen                        |
+| `d`       | Toggle the metadata panel                   |
+| Mouse       | Select/expand tree; scroll tree/metadata; click relationship targets |
 | `Esc`     | Cancel search or close help                 |
-| `q`       | Quit (only when editor is in Normal mode)   |
+| `q`       | Quit from tree / Vim normal mode             |
+| `Ctrl-q`  | Quit from Emacs editor                       |
+| `Alt-Left` / `Alt-Right` | Previous / next opened part       |
 
 ## Terminal image support
 
 Image previews work in all terminals using a Unicode half-block fallback. For sharper previews, use a terminal with Kitty graphics, iTerm2, or Sixel support, such as Ghostty, Kitty, WezTerm, or iTerm2.
+
+## Configuration
+
+Generate a documented configuration file in the system config directory:
+
+```bash
+oox --generate-config
+```
+
+Run with the automatically discovered configuration:
+
+```bash
+oox data/sample.pptx
+```
+
+Use `--config` only when you want to load a different file:
+
+```bash
+oox --config /path/to/config.toml data/sample.pptx
+```
+
+The generated file contains editor mode and application keybindings. Each binding
+is an array of alternative single-key shortcuts:
+
+```toml
+[editor]
+mode = "vim" # or "emacs"
+
+[keybindings]
+help = ["?", "F1"]
+move_down = ["j", "Down"]
+show_metadata = ["d"]
+```
+
+The keybinding help screen is generated from the active configuration.
 
 ## Debugging
 
