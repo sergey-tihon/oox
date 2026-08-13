@@ -13,17 +13,12 @@ use tui_tree_widget::Tree;
 use crate::{
     app::{App, CurrentWidget, PreviewKind},
     keybindings::Action,
+    layout::LayoutSnapshot,
 };
 
 pub fn ui(f: &mut Frame, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
+    let snapshot = LayoutSnapshot::new(f.area(), app.details_visible);
+    let chunks = [snapshot.header, snapshot.body, snapshot.status];
 
     let accent_color = Color::LightGreen;
     let normal_style = Style::default().fg(Color::White);
@@ -45,21 +40,8 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(title, chunks[0]);
 
     // Middle section
-    let sections = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(chunks[1]);
-    let left_sections = if app.details_visible {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-            .split(sections[0])
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(100)])
-            .split(sections[0])
-    };
+    let sections = [snapshot.tree, snapshot.content];
+    let left_sections = [snapshot.tree, snapshot.details.unwrap_or(snapshot.tree)];
 
     // Tree widget
     let tree_block = Block::bordered()
@@ -71,28 +53,44 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             normal_style
         });
 
-    match Tree::new(&app.tree_items) {
-        Ok(tree_widget) => {
-            let tree_widget = tree_widget
-                .block(tree_block)
-                .experimental_scrollbar(Some(
-                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                        .begin_symbol(None)
-                        .track_symbol(None)
-                        .end_symbol(None),
-                ))
-                .highlight_style(
-                    Style::new()
-                        .fg(Color::Black)
-                        .bg(accent_color)
-                        .add_modifier(Modifier::BOLD),
-                );
-            f.render_stateful_widget(tree_widget, left_sections[0], &mut app.tree_state);
-        }
-        Err(error) => {
-            let message = Paragraph::new(format!("Unable to render document tree: {error}"))
-                .block(tree_block);
-            f.render_widget(message, left_sections[0]);
+    if app.loading {
+        f.render_widget(
+            Paragraph::new("Loading package…").block(tree_block),
+            left_sections[0],
+        );
+    } else if let Some(error) = app
+        .worker_error
+        .as_deref()
+        .filter(|_| !app.is_package_loaded())
+    {
+        f.render_widget(
+            Paragraph::new(format!("Unable to open package: {error}")).block(tree_block),
+            left_sections[0],
+        );
+    } else {
+        match Tree::new(&app.tree_items) {
+            Ok(tree_widget) => {
+                let tree_widget = tree_widget
+                    .block(tree_block)
+                    .experimental_scrollbar(Some(
+                        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                            .begin_symbol(None)
+                            .track_symbol(None)
+                            .end_symbol(None),
+                    ))
+                    .highlight_style(
+                        Style::new()
+                            .fg(Color::Black)
+                            .bg(accent_color)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                f.render_stateful_widget(tree_widget, left_sections[0], &mut app.tree_state);
+            }
+            Err(error) => {
+                let message = Paragraph::new(format!("Unable to render document tree: {error}"))
+                    .block(tree_block);
+                f.render_widget(message, left_sections[0]);
+            }
         }
     }
 
@@ -112,13 +110,13 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             .lines()
             .count()
             .saturating_sub(details_inner.height as usize) as u16;
-        app.details_scroll = app.details_scroll.min(max_scroll);
-        if details.links.is_empty() {
-            app.details_cursor = 0;
+        let details_scroll = app.details_scroll.min(max_scroll);
+        let details_cursor = if details.links.is_empty() {
+            0
         } else {
-            app.details_cursor = app.details_cursor.min(details.links.len() - 1);
-        }
-        let selected_link_line = details.links.get(app.details_cursor).map(|link| link.line);
+            app.details_cursor.min(details.links.len() - 1)
+        };
+        let selected_link_line = details.links.get(details_cursor).map(|link| link.line);
         let lines = details
             .text
             .lines()
@@ -154,7 +152,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             .collect::<Vec<_>>();
         let details = Paragraph::new(Text::from(lines))
             .block(details_block)
-            .scroll((app.details_scroll, 0));
+            .scroll((details_scroll, 0));
         f.render_widget(details, left_sections[1]);
     }
 
@@ -177,10 +175,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                 .lines()
                 .count()
                 .saturating_sub(summary_inner.height as usize) as u16;
-            app.summary_scroll = app.summary_scroll.min(max_scroll);
+            let summary_scroll = app.summary_scroll.min(max_scroll);
             let summary = Paragraph::new(Text::from(linked_lines(summary)))
                 .block(editor_block)
-                .scroll((app.summary_scroll, 0));
+                .scroll((summary_scroll, 0));
             f.render_widget(summary, sections[1]);
         }
     } else if let Some(image_state) = app.image_state.as_mut() {
@@ -292,107 +290,36 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 }
 
 pub fn tree_area_contains(area: Rect, app: &App, x: u16, y: u16) -> bool {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(chunks[1]);
-    let left = if app.details_visible {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-            .split(columns[0])
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(100)])
-            .split(columns[0])
-    };
-    let tree = left[0];
-    x >= tree.x
-        && x < tree.x.saturating_add(tree.width)
-        && y >= tree.y
-        && y < tree.y.saturating_add(tree.height)
+    LayoutSnapshot::contains(LayoutSnapshot::new(area, app.details_visible).tree, x, y)
+}
+
+pub fn content_area_contains(area: Rect, app: &App, x: u16, y: u16) -> bool {
+    LayoutSnapshot::contains(LayoutSnapshot::new(area, app.details_visible).content, x, y)
 }
 
 pub fn summary_line_at(area: Rect, app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
     if !app.summary_visible {
         return None;
     }
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(chunks[1]);
-    let inner = Block::bordered().inner(columns[1]);
-
-    if x >= inner.x
-        && x < inner.x.saturating_add(inner.width)
-        && y >= inner.y
-        && y < inner.y.saturating_add(inner.height)
-    {
-        Some((
-            usize::from(y - inner.y) + usize::from(app.summary_scroll),
-            usize::from(x - inner.x),
-        ))
-    } else {
-        None
-    }
+    LayoutSnapshot::new(area, app.details_visible).content_line(app.summary_scroll, x, y)
 }
 
 pub fn metadata_line_at(area: Rect, app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
     if !app.details_visible {
         return None;
     }
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(chunks[1]);
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-        .split(columns[0]);
-    let inner = Block::bordered().inner(left[1]);
-
-    if x >= inner.x
-        && x < inner.x.saturating_add(inner.width)
-        && y >= inner.y
-        && y < inner.y.saturating_add(inner.height)
-    {
-        Some((
+    let snapshot = LayoutSnapshot::new(area, true);
+    let details = snapshot.details?;
+    let inner = Block::bordered().inner(details);
+    LayoutSnapshot::contains(inner, x, y).then(|| {
+        (
             usize::from(y - inner.y) + usize::from(app.details_scroll),
             usize::from(x - inner.x),
-        ))
-    } else {
-        None
-    }
+        )
+    })
 }
 
-fn linked_lines(view: &crate::app::DetailsView) -> Vec<Line<'static>> {
+fn linked_lines(view: &crate::summary::DetailsView) -> Vec<Line<'static>> {
     view.text
         .lines()
         .enumerate()

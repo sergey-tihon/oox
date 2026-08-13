@@ -74,6 +74,14 @@ oox --version
 | `Ctrl-q`  | Quit from Emacs editor                       |
 | `Alt-Left` / `Alt-Right` | Previous / next opened part       |
 
+## Package safety and loading
+
+Package metadata uses one canonical normalized path model. ZIP entries with traversal-like names, colliding normalized paths, and malformed relationships/content types are retained as structured diagnostics and are not allowed to overwrite another part. Archives exceeding 100,000 entries or 256 MiB of declared uncompressed content are rejected as failed opens; individual reads are bounded while data is decompressed (32 MiB per part and 4 MiB for indexing metadata), and declared ZIP sizes are not trusted as a substitute for the streaming limit. Hex previews are capped at 1 MiB and images are limited to 8192×8192 and 16 million pixels.
+
+Archive indexing, document summaries, and selected-part preview work run on a bounded background worker after the loading screen is entered. Messages contain owned package metadata/preview payloads; request IDs and selected canonical paths discard stale results. The UI remains the sole owner of editor state and creates ratatui image protocols on the UI thread. Loading and malformed/limited-part failures are shown in the status area rather than panicking. Terminal mode is restored on normal exits and unwinding errors on a best-effort basis.
+
+The initial package is not indexed synchronously: the tree and summary appear when the worker finishes, and tree/content actions are ignored while loading. Summary XML parser failures are retained as structured diagnostics in package metadata instead of displaying a partial summary; summary output and extracted item/text collections are bounded to prevent oversized documents from consuming unbounded memory.
+
 ## Terminal image support
 
 Image previews work in all terminals using a Unicode half-block fallback. For sharper previews, use a terminal with Kitty graphics, iTerm2, or Sixel support, such as Ghostty, Kitty, WezTerm, or iTerm2.

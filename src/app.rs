@@ -1,17 +1,20 @@
 use std::{
-    collections::{BTreeMap, HashMap},
     fmt::Write as _,
-    io::{self, Read},
+    io::{self, Cursor, Read},
+    path::PathBuf,
 };
 
 use edtui::{EditorState, Lines};
-use image::{DynamicImage, ImageFormat};
-use quick_xml::{
-    events::{BytesStart, Event},
-    Reader, Writer,
-};
+use image::{DynamicImage, ImageFormat, ImageReader, Limits};
+use quick_xml::{events::Event, Reader, Writer};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use tui_tree_widget::{TreeItem, TreeState};
+
+use crate::package::{
+    xml_attribute, Package, PackageIndex, PartKind, Relationship, TargetMode, MAX_PATH_DEPTH,
+};
+use crate::summary::{DetailLink, DetailsView};
+use crate::worker::{accepts_result, Job, ResultMessage, Worker};
 
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -30,14 +33,6 @@ impl Node {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum PartKind {
-    Xml,
-    Image,
-    Binary,
-    Directory,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewKind {
     Empty,
@@ -52,7 +47,7 @@ pub enum PreviewKind {
 }
 
 #[derive(Debug)]
-enum Preview {
+pub(crate) enum Preview {
     Editor { kind: PreviewKind, text: String },
     Image(DynamicImage),
     Info(String),
@@ -60,62 +55,15 @@ enum Preview {
 }
 
 const MAX_HEX_PREVIEW_BYTES: usize = 1024 * 1024;
-
-#[derive(Clone, Debug)]
-pub struct PartInfo {
-    pub path: String,
-    pub archive_name: String,
-    pub content_type: Option<String>,
-    pub size: u64,
-    pub compressed_size: u64,
-    pub kind: PartKind,
-}
-
-#[derive(Clone, Debug)]
-pub enum TargetMode {
-    Internal,
-    External,
-}
-
-#[derive(Clone, Debug)]
-pub struct Relationship {
-    pub source: String,
-    pub id: String,
-    pub relationship_type: String,
-    pub target: String,
-    pub resolved_target: Option<String>,
-    pub target_mode: TargetMode,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ContentTypes {
-    defaults: BTreeMap<String, String>,
-    overrides: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct DetailLink {
-    pub line: usize,
-    pub start: usize,
-    pub end: usize,
-    pub target: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct DetailsView {
-    pub text: String,
-    pub links: Vec<DetailLink>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct PackageIndex {
-    pub parts: BTreeMap<String, PartInfo>,
-    pub relationships: Vec<Relationship>,
-    pub outgoing: BTreeMap<String, Vec<usize>>,
-    pub incoming: BTreeMap<String, Vec<usize>>,
-    pub warnings: Vec<String>,
-    content_types: ContentTypes,
-}
+const MAX_XML_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
+const MAX_JSON_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 8192;
+const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
+const MAX_SUMMARY_LINES: usize = 4096;
+const MAX_SUMMARY_CHARS: usize = 512 * 1024;
+const MAX_SUMMARY_ITEMS: usize = 4096;
+const MAX_SUMMARY_TEXT_CHARS: usize = 16 * 1024;
+const MAX_SHARED_STRINGS: usize = 16_384;
 
 pub struct App {
     pub file_path: String,
@@ -132,6 +80,15 @@ pub struct App {
     pub details_cursor: usize,
     pub package_index: PackageIndex,
     pub document_summary: Option<DetailsView>,
+    package: Option<Package>,
+    worker: Worker,
+    open_request_id: u64,
+    preview_request_id: u64,
+    pub loading: bool,
+    pub worker_error: Option<String>,
+    // The legacy synchronous constructor exists only for in-tree unit tests.
+    #[cfg(test)]
+    synchronous: bool,
     pub summary_visible: bool,
     pub summary_scroll: u16,
     navigation_back: Vec<String>,
@@ -142,7 +99,6 @@ pub struct App {
     pub search_query: String,
     search_matches: Vec<String>,
     search_index: Option<usize>,
-    archive_paths: HashMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -150,246 +106,6 @@ pub enum CurrentWidget {
     Tree,
     Details,
     TextArea,
-}
-
-impl PackageIndex {
-    fn from_archive<R: Read + io::Seek>(archive: &mut zip::ZipArchive<R>) -> io::Result<Self> {
-        let mut index = Self::default();
-        let mut content_types_bytes = None;
-        let mut relationship_parts = Vec::new();
-
-        for entry_index in 0..archive.len() {
-            let mut entry = archive.by_index(entry_index).map_err(io::Error::other)?;
-            let archive_name = entry.name().to_string();
-            let normalized_path = normalize_package_path(&archive_name);
-            if normalized_path.is_empty() {
-                continue;
-            }
-
-            let path = format!("/{normalized_path}");
-            let is_directory = entry.is_dir();
-            let kind = if is_directory {
-                PartKind::Directory
-            } else if App::is_xml(&archive_name) {
-                PartKind::Xml
-            } else if App::is_image(&archive_name) {
-                PartKind::Image
-            } else {
-                PartKind::Binary
-            };
-            let size = entry.size();
-            let compressed_size = entry.compressed_size();
-            index.parts.insert(
-                path.clone(),
-                PartInfo {
-                    path: path.clone(),
-                    archive_name: archive_name.clone(),
-                    content_type: None,
-                    size,
-                    compressed_size,
-                    kind,
-                },
-            );
-
-            if normalized_path.eq_ignore_ascii_case("[Content_Types].xml") {
-                let mut bytes = Vec::new();
-                entry.read_to_end(&mut bytes)?;
-                content_types_bytes = Some(bytes);
-            } else if archive_name.ends_with(".rels") {
-                let mut bytes = Vec::new();
-                entry.read_to_end(&mut bytes)?;
-                relationship_parts.push((normalized_path, bytes));
-            }
-        }
-
-        if let Some(bytes) = content_types_bytes {
-            match parse_content_types(&bytes) {
-                Ok(content_types) => index.content_types = content_types,
-                Err(error) => index
-                    .warnings
-                    .push(format!("Could not parse [Content_Types].xml: {error}")),
-            }
-        }
-
-        for part in index.parts.values_mut() {
-            part.content_type = index.content_types.content_type_for(&part.path);
-        }
-
-        for (relationship_path, bytes) in relationship_parts {
-            let Some(source) = relationship_source(&relationship_path) else {
-                index.warnings.push(format!(
-                    "Could not determine relationship source: {relationship_path}"
-                ));
-                continue;
-            };
-            match parse_relationships(&bytes, &source) {
-                Ok(mut relationships) => index.relationships.append(&mut relationships),
-                Err(error) => index.warnings.push(format!(
-                    "Could not parse relationship part /{relationship_path}: {error}"
-                )),
-            }
-        }
-
-        for (relationship_index, relationship) in index.relationships.iter().enumerate() {
-            index
-                .outgoing
-                .entry(relationship.source.clone())
-                .or_default()
-                .push(relationship_index);
-            if let Some(target) = relationship.resolved_target.as_ref() {
-                index
-                    .incoming
-                    .entry(target.clone())
-                    .or_default()
-                    .push(relationship_index);
-            }
-        }
-
-        Ok(index)
-    }
-}
-
-impl ContentTypes {
-    fn content_type_for(&self, path: &str) -> Option<String> {
-        if let Some(content_type) = self.overrides.get(path) {
-            return Some(content_type.clone());
-        }
-        let extension = path.rsplit('.').next()?.to_ascii_lowercase();
-        self.defaults.get(&extension).cloned()
-    }
-}
-
-fn parse_content_types(bytes: &[u8]) -> io::Result<ContentTypes> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut reader = Reader::from_str(&text);
-    let mut content_types = ContentTypes::default();
-    let mut buffer = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Eof) => break,
-            Ok(Event::Empty(event)) | Ok(Event::Start(event)) => match event.name().as_ref() {
-                b"Default" => {
-                    if let (Some(extension), Some(content_type)) = (
-                        xml_attribute(&event, b"Extension"),
-                        xml_attribute(&event, b"ContentType"),
-                    ) {
-                        content_types
-                            .defaults
-                            .insert(extension.to_ascii_lowercase(), content_type);
-                    }
-                }
-                b"Override" => {
-                    if let (Some(part_name), Some(content_type)) = (
-                        xml_attribute(&event, b"PartName"),
-                        xml_attribute(&event, b"ContentType"),
-                    ) {
-                        content_types.overrides.insert(
-                            format!("/{}", normalize_package_path(&part_name)),
-                            content_type,
-                        );
-                    }
-                }
-                _ => {}
-            },
-            Ok(_) => {}
-            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
-        }
-        buffer.clear();
-    }
-
-    Ok(content_types)
-}
-
-fn parse_relationships(bytes: &[u8], source: &str) -> io::Result<Vec<Relationship>> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut reader = Reader::from_str(&text);
-    let mut relationships = Vec::new();
-    let mut buffer = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Eof) => break,
-            Ok(Event::Empty(event)) if event.name().as_ref() == b"Relationship" => {
-                let id = xml_attribute(&event, b"Id").unwrap_or_default();
-                let relationship_type = xml_attribute(&event, b"Type").unwrap_or_default();
-                let target = xml_attribute(&event, b"Target").unwrap_or_default();
-                let target_mode = if xml_attribute(&event, b"TargetMode")
-                    .is_some_and(|mode| mode.eq_ignore_ascii_case("External"))
-                {
-                    TargetMode::External
-                } else {
-                    TargetMode::Internal
-                };
-                let resolved_target = match target_mode {
-                    TargetMode::External => None,
-                    TargetMode::Internal => resolve_relationship_target(source, &target),
-                };
-                relationships.push(Relationship {
-                    source: source.to_string(),
-                    id,
-                    relationship_type,
-                    target,
-                    resolved_target,
-                    target_mode,
-                });
-            }
-            Ok(_) => {}
-            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
-        }
-        buffer.clear();
-    }
-
-    Ok(relationships)
-}
-
-fn xml_attribute(event: &BytesStart<'_>, name: &[u8]) -> Option<String> {
-    event
-        .attributes()
-        .with_checks(false)
-        .filter_map(Result::ok)
-        .find(|attribute| attribute.key.as_ref() == name)
-        .map(|attribute| String::from_utf8_lossy(attribute.value.as_ref()).into_owned())
-}
-
-fn relationship_source(path: &str) -> Option<String> {
-    if path == "_rels/.rels" {
-        return Some("/".to_string());
-    }
-    if let Some(name) = path.strip_prefix("_rels/") {
-        return name
-            .strip_suffix(".rels")
-            .map(|source| format!("/{}", normalize_package_path(source)));
-    }
-    let (directory, name) = path.rsplit_once("/_rels/")?;
-    let source_name = name.strip_suffix(".rels")?;
-    Some(format!("/{directory}/{source_name}"))
-}
-
-fn resolve_relationship_target(source: &str, target: &str) -> Option<String> {
-    let combined = if target.starts_with('/') {
-        target.to_string()
-    } else {
-        let directory = source
-            .rsplit_once('/')
-            .map_or("", |(directory, _)| directory);
-        format!("{directory}/{target}")
-    };
-    Some(format!("/{}", normalize_package_path(&combined)))
-}
-
-fn normalize_package_path(path: &str) -> String {
-    let mut components = Vec::new();
-    for component in path.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                components.pop();
-            }
-            component => components.push(component),
-        }
-    }
-    components.join("/")
 }
 
 fn part_kind_label(kind: &PartKind) -> &'static str {
@@ -437,7 +153,38 @@ fn push_detail_line(text: &mut String, line: &str) -> usize {
     line_number
 }
 
-fn build_preview(
+fn pretty_print_json(value: &serde_json::Value) -> io::Result<String> {
+    struct LimitedWriter {
+        output: Vec<u8>,
+        limit: usize,
+    }
+
+    impl io::Write for LimitedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.output.len()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("formatted JSON preview exceeds {MAX_JSON_PREVIEW_BYTES} byte limit"),
+                ));
+            }
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut output = LimitedWriter {
+        output: Vec::new(),
+        limit: MAX_JSON_PREVIEW_BYTES,
+    };
+    serde_json::to_writer_pretty(&mut output, value).map_err(io::Error::other)?;
+    String::from_utf8(output.output).map_err(io::Error::other)
+}
+
+pub(crate) fn build_preview(
     path: &str,
     content_type: Option<&str>,
     size: u64,
@@ -445,8 +192,19 @@ fn build_preview(
     bytes: &[u8],
 ) -> Preview {
     if App::is_image(path) {
-        return match image::load_from_memory_with_format(bytes, App::image_format(path)) {
-            Ok(image) => Preview::Image(image),
+        let mut reader = ImageReader::with_format(Cursor::new(bytes), App::image_format(path));
+        let mut limits = Limits::default();
+        limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+        limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+        limits.max_alloc = Some(MAX_IMAGE_PIXELS * 4);
+        reader.limits(limits);
+        return match reader.decode() {
+            Ok(image)
+                if u64::from(image.width()) * u64::from(image.height()) <= MAX_IMAGE_PIXELS =>
+            {
+                Preview::Image(image)
+            }
+            Ok(_) => Preview::Error(format!("image exceeds {MAX_IMAGE_PIXELS} pixel limit")),
             Err(error) => Preview::Error(format!("image decode failed: {error}")),
         };
     }
@@ -458,7 +216,7 @@ fn build_preview(
                 kind: PreviewKind::Xml,
                 text: formatted,
             },
-            Err(error) => Preview::Error(format!("XML parsing failed: {error}")),
+            Err(error) => Preview::Error(format!("XML preview failed: {error}")),
         };
     }
 
@@ -467,7 +225,10 @@ fn build_preview(
             return Preview::Error("JSON is not valid UTF-8".to_string());
         };
         let formatted = match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(value) => serde_json::to_string_pretty(&value).unwrap_or(text),
+            Ok(value) => match pretty_print_json(&value) {
+                Ok(formatted) => formatted,
+                Err(error) => return Preview::Error(format!("JSON preview failed: {error}")),
+            },
             Err(_) => text,
         };
         return Preview::Editor {
@@ -664,20 +425,10 @@ fn read_part<R: Read + io::Seek>(
     index: &PackageIndex,
     path: &str,
 ) -> io::Result<Vec<u8>> {
-    let archive_name = index
-        .parts
-        .get(path)
-        .map(|part| part.archive_name.clone())
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("part not found: {path}"))
-        })?;
-    let mut entry = archive.by_name(&archive_name).map_err(io::Error::other)?;
-    let mut bytes = Vec::new();
-    entry.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    index.read_part(archive, path, crate::package::MAX_ENTRY_BYTES)
 }
 
-fn build_document_summary<R: Read + io::Seek>(
+pub(crate) fn build_document_summary<R: Read + io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     index: &PackageIndex,
 ) -> io::Result<Option<DetailsView>> {
@@ -691,6 +442,23 @@ fn build_document_summary<R: Read + io::Seek>(
         return Ok(Some(build_excel_summary(archive, index)?));
     }
     Ok(None)
+}
+
+fn validate_xml_bytes(bytes: &[u8], part: &str) -> io::Result<()> {
+    let mut reader = Reader::from_reader(bytes);
+    let mut buffer = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Eof) => return Ok(()),
+            Ok(_) => buffer.clear(),
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{part}: malformed XML: {error}"),
+                ));
+            }
+        }
+    }
 }
 
 fn element_is(name: &[u8], expected: &[u8]) -> bool {
@@ -729,13 +497,65 @@ fn relationship_count(index: &PackageIndex, source: &str, suffix: &str) -> usize
         .unwrap_or(0)
 }
 
+fn append_decoded_reference(
+    output: &mut String,
+    event: &quick_xml::events::BytesRef<'_>,
+    limit: usize,
+) {
+    let Ok(reference) = event.decode() else {
+        return;
+    };
+    let encoded = format!("&{};", reference);
+    let Ok(decoded) = quick_xml::escape::unescape(&encoded) else {
+        return;
+    };
+    let remaining = limit.saturating_sub(output.chars().count());
+    output.extend(decoded.chars().take(remaining));
+}
+
+fn append_decoded_text(
+    output: &mut String,
+    event: &quick_xml::events::BytesText<'_>,
+    limit: usize,
+) {
+    if output.chars().count() >= limit {
+        return;
+    }
+    let decoded = event
+        .decode()
+        .ok()
+        .and_then(|value| {
+            quick_xml::escape::unescape(value.as_ref())
+                .ok()
+                .map(|unescaped| unescaped.into_owned())
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(event.as_ref()).into_owned());
+    let remaining = limit.saturating_sub(output.chars().count());
+    output.extend(decoded.chars().take(remaining));
+}
+
 fn clean_summary_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(MAX_SUMMARY_TEXT_CHARS).collect()
 }
 
 fn push_summary_line(view: &mut DetailsView, line: impl AsRef<str>, target: Option<&str>) {
+    if view.text.lines().count() >= MAX_SUMMARY_LINES || view.text.len() >= MAX_SUMMARY_CHARS {
+        return;
+    }
     let line = line.as_ref();
-    let line_number = push_detail_line(&mut view.text, line);
+    let remaining = MAX_SUMMARY_CHARS.saturating_sub(view.text.len() + 1);
+    let mut bounded = String::new();
+    for character in line.chars() {
+        if bounded.len() + character.len_utf8() > remaining {
+            break;
+        }
+        bounded.push(character);
+    }
+    if bounded.chars().count() < line.chars().count() {
+        bounded.push('…');
+    }
+    let line_number = push_detail_line(&mut view.text, &bounded);
     let Some(target) = target else {
         return;
     };
@@ -756,6 +576,7 @@ fn build_ppt_summary<R: Read + io::Seek>(
     index: &PackageIndex,
 ) -> io::Result<DetailsView> {
     let presentation = read_part(archive, index, "/ppt/presentation.xml")?;
+    validate_xml_bytes(&presentation, "/ppt/presentation.xml")?;
     let slide_paths = parse_ppt_slide_order(&presentation, index);
     let mut summary = DetailsView {
         text: String::new(),
@@ -767,6 +588,7 @@ fn build_ppt_summary<R: Read + io::Seek>(
 
     for (number, slide_path) in slide_paths.iter().enumerate() {
         let slide = read_part(archive, index, slide_path)?;
+        validate_xml_bytes(&slide, slide_path)?;
         let title = extract_ppt_title(&slide).unwrap_or_else(|| "(untitled)".to_string());
         let image_count = relationship_count(index, slide_path, "/image");
         let notes_path = index.outgoing.get(slide_path).and_then(|relationships| {
@@ -779,11 +601,15 @@ fn build_ppt_summary<R: Read + io::Seek>(
                 }
             })
         });
-        let notes_text = notes_path
-            .as_deref()
-            .and_then(|path| read_part(archive, index, path).ok())
-            .map(|bytes| clean_summary_text(&extract_all_text(&bytes)))
-            .filter(|text| !text.is_empty());
+        let notes_text = match notes_path.as_deref() {
+            Some(path) => {
+                let bytes = read_part(archive, index, path)?;
+                validate_xml_bytes(&bytes, path)?;
+                let text = clean_summary_text(&extract_all_text(&bytes));
+                (!text.is_empty()).then_some(text)
+            }
+            None => None,
+        };
 
         push_summary_line(&mut summary, "", None);
         push_summary_line(&mut summary, format!("{}. {}", number + 1, title), None);
@@ -825,7 +651,9 @@ fn parse_ppt_slide_order(xml: &[u8], index: &PackageIndex) -> Vec<String> {
                     if let Some(path) =
                         relationship_target_for_id(index, "/ppt/presentation.xml", &relationship_id)
                     {
-                        slides.push(path);
+                        if slides.len() < MAX_SUMMARY_ITEMS {
+                            slides.push(path);
+                        }
                     }
                 }
             }
@@ -876,7 +704,10 @@ fn extract_ppt_title(xml: &[u8]) -> Option<String> {
                 title_shape = true;
             }
             Ok(Event::Text(event)) if title_shape => {
-                text.push_str(&String::from_utf8_lossy(event.as_ref()));
+                append_decoded_text(&mut text, &event, MAX_SUMMARY_TEXT_CHARS);
+            }
+            Ok(Event::GeneralRef(event)) if title_shape => {
+                append_decoded_reference(&mut text, &event, MAX_SUMMARY_TEXT_CHARS);
             }
             Ok(Event::End(event)) if element_is(event.name().as_ref(), b"sp") => {
                 if shape_depth == 1 && title_shape {
@@ -904,7 +735,12 @@ fn extract_all_text(xml: &[u8]) -> String {
 
     loop {
         match reader.read_event_into(&mut buffer) {
-            Ok(Event::Text(event)) => text.push_str(&String::from_utf8_lossy(event.as_ref())),
+            Ok(Event::Text(event)) => {
+                append_decoded_text(&mut text, &event, MAX_SUMMARY_TEXT_CHARS);
+            }
+            Ok(Event::GeneralRef(event)) => {
+                append_decoded_reference(&mut text, &event, MAX_SUMMARY_TEXT_CHARS);
+            }
             Ok(Event::Eof) => break,
             Ok(_) => {}
             Err(_) => break,
@@ -920,6 +756,7 @@ fn build_word_summary<R: Read + io::Seek>(
     index: &PackageIndex,
 ) -> io::Result<DetailsView> {
     let document = read_part(archive, index, "/word/document.xml")?;
+    validate_xml_bytes(&document, "/word/document.xml")?;
     let (paragraph_count, table_count, headings) = parse_word_document(&document);
     let image_count = relationship_count(index, "/word/document.xml", "/image");
     let mut summary = DetailsView {
@@ -989,7 +826,10 @@ fn parse_word_document(xml: &[u8]) -> (usize, usize, Vec<(usize, String)>) {
                 }
             }
             Ok(Event::Text(event)) if text_element => {
-                paragraph_text.push_str(&String::from_utf8_lossy(event.as_ref()));
+                append_decoded_text(&mut paragraph_text, &event, MAX_SUMMARY_TEXT_CHARS);
+            }
+            Ok(Event::GeneralRef(event)) if text_element => {
+                append_decoded_reference(&mut paragraph_text, &event, MAX_SUMMARY_TEXT_CHARS);
             }
             Ok(Event::End(event)) => {
                 let name = event.name();
@@ -1002,7 +842,7 @@ fn parse_word_document(xml: &[u8]) -> (usize, usize, Vec<(usize, String)>) {
                             .and_then(|value| value.parse::<usize>().ok())
                         {
                             let heading = clean_summary_text(&paragraph_text);
-                            if !heading.is_empty() {
+                            if !heading.is_empty() && headings.len() < MAX_SUMMARY_ITEMS {
                                 headings.push((level, heading));
                             }
                         }
@@ -1027,13 +867,18 @@ fn build_excel_summary<R: Read + io::Seek>(
     index: &PackageIndex,
 ) -> io::Result<DetailsView> {
     let workbook = read_part(archive, index, "/xl/workbook.xml")?;
+    validate_xml_bytes(&workbook, "/xl/workbook.xml")?;
     let sheets = parse_excel_workbook(&workbook);
     let shared_strings = index
         .parts
         .contains_key("/xl/sharedStrings.xml")
         .then(|| read_part(archive, index, "/xl/sharedStrings.xml"))
         .transpose()?
-        .map(|bytes| parse_shared_strings(&bytes));
+        .map(|bytes| {
+            validate_xml_bytes(&bytes, "/xl/sharedStrings.xml")?;
+            Ok::<Vec<String>, io::Error>(parse_shared_strings(&bytes))
+        })
+        .transpose()?;
     let shared_strings = shared_strings.unwrap_or_default();
 
     let mut summary = DetailsView {
@@ -1057,6 +902,7 @@ fn build_excel_summary<R: Read + io::Seek>(
             continue;
         };
         let worksheet = read_part(archive, index, &path)?;
+        validate_xml_bytes(&worksheet, &path)?;
         let sheet_summary = parse_excel_worksheet(&worksheet, &shared_strings);
         push_summary_line(&mut summary, format!("  Worksheet: {path}"), Some(&path));
         push_summary_line(
@@ -1117,7 +963,9 @@ fn parse_excel_workbook(xml: &[u8]) -> Vec<(String, String)> {
                     xml_attribute(&event, b"name"),
                     xml_attribute(&event, b"r:id"),
                 ) {
-                    sheets.push((name, relationship_id));
+                    if sheets.len() < MAX_SUMMARY_ITEMS {
+                        sheets.push((name, relationship_id));
+                    }
                 }
             }
             Ok(Event::Eof) => break,
@@ -1149,13 +997,18 @@ fn parse_shared_strings(xml: &[u8]) -> Vec<String> {
                 }
             }
             Ok(Event::Text(event)) if in_text => {
-                current.push_str(&String::from_utf8_lossy(event.as_ref()));
+                append_decoded_text(&mut current, &event, MAX_SUMMARY_TEXT_CHARS);
+            }
+            Ok(Event::GeneralRef(event)) if in_text => {
+                append_decoded_reference(&mut current, &event, MAX_SUMMARY_TEXT_CHARS);
             }
             Ok(Event::End(event)) => {
                 if element_is(event.name().as_ref(), b"t") {
                     in_text = false;
                 } else if element_is(event.name().as_ref(), b"si") {
-                    values.push(current.clone());
+                    if values.len() < MAX_SHARED_STRINGS {
+                        values.push(current.clone());
+                    }
                     in_string = false;
                 }
             }
@@ -1220,7 +1073,9 @@ fn parse_excel_worksheet(xml: &[u8], shared_strings: &[String]) -> ExcelWorkshee
             Ok(Event::Empty(event)) => {
                 if element_is(event.name().as_ref(), b"dimension") {
                     summary.range = xml_attribute(&event, b"ref");
-                } else if element_is(event.name().as_ref(), b"c") {
+                } else if element_is(event.name().as_ref(), b"c")
+                    && summary.cells.len() < MAX_SUMMARY_ITEMS
+                {
                     summary.cells.push(ExcelCell {
                         reference: xml_attribute(&event, b"r").unwrap_or_default(),
                         cell_type: xml_attribute(&event, b"t"),
@@ -1231,14 +1086,32 @@ fn parse_excel_worksheet(xml: &[u8], shared_strings: &[String]) -> ExcelWorkshee
             Ok(Event::Text(event)) => {
                 if let (Some(cell), Some(field)) = (current_cell.as_mut(), active_field) {
                     match field {
-                        ExcelField::Value => cell
-                            .value
-                            .push_str(&String::from_utf8_lossy(event.as_ref())),
-                        ExcelField::Formula => {
-                            cell.formula
-                                .get_or_insert_with(String::new)
-                                .push_str(&String::from_utf8_lossy(event.as_ref()));
+                        ExcelField::Value => {
+                            append_decoded_text(&mut cell.value, &event, MAX_SUMMARY_TEXT_CHARS)
                         }
+                        ExcelField::Formula => {
+                            append_decoded_text(
+                                cell.formula.get_or_insert_with(String::new),
+                                &event,
+                                MAX_SUMMARY_TEXT_CHARS,
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(Event::GeneralRef(event)) => {
+                if let (Some(cell), Some(field)) = (current_cell.as_mut(), active_field) {
+                    match field {
+                        ExcelField::Value => append_decoded_reference(
+                            &mut cell.value,
+                            &event,
+                            MAX_SUMMARY_TEXT_CHARS,
+                        ),
+                        ExcelField::Formula => append_decoded_reference(
+                            cell.formula.get_or_insert_with(String::new),
+                            &event,
+                            MAX_SUMMARY_TEXT_CHARS,
+                        ),
                     }
                 }
             }
@@ -1259,7 +1132,9 @@ fn parse_excel_worksheet(xml: &[u8], shared_strings: &[String]) -> ExcelWorkshee
                         if cell.formula.is_some() {
                             summary.formula_count += 1;
                         }
-                        summary.cells.push(cell);
+                        if summary.cells.len() < MAX_SUMMARY_ITEMS {
+                            summary.cells.push(cell);
+                        }
                     }
                 }
             }
@@ -1274,30 +1149,185 @@ fn parse_excel_worksheet(xml: &[u8], shared_strings: &[String]) -> ExcelWorkshee
 }
 
 impl App {
+    /// Construct an interactive loading state without opening the archive on the UI thread.
+    pub fn new_loading(path: String, picker: Picker, worker: Worker) -> io::Result<Self> {
+        let app = Self {
+            file_path: path.clone(),
+            tree_state: TreeState::default(),
+            tree_items: Vec::new(),
+            editor_state: EditorState::default(),
+            image_state: None,
+            preview_kind: PreviewKind::Empty,
+            picker,
+            current_widget: CurrentWidget::Tree,
+            status_message: Some("Loading package…".to_string()),
+            details_visible: true,
+            details_scroll: 0,
+            details_cursor: 0,
+            package_index: PackageIndex::default(),
+            document_summary: None,
+            package: None,
+            worker,
+            open_request_id: 1,
+            preview_request_id: 0,
+            loading: true,
+            worker_error: None,
+            #[cfg(test)]
+            synchronous: false,
+            summary_visible: false,
+            summary_scroll: 0,
+            navigation_back: Vec::new(),
+            navigation_forward: Vec::new(),
+            navigation_current: None,
+            show_help: false,
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_index: None,
+        };
+        app.worker.submit(Job::Open {
+            request_id: app.open_request_id,
+            path: PathBuf::from(&app.file_path),
+        })?;
+        Ok(app)
+    }
+
+    /// Poll without blocking; this is used by the event loop and is deterministic in tests.
+    pub fn poll_worker(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            let result = match self.worker.try_recv() {
+                Ok(Some(result)) => result,
+                Ok(None) => break,
+                Err(error) => {
+                    self.loading = false;
+                    self.worker_error = Some(error.to_string());
+                    self.status_message = Some(format!("Package worker failed: {error}"));
+                    return true;
+                }
+            };
+            changed = true;
+            match result {
+                ResultMessage::Opened {
+                    request_id,
+                    path,
+                    package,
+                    summary,
+                } => {
+                    if request_id != self.open_request_id
+                        || path.to_string_lossy() != self.file_path
+                    {
+                        continue;
+                    }
+                    match *package {
+                        Ok(package) => {
+                            self.package_index = package.index.clone();
+                            self.package = Some(package);
+                            self.editor_state = EditorState::default();
+                            self.image_state = None;
+                            self.preview_kind = PreviewKind::Empty;
+                            self.install_tree();
+                            self.document_summary = summary.view;
+                            for diagnostic in summary.diagnostics {
+                                self.package_index
+                                    .warnings
+                                    .push(format!("{}: {}", diagnostic.stage, diagnostic.message));
+                                self.package_index.diagnostics.push(diagnostic);
+                            }
+                            self.loading = false;
+                            self.status_message = Some(
+                                "Select a package part or press Enter to preview content"
+                                    .to_string(),
+                            );
+                        }
+                        Err(error) => {
+                            self.loading = false;
+                            self.worker_error = Some(error.clone());
+                            self.status_message = Some(format!("Could not open package: {error}"));
+                        }
+                    }
+                }
+                ResultMessage::PartRead {
+                    request_id,
+                    selected_path,
+                    preview,
+                } => {
+                    let current = self.tree_state.selected().last().cloned();
+                    if !current.as_deref().is_some_and(|path| {
+                        accepts_result(request_id, self.preview_request_id, &selected_path, path)
+                    }) {
+                        continue;
+                    }
+                    match preview {
+                        Ok(Preview::Editor { kind, text }) => {
+                            self.preview_kind = kind;
+                            self.editor_state = EditorState::new(Lines::from(text.as_str()));
+                            self.status_message = None;
+                        }
+                        Ok(Preview::Image(image)) => {
+                            self.preview_kind = PreviewKind::Image;
+                            self.image_state = Some(self.picker.new_resize_protocol(image));
+                            self.status_message = None;
+                        }
+                        Ok(Preview::Info(message)) => {
+                            self.preview_kind = PreviewKind::Info;
+                            self.status_message = Some(message);
+                        }
+                        Ok(Preview::Error(message)) => {
+                            self.preview_kind = PreviewKind::Error;
+                            self.status_message = Some(format!(
+                                "Could not preview {}: {message}",
+                                selected_path.trim_start_matches('/')
+                            ));
+                        }
+                        Err(error) => {
+                            self.preview_kind = PreviewKind::Error;
+                            self.status_message = Some(format!("Could not preview: {error}"));
+                        }
+                    }
+                }
+            }
+        }
+        let worker_busy = self.loading
+            || self
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("Loading "));
+        if !self.worker.is_alive() && worker_busy {
+            self.loading = false;
+            let message = "Package worker exited before completing the request".to_string();
+            self.worker_error = Some(message.clone());
+            self.status_message = Some(message);
+            changed = true;
+        }
+        changed
+    }
+
+    pub fn is_package_loaded(&self) -> bool {
+        !self.loading && self.package.is_some()
+    }
+
+    #[cfg(test)]
     pub fn from_file(path: String, picker: Picker) -> io::Result<Self> {
+        let package = Package::open(path.clone())?;
+        let package_source = package.source.clone();
+        let mut package_index = package.index.clone();
+        package_index.source = Some(package_source);
         let file = std::fs::File::open(path.clone())?;
         let mut archive = zip::ZipArchive::new(file)?;
-
         let mut root = Node::new("root", "");
-        let mut archive_paths = HashMap::new();
-        let file_names = archive
-            .file_names()
-            .map(str::to_owned)
-            .collect::<Vec<String>>();
-
-        for file_name in file_names {
-            let normalized_path = App::normalize_path(&file_name);
+        for normalized_path in package_index
+            .parts
+            .keys()
+            .map(|path| path.trim_start_matches('/'))
+        {
             if normalized_path.is_empty() {
                 continue;
             }
-
-            let path = normalized_path.split('/').collect::<Vec<&str>>();
-            App::build_tree(&mut root, &path, 0);
-            archive_paths.insert(format!("/{normalized_path}"), file_name);
+            let components = normalized_path.split('/').collect::<Vec<&str>>();
+            App::build_tree(&mut root, &components, 0);
         }
-
         let tree_items = App::create_tree(&root)?;
-        let mut package_index = PackageIndex::from_archive(&mut archive)?;
         let document_summary = match build_document_summary(&mut archive, &package_index) {
             Ok(summary) => summary,
             Err(error) => {
@@ -1325,6 +1355,14 @@ impl App {
             details_cursor: 0,
             package_index,
             document_summary,
+            package: Some(package),
+            worker: Worker::start()?,
+            open_request_id: 0,
+            preview_request_id: 0,
+            loading: false,
+            worker_error: None,
+            #[cfg(test)]
+            synchronous: true,
             summary_visible: false,
             summary_scroll: 0,
             navigation_back: Vec::new(),
@@ -1335,7 +1373,6 @@ impl App {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_index: None,
-            archive_paths,
         })
     }
 
@@ -1759,78 +1796,76 @@ impl App {
         }
 
         let display_name = selected.trim_start_matches('/');
-        let file_name = self
-            .archive_paths
-            .get(&selected)
-            .map(String::as_str)
-            .unwrap_or(display_name);
-
-        let file = std::fs::File::open(self.file_path.clone())?;
-        let mut zip = zip::ZipArchive::new(file)?;
-        let is_directory = self.is_directory(&selected);
-        let mut entry = match zip.by_name(file_name) {
-            Ok(entry) => entry,
-            Err(_) if is_directory => {
+        let Some(part) = self.package_index.parts.get(&selected) else {
+            if self.is_directory(&selected) {
                 self.status_message = Some(format!("Directory: {display_name}"));
-                return Ok(());
-            }
-            Err(_) => {
+            } else {
                 self.status_message = Some(format!("Unavailable package part: {display_name}"));
-                return Ok(());
             }
+            return Ok(());
         };
-
-        if entry.is_dir() {
+        if part.kind == PartKind::Directory {
             self.status_message = Some(format!("Directory: {display_name}"));
             return Ok(());
         }
-
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes)?;
-
-        let content_type = self
-            .package_index
-            .parts
-            .get(&selected)
-            .and_then(|part| part.content_type.as_deref());
-        match build_preview(
-            file_name,
-            content_type,
-            entry.size(),
-            entry.compressed_size(),
-            &bytes,
-        ) {
-            Preview::Editor { kind, text } => {
-                self.preview_kind = kind;
-                self.editor_state = EditorState::new(Lines::from(text.as_str()));
-                self.status_message = None;
-            }
-            Preview::Image(image) => {
-                self.preview_kind = PreviewKind::Image;
-                self.image_state = Some(self.picker.new_resize_protocol(image));
-                self.status_message = None;
-            }
-            Preview::Info(message) => {
-                self.preview_kind = PreviewKind::Info;
-                self.status_message = Some(message);
-            }
-            Preview::Error(message) => {
-                self.preview_kind = PreviewKind::Error;
-                self.status_message = Some(format!("Could not preview {display_name}: {message}"));
+        let Some(package) = self.package.as_ref() else {
+            self.status_message = Some("Package is still loading".to_string());
+            return Ok(());
+        };
+        self.preview_request_id = self.preview_request_id.wrapping_add(1);
+        if let Err(error) = self.worker.submit(Job::ReadPart {
+            request_id: self.preview_request_id,
+            package_path: package.source.clone(),
+            selected_path: selected.clone(),
+            archive_name: part.archive_name.clone(),
+            content_type: part.content_type.clone(),
+            size: part.size,
+            compressed_size: part.compressed_size,
+            index: Box::new(self.package_index.clone()),
+        }) {
+            self.preview_kind = PreviewKind::Error;
+            self.worker_error = Some(error.to_string());
+            self.status_message = Some(format!("Package worker failed: {error}"));
+            return Ok(());
+        }
+        self.status_message = Some(format!("Loading {display_name}…"));
+        #[cfg(test)]
+        if self.synchronous {
+            for _ in 0..200 {
+                if self.poll_worker() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
-
         Ok(())
     }
 
     fn is_directory(&self, path: &str) -> bool {
-        self.archive_paths
-            .get(path)
-            .is_some_and(|archive_path| archive_path.ends_with('/'))
-            || self
-                .archive_paths
-                .keys()
-                .any(|child| child.starts_with(&format!("{path}/")))
+        self.package_index.is_directory(path)
+    }
+
+    fn install_tree(&mut self) {
+        let mut root = Node::new("root", "");
+        for normalized_path in self
+            .package_index
+            .parts
+            .keys()
+            .map(|path| path.trim_start_matches('/'))
+        {
+            if normalized_path.is_empty() {
+                continue;
+            }
+            let components = normalized_path.split('/').collect::<Vec<&str>>();
+            Self::build_tree(&mut root, &components, 0);
+        }
+        match Self::create_tree(&root) {
+            Ok(tree_items) => self.tree_items = tree_items,
+            Err(error) => {
+                self.tree_items.clear();
+                self.worker_error = Some(format!("Could not build package tree: {error}"));
+            }
+        }
     }
 
     fn select_path(&mut self, path: &str) {
@@ -1860,7 +1895,8 @@ impl App {
         }
 
         self.search_matches = self
-            .archive_paths
+            .package_index
+            .parts
             .keys()
             .filter(|path| path.to_ascii_lowercase().contains(&query))
             .cloned()
@@ -1876,10 +1912,6 @@ impl App {
         self.search_index = Some(0);
         let path = self.search_matches[0].clone();
         self.select_path(&path);
-    }
-
-    fn normalize_path(path: &str) -> String {
-        normalize_package_path(path)
     }
 
     fn is_xml(path: &str) -> bool {
@@ -1920,10 +1952,35 @@ impl App {
     }
 
     fn pretty_print_xml(xml: &str) -> io::Result<String> {
+        struct LimitedWriter {
+            output: Vec<u8>,
+            limit: usize,
+        }
+
+        impl io::Write for LimitedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.len() > self.limit.saturating_sub(self.output.len()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("formatted XML preview exceeds {MAX_XML_PREVIEW_BYTES} byte limit"),
+                    ));
+                }
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
         let mut reader = Reader::from_str(xml);
         reader.config_mut().trim_text(false);
 
-        let mut output = Vec::new();
+        let mut output = LimitedWriter {
+            output: Vec::with_capacity(xml.len().min(MAX_XML_PREVIEW_BYTES)),
+            limit: MAX_XML_PREVIEW_BYTES,
+        };
         let mut writer = Writer::new_with_indent(&mut output, b' ', 2);
         let mut buffer = Vec::new();
 
@@ -1936,22 +1993,23 @@ impl App {
             buffer.clear();
         }
 
-        String::from_utf8(output).map_err(io::Error::other)
+        String::from_utf8(output.output).map_err(io::Error::other)
     }
 
     fn build_tree(node: &mut Node, parts: &[&str], depth: usize) {
-        if depth < parts.len() {
-            let item = parts[depth];
-            let child_index = match node.children.iter().position(|child| child.name == item) {
-                Some(index) => index,
-                None => {
-                    let path = format!("{}/{}", node.path, item);
-                    node.children.push(Node::new(item, &path));
-                    node.children.len() - 1
-                }
-            };
-            App::build_tree(&mut node.children[child_index], parts, depth + 1);
+        if depth >= MAX_PATH_DEPTH || depth >= parts.len() {
+            return;
         }
+        let item = parts[depth];
+        let child_index = match node.children.iter().position(|child| child.name == item) {
+            Some(index) => index,
+            None => {
+                let path = format!("{}/{}", node.path, item);
+                node.children.push(Node::new(item, &path));
+                node.children.len() - 1
+            }
+        };
+        App::build_tree(&mut node.children[child_index], parts, depth + 1);
     }
 
     fn create_tree(root: &Node) -> io::Result<Vec<TreeItem<'static, String>>> {
@@ -1975,9 +2033,53 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use crate::App;
+    use crate::package::normalize_package_path;
+    use crate::{worker::Worker, App};
     use ratatui_image::picker::Picker;
     use std::io;
+
+    #[test]
+    fn loading_constructor_installs_worker_package_result() -> io::Result<()> {
+        let worker = Worker::start()?;
+        let mut app =
+            App::new_loading("data/sample.pptx".to_string(), Picker::halfblocks(), worker)?;
+        assert!(app.loading);
+        assert!(app.tree_items.is_empty());
+        for _ in 0..200 {
+            if app.poll_worker() && !app.loading {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!app.loading);
+        assert!(app.is_package_loaded());
+        assert!(!app.tree_items.is_empty());
+        assert!(app.document_summary.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn loading_error_keeps_no_package_state() -> io::Result<()> {
+        let worker = Worker::start()?;
+        let mut app = App::new_loading(
+            "/definitely/not/a/package.pptx".to_string(),
+            Picker::halfblocks(),
+            worker,
+        )?;
+        for _ in 0..200 {
+            if app.poll_worker() && !app.loading {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!app.loading);
+        assert!(!app.is_package_loaded());
+        assert!(app.tree_items.is_empty());
+        assert!(app.selection_status().contains("No package"));
+        app.expand_all();
+        app.collapse_all();
+        Ok(())
+    }
 
     #[test]
     fn load_pptx() -> io::Result<()> {
@@ -2065,6 +2167,44 @@ mod tests {
     #[test]
     fn malformed_xml_is_reported_as_an_error() {
         assert!(App::pretty_print_xml("<root><item></root>").is_err());
+        let error = super::validate_xml_bytes(b"<root><item></root>", "/ppt/presentation.xml")
+            .expect_err("summary validation must reject malformed XML");
+        assert!(error.to_string().contains("/ppt/presentation.xml"));
+        assert!(
+            super::validate_xml_bytes(b"<sst><si><t>bad</sst>", "/xl/sharedStrings.xml").is_err()
+        );
+    }
+
+    #[test]
+    fn xml_preview_rejects_indentation_amplification() {
+        let depth = super::MAX_XML_PREVIEW_BYTES / 1024;
+        let mut xml = String::from("<root>");
+        for _ in 0..depth {
+            xml.push_str("<item>");
+        }
+        for _ in 0..depth {
+            xml.push_str("</item>");
+        }
+        xml.push_str("</root>");
+
+        let error = App::pretty_print_xml(&xml).expect_err("formatted XML must be bounded");
+        assert!(error.to_string().contains("formatted XML preview exceeds"));
+    }
+
+    #[test]
+    fn summary_text_decodes_entities_and_stays_bounded() {
+        let text = super::extract_all_text(br#"<root>one &amp; &lt;two&gt;</root>"#);
+        assert_eq!(text, "one & <two>");
+
+        let mut view = super::DetailsView {
+            text: String::new(),
+            links: Vec::new(),
+        };
+        for _ in 0..(super::MAX_SUMMARY_LINES * 2) {
+            super::push_summary_line(&mut view, "summary line", None);
+        }
+        assert!(view.text.len() <= super::MAX_SUMMARY_CHARS);
+        assert!(view.text.lines().count() <= super::MAX_SUMMARY_LINES);
     }
 
     #[test]
@@ -2164,10 +2304,10 @@ mod tests {
     #[test]
     fn unusual_paths_are_normalized_for_tree_identifiers() {
         assert_eq!(
-            App::normalize_path("/ppt//slides/./slide1.xml"),
+            normalize_package_path("/ppt//slides/./slide1.xml"),
             "ppt/slides/slide1.xml"
         );
-        assert_eq!(App::normalize_path("///"), "");
+        assert_eq!(normalize_package_path("///"), "");
     }
 
     #[test]

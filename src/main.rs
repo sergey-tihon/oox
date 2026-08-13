@@ -3,6 +3,7 @@ use std::{
     fs::OpenOptions,
     io::{self, Write},
     path::PathBuf,
+    time::Duration,
 };
 
 use clap::Parser;
@@ -19,10 +20,15 @@ use edtui::{EditorEventHandler, EditorMode as EdtuiMode};
 use keybindings::Action;
 use ratatui::prelude::*;
 use ratatui_image::picker::Picker;
+use worker::Worker;
 
 mod app;
 mod keybindings;
+mod layout;
+mod package;
+mod summary;
 mod ui;
+mod worker;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -53,25 +59,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config_path = keybindings::resolve_config_path(cli.config.as_deref())?;
     let editor_mode = keybindings::load(config_path.as_deref())?;
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-    let mut app = App::from_file(cli.file.to_string_lossy().into_owned(), picker)?;
+    let worker = Worker::start()?;
+    let mut app = App::new_loading(cli.file.to_string_lossy().into_owned(), picker, worker)?;
 
-    enable_raw_mode()?;
-    let mut stderr = io::stderr();
-    if let Err(error) = execute!(stderr, EnterAlternateScreen, EnableMouseCapture) {
-        disable_raw_mode()?;
-        return Err(error.into());
-    }
+    let stderr = io::stderr();
     let backend = CrosstermBackend::new(stderr);
     let mut terminal = Terminal::new(backend)?;
+    enable_raw_mode()?;
+    if let Err(error) = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    ) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
+        return Err(error.into());
+    }
     let mut editor_handler = match editor_mode {
         keybindings::EditorMode::Vim => EditorEventHandler::vim_mode(),
         keybindings::EditorMode::Emacs => EditorEventHandler::emacs_mode(),
     };
-    let result = run_app(&mut terminal, &mut app, &mut editor_handler, editor_mode);
-    let restore_result = restore_terminal(&mut terminal);
-
-    result?;
-    restore_result?;
+    let mut terminal_guard = TerminalGuard { terminal };
+    run_app(
+        &mut terminal_guard.terminal,
+        &mut app,
+        &mut editor_handler,
+        editor_mode,
+    )?;
     Ok(())
 }
 
@@ -91,15 +109,20 @@ fn debug_log(message: impl std::fmt::Display) {
     }
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stderr>>) -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-    )?;
-    terminal.show_cursor()?;
-    Ok(())
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<io::Stderr>>,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+        );
+        let _ = self.terminal.show_cursor();
+    }
 }
 
 fn next_focus(current: CurrentWidget, details_visible: bool, backwards: bool) -> CurrentWidget {
@@ -124,12 +147,19 @@ fn run_app(
     editor_mode: keybindings::EditorMode,
 ) -> io::Result<()> {
     loop {
+        app.poll_worker();
         terminal.draw(|f| ui::ui(f, app))?;
 
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
         let event = event::read()?;
         debug_log(format!("event={event:?}"));
 
         if let Event::Mouse(mouse) = &event {
+            if app.show_help {
+                continue;
+            }
             let terminal_area = terminal.size()?.into();
             if let Some(line) = ui::summary_line_at(terminal_area, app, mouse.column, mouse.row) {
                 match mouse.kind {
@@ -156,7 +186,18 @@ fn run_app(
                 continue;
             }
 
+            if ui::content_area_contains(terminal_area, app, mouse.column, mouse.row) {
+                if app.is_package_loaded() {
+                    app.current_widget = CurrentWidget::TextArea;
+                    editor_handler.on_event(event, &mut app.editor_state);
+                }
+                continue;
+            }
+
             if ui::tree_area_contains(terminal_area, app, mouse.column, mouse.row) {
+                if !app.is_package_loaded() {
+                    continue;
+                }
                 app.current_widget = CurrentWidget::Tree;
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
@@ -180,12 +221,18 @@ fn run_app(
             continue;
         }
 
+        let dispatched_actions = match &event {
+            Event::Key(key) if key.kind != event::KeyEventKind::Release => {
+                Some(Action::dispatch(key))
+            }
+            _ => None,
+        };
         if let Event::Key(key) = &event {
             if key.kind == event::KeyEventKind::Release {
                 continue;
             }
 
-            let actions = Action::dispatch(key);
+            let actions = dispatched_actions.as_deref().unwrap_or(&[]);
             debug_log(format!(
                 "key={:?} modifiers={:?} actions={actions:?} focus={:?} editor_mode={:?} help={} search={}",
                 key.code,
@@ -227,11 +274,15 @@ fn run_app(
             }
 
             if actions.contains(&Action::NavigateBack) {
-                app.navigate_back()?;
+                if app.is_package_loaded() {
+                    app.navigate_back()?;
+                }
                 continue;
             }
             if actions.contains(&Action::NavigateForward) {
-                app.navigate_forward()?;
+                if app.is_package_loaded() {
+                    app.navigate_forward()?;
+                }
                 continue;
             }
 
@@ -256,10 +307,12 @@ fn run_app(
                 continue;
             }
 
-            if matches!(
-                app.current_widget,
-                CurrentWidget::Tree | CurrentWidget::Details
-            ) && actions.contains(&Action::ShowSummary)
+            if app.is_package_loaded()
+                && matches!(
+                    app.current_widget,
+                    CurrentWidget::Tree | CurrentWidget::Details
+                )
+                && actions.contains(&Action::ShowSummary)
             {
                 app.toggle_summary()?;
                 continue;
@@ -307,10 +360,14 @@ fn run_app(
             }
         }
 
+        if !app.is_package_loaded() {
+            continue;
+        }
+
         match app.current_widget {
             CurrentWidget::Tree => {
-                if let Event::Key(key) = &event {
-                    let actions = Action::dispatch(key);
+                if let Event::Key(_key) = &event {
+                    let actions = dispatched_actions.as_deref().unwrap_or(&[]);
                     if actions.contains(&Action::MoveDown) {
                         app.tree_state.key_down();
                     } else if actions.contains(&Action::MoveUp) {
@@ -342,8 +399,8 @@ fn run_app(
                 }
             }
             CurrentWidget::Details => {
-                if let Event::Key(key) = &event {
-                    let actions = Action::dispatch(key);
+                if let Event::Key(_key) = &event {
+                    let actions = dispatched_actions.as_deref().unwrap_or(&[]);
                     if actions.contains(&Action::MoveDown) {
                         app.move_details_cursor(false);
                     } else if actions.contains(&Action::MoveUp) {
