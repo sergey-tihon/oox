@@ -7,6 +7,8 @@ A terminal user interface for inspecting Office Open XML (OOXML) documents such 
 - **Tree inspector** — Browse the parts inside an OOXML package as a tree.
 - **XML viewer** — View selected XML parts with syntax highlighting and indentation.
 - **Image preview** — Preview common embedded PNG, JPEG, GIF, BMP, and WebP images.
+- **Raw file previews** — View plain text and JSON, inspect `.bin` files as hex, and see metadata for binary media, fonts, and OLE parts.
+- **Document summaries** — Press `s` to inspect slide, paragraph, heading, table, sheet, cell, and formula summaries for PowerPoint, Word, and Excel packages; linked part paths navigate back to the tree.
 - **Vim-like navigation** — Move through files with `j`/`k` and the editor with Vim bindings.
 
 ## Tech Stack
@@ -65,6 +67,7 @@ oox --version
 | `Tab`     | Cycle tree / metadata / content focus       |
 | `?` / `F1` | Show the help screen                        |
 | `d`       | Toggle the metadata panel                   |
+| `s`       | Toggle the document-specific summary        |
 | Mouse       | Select/expand tree; scroll tree/metadata; click relationship targets |
 | `Esc`     | Cancel search or close help                 |
 | `q`       | Quit from tree / Vim normal mode             |
@@ -106,6 +109,7 @@ mode = "vim" # or "emacs"
 help = ["?", "F1"]
 move_down = ["j", "Down"]
 show_metadata = ["d"]
+show_summary = ["s"]
 ```
 
 The keybinding help screen is generated from the active configuration.

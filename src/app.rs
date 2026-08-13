@@ -46,6 +46,7 @@ pub enum PreviewKind {
     Json,
     Hex,
     Image,
+    Summary,
     Info,
     Error,
 }
@@ -130,6 +131,9 @@ pub struct App {
     pub details_scroll: u16,
     pub details_cursor: usize,
     pub package_index: PackageIndex,
+    pub document_summary: Option<DetailsView>,
+    pub summary_visible: bool,
+    pub summary_scroll: u16,
     navigation_back: Vec<String>,
     navigation_forward: Vec<String>,
     navigation_current: Option<String>,
@@ -655,6 +659,620 @@ fn fallback_mime_type(path: &str) -> &'static str {
     }
 }
 
+fn read_part<R: Read + io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    index: &PackageIndex,
+    path: &str,
+) -> io::Result<Vec<u8>> {
+    let archive_name = index
+        .parts
+        .get(path)
+        .map(|part| part.archive_name.clone())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("part not found: {path}"))
+        })?;
+    let mut entry = archive.by_name(&archive_name).map_err(io::Error::other)?;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn build_document_summary<R: Read + io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    index: &PackageIndex,
+) -> io::Result<Option<DetailsView>> {
+    if index.parts.contains_key("/ppt/presentation.xml") {
+        return Ok(Some(build_ppt_summary(archive, index)?));
+    }
+    if index.parts.contains_key("/word/document.xml") {
+        return Ok(Some(build_word_summary(archive, index)?));
+    }
+    if index.parts.contains_key("/xl/workbook.xml") {
+        return Ok(Some(build_excel_summary(archive, index)?));
+    }
+    Ok(None)
+}
+
+fn element_is(name: &[u8], expected: &[u8]) -> bool {
+    name.rsplit(|byte| *byte == b':').next() == Some(expected)
+}
+
+fn relationship_target_for_id(
+    index: &PackageIndex,
+    source: &str,
+    relationship_id: &str,
+) -> Option<String> {
+    index.outgoing.get(source).and_then(|relationships| {
+        relationships.iter().find_map(|relationship_index| {
+            let relationship = &index.relationships[*relationship_index];
+            (relationship.id == relationship_id)
+                .then(|| relationship.resolved_target.clone())
+                .flatten()
+        })
+    })
+}
+
+fn relationship_count(index: &PackageIndex, source: &str, suffix: &str) -> usize {
+    index
+        .outgoing
+        .get(source)
+        .map(|relationships| {
+            relationships
+                .iter()
+                .filter(|relationship_index| {
+                    index.relationships[**relationship_index]
+                        .relationship_type
+                        .ends_with(suffix)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn clean_summary_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn push_summary_line(view: &mut DetailsView, line: impl AsRef<str>, target: Option<&str>) {
+    let line = line.as_ref();
+    let line_number = push_detail_line(&mut view.text, line);
+    let Some(target) = target else {
+        return;
+    };
+    let Some(byte_start) = line.find(target) else {
+        return;
+    };
+    let start = line[..byte_start].chars().count();
+    view.links.push(DetailLink {
+        line: line_number,
+        start,
+        end: start + target.chars().count(),
+        target: target.to_string(),
+    });
+}
+
+fn build_ppt_summary<R: Read + io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    index: &PackageIndex,
+) -> io::Result<DetailsView> {
+    let presentation = read_part(archive, index, "/ppt/presentation.xml")?;
+    let slide_paths = parse_ppt_slide_order(&presentation, index);
+    let mut summary = DetailsView {
+        text: String::new(),
+        links: Vec::new(),
+    };
+    push_summary_line(&mut summary, "PowerPoint summary", None);
+    push_summary_line(&mut summary, "", None);
+    push_summary_line(&mut summary, format!("Slides: {}", slide_paths.len()), None);
+
+    for (number, slide_path) in slide_paths.iter().enumerate() {
+        let slide = read_part(archive, index, slide_path)?;
+        let title = extract_ppt_title(&slide).unwrap_or_else(|| "(untitled)".to_string());
+        let image_count = relationship_count(index, slide_path, "/image");
+        let notes_path = index.outgoing.get(slide_path).and_then(|relationships| {
+            relationships.iter().find_map(|relationship_index| {
+                let relationship = &index.relationships[*relationship_index];
+                if relationship.relationship_type.ends_with("/notesSlide") {
+                    relationship.resolved_target.clone()
+                } else {
+                    None
+                }
+            })
+        });
+        let notes_text = notes_path
+            .as_deref()
+            .and_then(|path| read_part(archive, index, path).ok())
+            .map(|bytes| clean_summary_text(&extract_all_text(&bytes)))
+            .filter(|text| !text.is_empty());
+
+        push_summary_line(&mut summary, "", None);
+        push_summary_line(&mut summary, format!("{}. {}", number + 1, title), None);
+        push_summary_line(
+            &mut summary,
+            format!("   Part: {slide_path}"),
+            Some(slide_path),
+        );
+        push_summary_line(&mut summary, format!("   Images: {image_count}"), None);
+        match notes_path {
+            Some(path) => {
+                let suffix = notes_text
+                    .as_deref()
+                    .map_or_else(String::new, |text| format!(" — {text}"));
+                push_summary_line(
+                    &mut summary,
+                    format!("   Notes: {path}{suffix}"),
+                    Some(&path),
+                );
+            }
+            None => push_summary_line(&mut summary, "   Notes: none", None),
+        }
+    }
+
+    Ok(summary)
+}
+
+fn parse_ppt_slide_order(xml: &[u8], index: &PackageIndex) -> Vec<String> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut slides = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) | Ok(Event::Empty(event))
+                if element_is(event.name().as_ref(), b"sldId") =>
+            {
+                if let Some(relationship_id) = xml_attribute(&event, b"r:id") {
+                    if let Some(path) =
+                        relationship_target_for_id(index, "/ppt/presentation.xml", &relationship_id)
+                    {
+                        slides.push(path);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        buffer.clear();
+    }
+
+    slides
+}
+
+fn extract_ppt_title(xml: &[u8]) -> Option<String> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut shape_depth = 0usize;
+    let mut title_shape = false;
+    let mut text = String::new();
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) => {
+                if element_is(event.name().as_ref(), b"sp") {
+                    shape_depth += 1;
+                    if shape_depth == 1 {
+                        title_shape = false;
+                        text.clear();
+                    }
+                } else if element_is(event.name().as_ref(), b"ph")
+                    && shape_depth > 0
+                    && xml_attribute(&event, b"type").is_some_and(|value| {
+                        value.eq_ignore_ascii_case("title")
+                            || value.eq_ignore_ascii_case("ctrTitle")
+                    })
+                {
+                    title_shape = true;
+                }
+            }
+            Ok(Event::Empty(event))
+                if element_is(event.name().as_ref(), b"ph")
+                    && shape_depth > 0
+                    && xml_attribute(&event, b"type").is_some_and(|value| {
+                        value.eq_ignore_ascii_case("title")
+                            || value.eq_ignore_ascii_case("ctrTitle")
+                    }) =>
+            {
+                title_shape = true;
+            }
+            Ok(Event::Text(event)) if title_shape => {
+                text.push_str(&String::from_utf8_lossy(event.as_ref()));
+            }
+            Ok(Event::End(event)) if element_is(event.name().as_ref(), b"sp") => {
+                if shape_depth == 1 && title_shape {
+                    let title = clean_summary_text(&text);
+                    if !title.is_empty() {
+                        return Some(title);
+                    }
+                }
+                shape_depth = shape_depth.saturating_sub(1);
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        buffer.clear();
+    }
+
+    None
+}
+
+fn extract_all_text(xml: &[u8]) -> String {
+    let mut reader = Reader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut text = String::new();
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Text(event)) => text.push_str(&String::from_utf8_lossy(event.as_ref())),
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        buffer.clear();
+    }
+
+    text
+}
+
+fn build_word_summary<R: Read + io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    index: &PackageIndex,
+) -> io::Result<DetailsView> {
+    let document = read_part(archive, index, "/word/document.xml")?;
+    let (paragraph_count, table_count, headings) = parse_word_document(&document);
+    let image_count = relationship_count(index, "/word/document.xml", "/image");
+    let mut summary = DetailsView {
+        text: String::new(),
+        links: Vec::new(),
+    };
+    push_summary_line(&mut summary, "Word summary", None);
+    push_summary_line(&mut summary, "", None);
+    push_summary_line(
+        &mut summary,
+        "Document: /word/document.xml",
+        Some("/word/document.xml"),
+    );
+    push_summary_line(&mut summary, format!("Paragraphs: {paragraph_count}"), None);
+    push_summary_line(&mut summary, format!("Tables: {table_count}"), None);
+    push_summary_line(&mut summary, format!("Images: {image_count}"), None);
+    push_summary_line(&mut summary, "", None);
+    push_summary_line(&mut summary, "Heading outline", None);
+    if headings.is_empty() {
+        push_summary_line(&mut summary, "  (none)", None);
+    } else {
+        for (level, heading) in headings {
+            push_summary_line(
+                &mut summary,
+                format!("  {}{}", "  ".repeat(level), heading),
+                None,
+            );
+        }
+    }
+    Ok(summary)
+}
+
+fn parse_word_document(xml: &[u8]) -> (usize, usize, Vec<(usize, String)>) {
+    let mut reader = Reader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut paragraph_count = 0;
+    let mut table_count = 0;
+    let mut headings = Vec::new();
+    let mut in_paragraph = false;
+    let mut paragraph_text = String::new();
+    let mut paragraph_style = None;
+    let mut text_element = false;
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) => {
+                let name = event.name();
+                if element_is(name.as_ref(), b"p") {
+                    paragraph_count += 1;
+                    in_paragraph = true;
+                    paragraph_text.clear();
+                    paragraph_style = None;
+                } else if element_is(name.as_ref(), b"tbl") {
+                    table_count += 1;
+                } else if in_paragraph && element_is(name.as_ref(), b"pStyle") {
+                    paragraph_style = xml_attribute(&event, b"w:val");
+                } else if in_paragraph && element_is(name.as_ref(), b"t") {
+                    text_element = true;
+                }
+            }
+            Ok(Event::Empty(event)) => {
+                let name = event.name();
+                if in_paragraph && element_is(name.as_ref(), b"pStyle") {
+                    paragraph_style = xml_attribute(&event, b"w:val");
+                } else if element_is(name.as_ref(), b"tbl") {
+                    table_count += 1;
+                }
+            }
+            Ok(Event::Text(event)) if text_element => {
+                paragraph_text.push_str(&String::from_utf8_lossy(event.as_ref()));
+            }
+            Ok(Event::End(event)) => {
+                let name = event.name();
+                if element_is(name.as_ref(), b"t") {
+                    text_element = false;
+                } else if element_is(name.as_ref(), b"p") {
+                    if let Some(style) = paragraph_style.as_deref() {
+                        if let Some(level) = style
+                            .strip_prefix("Heading")
+                            .and_then(|value| value.parse::<usize>().ok())
+                        {
+                            let heading = clean_summary_text(&paragraph_text);
+                            if !heading.is_empty() {
+                                headings.push((level, heading));
+                            }
+                        }
+                    }
+                    in_paragraph = false;
+                    paragraph_text.clear();
+                    paragraph_style = None;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        buffer.clear();
+    }
+
+    (paragraph_count, table_count, headings)
+}
+
+fn build_excel_summary<R: Read + io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    index: &PackageIndex,
+) -> io::Result<DetailsView> {
+    let workbook = read_part(archive, index, "/xl/workbook.xml")?;
+    let sheets = parse_excel_workbook(&workbook);
+    let shared_strings = index
+        .parts
+        .contains_key("/xl/sharedStrings.xml")
+        .then(|| read_part(archive, index, "/xl/sharedStrings.xml"))
+        .transpose()?
+        .map(|bytes| parse_shared_strings(&bytes));
+    let shared_strings = shared_strings.unwrap_or_default();
+
+    let mut summary = DetailsView {
+        text: String::new(),
+        links: Vec::new(),
+    };
+    push_summary_line(&mut summary, "Excel summary", None);
+    push_summary_line(&mut summary, "", None);
+    push_summary_line(
+        &mut summary,
+        "Workbook: /xl/workbook.xml",
+        Some("/xl/workbook.xml"),
+    );
+    push_summary_line(&mut summary, format!("Sheets: {}", sheets.len()), None);
+    for (name, relationship_id) in sheets {
+        push_summary_line(&mut summary, "", None);
+        push_summary_line(&mut summary, format!("- {name}"), None);
+        let Some(path) = relationship_target_for_id(index, "/xl/workbook.xml", &relationship_id)
+        else {
+            push_summary_line(&mut summary, "  Worksheet part: unavailable", None);
+            continue;
+        };
+        let worksheet = read_part(archive, index, &path)?;
+        let sheet_summary = parse_excel_worksheet(&worksheet, &shared_strings);
+        push_summary_line(&mut summary, format!("  Worksheet: {path}"), Some(&path));
+        push_summary_line(
+            &mut summary,
+            format!(
+                "  Range: {}",
+                sheet_summary.range.as_deref().unwrap_or("unknown")
+            ),
+            None,
+        );
+        push_summary_line(
+            &mut summary,
+            format!("  Cells: {}", sheet_summary.cells.len()),
+            None,
+        );
+        push_summary_line(
+            &mut summary,
+            format!("  Formulas: {}", sheet_summary.formula_count),
+            None,
+        );
+        for cell in sheet_summary.cells.iter().take(20) {
+            if let Some(formula) = cell.formula.as_deref() {
+                push_summary_line(
+                    &mut summary,
+                    format!("  {} = {formula}", cell.reference),
+                    None,
+                );
+            } else if !cell.value.is_empty() {
+                push_summary_line(
+                    &mut summary,
+                    format!("  {} = {}", cell.reference, cell.value),
+                    None,
+                );
+            }
+        }
+        if sheet_summary.cells.len() > 20 {
+            push_summary_line(
+                &mut summary,
+                format!("  ... {} more cells", sheet_summary.cells.len() - 20),
+                None,
+            );
+        }
+    }
+    Ok(summary)
+}
+
+fn parse_excel_workbook(xml: &[u8]) -> Vec<(String, String)> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut sheets = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) | Ok(Event::Empty(event))
+                if element_is(event.name().as_ref(), b"sheet") =>
+            {
+                if let (Some(name), Some(relationship_id)) = (
+                    xml_attribute(&event, b"name"),
+                    xml_attribute(&event, b"r:id"),
+                ) {
+                    sheets.push((name, relationship_id));
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        buffer.clear();
+    }
+
+    sheets
+}
+
+fn parse_shared_strings(xml: &[u8]) -> Vec<String> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut in_text = false;
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) => {
+                if element_is(event.name().as_ref(), b"si") {
+                    current.clear();
+                    in_string = true;
+                } else if in_string && element_is(event.name().as_ref(), b"t") {
+                    in_text = true;
+                }
+            }
+            Ok(Event::Text(event)) if in_text => {
+                current.push_str(&String::from_utf8_lossy(event.as_ref()));
+            }
+            Ok(Event::End(event)) => {
+                if element_is(event.name().as_ref(), b"t") {
+                    in_text = false;
+                } else if element_is(event.name().as_ref(), b"si") {
+                    values.push(current.clone());
+                    in_string = false;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        buffer.clear();
+    }
+
+    values
+}
+
+#[derive(Default)]
+struct ExcelWorksheetSummary {
+    range: Option<String>,
+    cells: Vec<ExcelCell>,
+    formula_count: usize,
+}
+
+#[derive(Default)]
+struct ExcelCell {
+    reference: String,
+    cell_type: Option<String>,
+    value: String,
+    formula: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum ExcelField {
+    Value,
+    Formula,
+}
+
+fn parse_excel_worksheet(xml: &[u8], shared_strings: &[String]) -> ExcelWorksheetSummary {
+    let mut reader = Reader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut summary = ExcelWorksheetSummary::default();
+    let mut current_cell = None;
+    let mut active_field = None;
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) => {
+                let name = event.name();
+                if element_is(name.as_ref(), b"dimension") {
+                    summary.range = xml_attribute(&event, b"ref");
+                } else if element_is(name.as_ref(), b"c") {
+                    current_cell = Some(ExcelCell {
+                        reference: xml_attribute(&event, b"r").unwrap_or_default(),
+                        cell_type: xml_attribute(&event, b"t"),
+                        ..ExcelCell::default()
+                    });
+                } else if current_cell.is_some() && element_is(name.as_ref(), b"v") {
+                    active_field = Some(ExcelField::Value);
+                } else if current_cell.is_some() && element_is(name.as_ref(), b"f") {
+                    active_field = Some(ExcelField::Formula);
+                } else if current_cell.is_some() && element_is(name.as_ref(), b"t") {
+                    active_field = Some(ExcelField::Value);
+                }
+            }
+            Ok(Event::Empty(event)) => {
+                if element_is(event.name().as_ref(), b"dimension") {
+                    summary.range = xml_attribute(&event, b"ref");
+                } else if element_is(event.name().as_ref(), b"c") {
+                    summary.cells.push(ExcelCell {
+                        reference: xml_attribute(&event, b"r").unwrap_or_default(),
+                        cell_type: xml_attribute(&event, b"t"),
+                        ..ExcelCell::default()
+                    });
+                }
+            }
+            Ok(Event::Text(event)) => {
+                if let (Some(cell), Some(field)) = (current_cell.as_mut(), active_field) {
+                    match field {
+                        ExcelField::Value => cell
+                            .value
+                            .push_str(&String::from_utf8_lossy(event.as_ref())),
+                        ExcelField::Formula => {
+                            cell.formula
+                                .get_or_insert_with(String::new)
+                                .push_str(&String::from_utf8_lossy(event.as_ref()));
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(event)) => {
+                let name = event.name();
+                if element_is(name.as_ref(), b"v")
+                    || element_is(name.as_ref(), b"f")
+                    || element_is(name.as_ref(), b"t")
+                {
+                    active_field = None;
+                } else if element_is(name.as_ref(), b"c") {
+                    if let Some(mut cell) = current_cell.take() {
+                        if cell.cell_type.as_deref() == Some("s") {
+                            if let Ok(index) = cell.value.parse::<usize>() {
+                                cell.value = shared_strings.get(index).cloned().unwrap_or_default();
+                            }
+                        }
+                        if cell.formula.is_some() {
+                            summary.formula_count += 1;
+                        }
+                        summary.cells.push(cell);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        buffer.clear();
+    }
+
+    summary
+}
+
 impl App {
     pub fn from_file(path: String, picker: Picker) -> io::Result<Self> {
         let file = std::fs::File::open(path.clone())?;
@@ -679,7 +1297,16 @@ impl App {
         }
 
         let tree_items = App::create_tree(&root)?;
-        let package_index = PackageIndex::from_archive(&mut archive)?;
+        let mut package_index = PackageIndex::from_archive(&mut archive)?;
+        let document_summary = match build_document_summary(&mut archive, &package_index) {
+            Ok(summary) => summary,
+            Err(error) => {
+                package_index
+                    .warnings
+                    .push(format!("Could not build document summary: {error}"));
+                None
+            }
+        };
 
         Ok(Self {
             file_path: path,
@@ -697,6 +1324,9 @@ impl App {
             details_scroll: 0,
             details_cursor: 0,
             package_index,
+            document_summary,
+            summary_visible: false,
+            summary_scroll: 0,
             navigation_back: Vec::new(),
             navigation_forward: Vec::new(),
             navigation_current: None,
@@ -723,6 +1353,27 @@ impl App {
             self.details_scroll = 0;
             self.details_cursor = 0;
         }
+    }
+
+    pub fn toggle_summary(&mut self) -> io::Result<()> {
+        if self.summary_visible {
+            self.summary_visible = false;
+            return self.load_selected_file_content_inner(false);
+        }
+
+        if self.document_summary.is_none() {
+            self.preview_kind = PreviewKind::Error;
+            self.status_message = Some("No document-specific summary is available".to_string());
+            return Ok(());
+        }
+
+        self.summary_visible = true;
+        self.summary_scroll = 0;
+        self.image_state = None;
+        self.editor_state = EditorState::default();
+        self.preview_kind = PreviewKind::Summary;
+        self.status_message = None;
+        Ok(())
     }
 
     pub fn expand_all(&mut self) {
@@ -925,6 +1576,37 @@ impl App {
         Ok(true)
     }
 
+    pub fn scroll_summary(&mut self, amount: i16) {
+        if amount.is_negative() {
+            self.summary_scroll = self.summary_scroll.saturating_sub(amount.unsigned_abs());
+        } else {
+            self.summary_scroll = self.summary_scroll.saturating_add(amount as u16);
+        }
+    }
+
+    pub fn activate_summary_link(&mut self, line: usize, column: usize) -> io::Result<bool> {
+        let Some(summary) = self.document_summary.as_ref() else {
+            return Ok(false);
+        };
+        let Some(target) = summary
+            .links
+            .iter()
+            .find(|link| link.line == line && column >= link.start && column < link.end)
+            .map(|link| link.target.clone())
+        else {
+            return Ok(false);
+        };
+
+        if !self.package_index.parts.contains_key(&target) && !self.is_directory(&target) {
+            return Ok(false);
+        }
+        self.summary_visible = false;
+        self.summary_scroll = 0;
+        self.select_path(&target);
+        self.load_selected_file_content_inner(true)?;
+        Ok(true)
+    }
+
     pub fn start_search(&mut self) {
         self.search_active = true;
         if self
@@ -1064,6 +1746,8 @@ impl App {
         self.image_state = None;
         self.editor_state = EditorState::default();
         self.preview_kind = PreviewKind::Empty;
+        self.summary_visible = false;
+        self.summary_scroll = 0;
         self.status_message = Some("Select a package part to inspect".to_string());
 
         let selected = match self.tree_state.selected().last().cloned() {
@@ -1299,7 +1983,58 @@ mod tests {
     fn load_pptx() -> io::Result<()> {
         let app = App::from_file("data/sample.pptx".to_string(), Picker::halfblocks())?;
         assert!(!app.tree_items.is_empty());
+        let summary = app
+            .document_summary
+            .as_ref()
+            .expect("sample presentation should have a summary");
+        assert!(summary.text.contains("Slides: 2"));
+        assert!(summary.text.contains("OOXML TUI"));
+        assert!(summary
+            .links
+            .iter()
+            .any(|link| link.target == "/ppt/slides/slide1.xml"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn summary_links_navigate_to_package_parts() -> io::Result<()> {
+        let mut app = App::from_file("data/sample.pptx".to_string(), Picker::halfblocks())?;
+        app.toggle_summary()?;
+        let link = app
+            .document_summary
+            .as_ref()
+            .and_then(|summary| {
+                summary
+                    .links
+                    .iter()
+                    .find(|link| link.target == "/ppt/slides/slide1.xml")
+            })
+            .cloned()
+            .expect("summary should link to the first slide");
+        assert!(app.activate_summary_link(link.line, link.start)?);
+        assert!(!app.summary_visible);
+        assert_eq!(
+            app.tree_state.selected().last().map(String::as_str),
+            Some("/ppt/slides/slide1.xml")
+        );
+        assert_eq!(app.preview_kind, super::PreviewKind::Xml);
+        Ok(())
+    }
+
+    #[test]
+    fn toggle_document_summary_switches_back_to_selected_content() -> io::Result<()> {
+        let mut app = App::from_file("data/sample.pptx".to_string(), Picker::halfblocks())?;
+        app.toggle_summary()?;
+        assert_eq!(app.preview_kind, super::PreviewKind::Summary);
+        assert!(app.summary_visible);
+
+        app.tree_state
+            .select(vec!["/[Content_Types].xml".to_string()]);
+        app.toggle_summary()?;
+        assert!(!app.summary_visible);
+        assert_eq!(app.preview_kind, super::PreviewKind::Xml);
+        assert!(app.status_message.is_none());
         Ok(())
     }
 
@@ -1357,6 +2092,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn document_summary_parsers_extract_word_and_excel_details() {
+        let word = br#"
+            <w:document xmlns:w="word">
+              <w:body>
+                <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Overview</w:t></w:r></w:p>
+                <w:p><w:r><w:t>Body text</w:t></w:r></w:p>
+                <w:tbl/>
+              </w:body>
+            </w:document>
+        "#;
+        let (paragraphs, tables, headings) = super::parse_word_document(word);
+        assert_eq!(paragraphs, 2);
+        assert_eq!(tables, 1);
+        assert_eq!(headings, vec![(1, "Overview".to_string())]);
+
+        let excel = br#"
+            <worksheet xmlns:r="relationships">
+              <dimension ref="A1:B2"/>
+              <sheetData>
+                <row>
+                  <c r="A1" t="inlineStr"><is><t>Hello</t></is></c>
+                  <c r="B1"><f>SUM(A2:A3)</f><v>3</v></c>
+                </row>
+              </sheetData>
+            </worksheet>
+        "#;
+        let worksheet = super::parse_excel_worksheet(excel, &[]);
+        assert_eq!(worksheet.range.as_deref(), Some("A1:B2"));
+        assert_eq!(worksheet.cells.len(), 2);
+        assert_eq!(worksheet.formula_count, 1);
+        assert_eq!(worksheet.cells[0].value, "Hello");
+        assert_eq!(worksheet.cells[1].formula.as_deref(), Some("SUM(A2:A3)"));
     }
 
     #[test]

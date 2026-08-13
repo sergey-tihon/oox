@@ -131,6 +131,18 @@ fn run_app(
 
         if let Event::Mouse(mouse) = &event {
             let terminal_area = terminal.size()?.into();
+            if let Some(line) = ui::summary_line_at(terminal_area, app, mouse.column, mouse.row) {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => app.scroll_summary(-3),
+                    MouseEventKind::ScrollDown => app.scroll_summary(3),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        app.activate_summary_link(line.0, line.1)?;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             if let Some(line) = ui::metadata_line_at(terminal_area, app, mouse.column, mouse.row) {
                 app.current_widget = CurrentWidget::Details;
                 match mouse.kind {
@@ -241,6 +253,15 @@ fn run_app(
             }
             if can_focus_panel && actions.contains(&Action::FocusContent) {
                 app.current_widget = CurrentWidget::TextArea;
+                continue;
+            }
+
+            if matches!(
+                app.current_widget,
+                CurrentWidget::Tree | CurrentWidget::Details
+            ) && actions.contains(&Action::ShowSummary)
+            {
+                app.toggle_summary()?;
                 continue;
             }
 

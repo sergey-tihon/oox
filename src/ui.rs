@@ -169,7 +169,21 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             normal_style
         });
 
-    if let Some(image_state) = app.image_state.as_mut() {
+    if app.summary_visible {
+        if let Some(summary) = app.document_summary.as_ref() {
+            let summary_inner = editor_block.inner(sections[1]);
+            let max_scroll = summary
+                .text
+                .lines()
+                .count()
+                .saturating_sub(summary_inner.height as usize) as u16;
+            app.summary_scroll = app.summary_scroll.min(max_scroll);
+            let summary = Paragraph::new(Text::from(linked_lines(summary)))
+                .block(editor_block)
+                .scroll((app.summary_scroll, 0));
+            f.render_widget(summary, sections[1]);
+        }
+    } else if let Some(image_state) = app.image_state.as_mut() {
         let image_block = Block::default()
             .borders(Borders::ALL)
             .title(format!("[3] {}", content_title(app.preview_kind)))
@@ -247,6 +261,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             help_line(&Action::Last, "Last item"),
             help_line(&Action::OpenContent, "Expand / preview content"),
             help_line(&Action::ShowMetadata, "Toggle metadata panel"),
+            help_line(&Action::ShowSummary, "Toggle document summary"),
             Line::from("  Mouse click   Select/expand tree item"),
             Line::from("  Mouse wheel   Scroll tree/metadata"),
             Line::from("  Click link    Open related part"),
@@ -307,6 +322,39 @@ pub fn tree_area_contains(area: Rect, app: &App, x: u16, y: u16) -> bool {
         && y < tree.y.saturating_add(tree.height)
 }
 
+pub fn summary_line_at(area: Rect, app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
+    if !app.summary_visible {
+        return None;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .split(chunks[1]);
+    let inner = Block::bordered().inner(columns[1]);
+
+    if x >= inner.x
+        && x < inner.x.saturating_add(inner.width)
+        && y >= inner.y
+        && y < inner.y.saturating_add(inner.height)
+    {
+        Some((
+            usize::from(y - inner.y) + usize::from(app.summary_scroll),
+            usize::from(x - inner.x),
+        ))
+    } else {
+        None
+    }
+}
+
 pub fn metadata_line_at(area: Rect, app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
     if !app.details_visible {
         return None;
@@ -344,6 +392,33 @@ pub fn metadata_line_at(area: Rect, app: &App, x: u16, y: u16) -> Option<(usize,
     }
 }
 
+fn linked_lines(view: &crate::app::DetailsView) -> Vec<Line<'static>> {
+    view.text
+        .lines()
+        .enumerate()
+        .map(|(line, text)| {
+            let Some(link) = view.links.iter().find(|link| link.line == line) else {
+                return Line::from(text.to_string());
+            };
+            let link_style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::UNDERLINED);
+            let prefix = text.chars().take(link.start).collect::<String>();
+            let target = text
+                .chars()
+                .skip(link.start)
+                .take(link.end - link.start)
+                .collect::<String>();
+            let suffix = text.chars().skip(link.end).collect::<String>();
+            Line::from(vec![
+                Span::raw(prefix),
+                Span::styled(target, link_style),
+                Span::raw(suffix),
+            ])
+        })
+        .collect()
+}
+
 fn content_title(kind: PreviewKind) -> &'static str {
     match kind {
         PreviewKind::Xml => "XML content",
@@ -351,6 +426,7 @@ fn content_title(kind: PreviewKind) -> &'static str {
         PreviewKind::Json => "JSON preview",
         PreviewKind::Hex => "Hex dump",
         PreviewKind::Image => "Image preview",
+        PreviewKind::Summary => "Document summary",
         PreviewKind::Info => "Binary information",
         PreviewKind::Error | PreviewKind::Empty => "File content",
     }

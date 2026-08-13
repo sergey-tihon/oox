@@ -55,6 +55,9 @@ pub enum Action {
     /// Toggle the metadata panel.
     #[keybindings["d"]]
     ShowMetadata,
+    /// Toggle the document-specific summary.
+    #[keybindings["s"]]
+    ShowSummary,
     /// Expand all tree nodes.
     #[keybindings["E", "Shift+E", "Shift+e"]]
     ExpandAll,
