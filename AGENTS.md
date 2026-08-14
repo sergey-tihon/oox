@@ -7,8 +7,14 @@
 ## Architecture
 
 - `src/main.rs` — Entry point, terminal setup/teardown, event loop.
-- `src/app.rs` — `App` state: zip tree, tree selection, editor state, file loading, XML pretty-printing.
-- `src/ui.rs` — Ratatui layout and widgets (tree + editor).
+- `src/app.rs` — `App` state: zip tree, tree selection, editor state, file loading, navigation history, search, cached metadata view.
+- `src/package.rs` — Canonical package model (`Package`, `PackageIndex`), bounded ZIP access, content-type/relationship parsing, and the single source of truth for extension- and content-type-based part classification.
+- `src/preview.rs` — Part-preview classification and formatters (XML/JSON pretty-print, hex dump, binary info), with bounded output writers.
+- `src/summary/` — Document summary view model (`mod.rs`) and per-format parsers (`ppt.rs`, `word.rs`, `excel.rs`).
+- `src/worker.rs` — Background worker thread; owns a cached `ZipArchive` handle and receives the shared `Arc<PackageIndex>`.
+- `src/keybindings.rs` — Configurable `Action` bindings, editor mode, and generated help-overlay content.
+- `src/layout.rs` — Shared layout geometry used by both rendering and mouse hit testing.
+- `src/ui.rs` — Ratatui layout and widgets (tree + metadata + content + help).
 - `Cargo.toml` — Dependencies and CLI binary name (`oox`).
 - `data/sample.pptx` — Default sample file.
 
@@ -41,8 +47,8 @@ cargo run -- data/sample.pptx
 
 ## Common Tasks
 
-- **Add new keybindings** → `src/main.rs` (`run_app`), consider editor mode guards.
-- **Change layout/styling** → `src/ui.rs`.
-- **Add OOXML semantics** → extend `src/app.rs`; consider higher-level OOXML crates before hand-rolling parsers.
-- **Switch XML engine** → `App::pretty_print_xml` in `src/app.rs` is the only XML formatting site.
-- **Change image support** → update `is_image`, `image_format`, and the `image` features in `Cargo.toml` together.
+- **Add new keybindings** → `src/keybindings.rs` (`Action` enum + `help_sections`), dispatch in `src/main.rs` (`run_app`); consider editor mode guards.
+- **Change layout/styling** → `src/ui.rs` (and `src/layout.rs` for geometry shared with mouse hit testing).
+- **Add OOXML semantics** → extend `src/summary/`; consider higher-level OOXML crates before hand-rolling parsers.
+- **Switch XML engine** → `pretty_print_xml` in `src/preview.rs` is the only XML formatting site.
+- **Change image support** → update `is_image_name`/`image_format` in `src/package.rs` and the `image` features in `Cargo.toml` together.

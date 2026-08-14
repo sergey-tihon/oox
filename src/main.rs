@@ -26,6 +26,7 @@ mod app;
 mod keybindings;
 mod layout;
 mod package;
+mod preview;
 mod summary;
 mod ui;
 mod worker;
@@ -34,7 +35,7 @@ mod worker;
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// OOXML document to inspect
-    #[arg(value_name = "FILE", default_value = "data/sample.pptx")]
+    #[arg(value_name = "FILE")]
     file: PathBuf,
     /// Keybinding and editor configuration file
     #[arg(long, value_name = "PATH")]
@@ -146,14 +147,23 @@ fn run_app(
     editor_handler: &mut EditorEventHandler,
     editor_mode: keybindings::EditorMode,
 ) -> io::Result<()> {
+    // Redraw-on-change: render once, then again only when the worker reports new
+    // state or a terminal event arrives. Idle polling no longer repaints at 20 fps.
+    let mut redraw = true;
     loop {
-        app.poll_worker();
-        terminal.draw(|f| ui::ui(f, app))?;
+        if app.poll_worker() {
+            redraw = true;
+        }
+        if redraw {
+            terminal.draw(|f| ui::ui(f, app))?;
+            redraw = false;
+        }
 
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
         let event = event::read()?;
+        redraw = true;
         debug_log(format!("event={event:?}"));
 
         if let Event::Mouse(mouse) = &event {
@@ -320,7 +330,12 @@ fn run_app(
 
             let can_show_help = match app.current_widget {
                 CurrentWidget::Tree | CurrentWidget::Details => true,
-                CurrentWidget::TextArea => app.editor_state.mode == EdtuiMode::Normal,
+                CurrentWidget::TextArea => match editor_mode {
+                    keybindings::EditorMode::Vim => app.editor_state.mode == EdtuiMode::Normal,
+                    // Emacs mode is modeless: character keys insert text, so only
+                    // function keys (e.g. F1) can open help from the editor.
+                    keybindings::EditorMode::Emacs => matches!(key.code, KeyCode::F(_)),
+                },
             };
             if actions.contains(&Action::ToggleHelp) && can_show_help {
                 debug_log("opening help");

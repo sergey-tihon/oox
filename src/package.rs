@@ -3,8 +3,10 @@ use std::{
     collections::BTreeMap,
     io::{self, Read, Seek},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
+use image::ImageFormat;
 use quick_xml::{
     events::{BytesStart, Event},
     Reader,
@@ -215,7 +217,20 @@ impl PackageIndex {
             }
         }
         for part in index.parts.values_mut() {
-            part.content_type = index.content_types.content_type_for(&part.path);
+            let content_type = index.content_types.content_type_for(&part.path);
+            // Refine extension-based classification with the declared content type so
+            // XML or image parts with unusual extensions still preview correctly.
+            if part.kind == PartKind::Binary {
+                if content_type.as_deref().is_some_and(is_xml_content_type) {
+                    part.kind = PartKind::Xml;
+                } else if content_type
+                    .as_deref()
+                    .is_some_and(|value| value.to_ascii_lowercase().starts_with("image/"))
+                {
+                    part.kind = PartKind::Image;
+                }
+            }
+            part.content_type = content_type;
         }
         for (relationship_path, bytes) in relationship_parts {
             let Some(source) = relationship_source(&relationship_path) else {
@@ -252,7 +267,7 @@ impl PackageIndex {
         Ok(index)
     }
 
-    fn record(&mut self, diagnostic: Diagnostic) {
+    pub(crate) fn record(&mut self, diagnostic: Diagnostic) {
         self.warnings
             .push(format!("{}: {}", diagnostic.stage, diagnostic.message));
         self.diagnostics.push(diagnostic);
@@ -287,10 +302,12 @@ impl PackageIndex {
 }
 
 /// A package owns the canonical source path and immutable metadata snapshot.
+/// The index is shared with background workers via `Arc` to avoid cloning the
+/// full metadata graph for every preview request.
 #[derive(Clone, Debug)]
 pub struct Package {
     pub source: PathBuf,
-    pub index: PackageIndex,
+    pub index: Arc<PackageIndex>,
 }
 
 impl Package {
@@ -299,7 +316,10 @@ impl Package {
         let file = std::fs::File::open(&source)?;
         let mut index = PackageIndex::from_archive(&mut zip::ZipArchive::new(file)?)?;
         index.source = Some(source.clone());
-        Ok(Self { source, index })
+        Ok(Self {
+            source,
+            index: Arc::new(index),
+        })
     }
 }
 
@@ -507,13 +527,16 @@ pub fn normalize_package_path(path: &str) -> String {
     }
     components.join("/")
 }
-fn is_xml_name(path: &str) -> bool {
+/// Single source of truth for extension-based part classification. Used both for
+/// `PartKind` assignment during indexing and for preview selection.
+pub(crate) fn is_xml_name(path: &str) -> bool {
     Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "xml" | "rels"))
 }
-fn is_image_name(path: &str) -> bool {
+
+pub(crate) fn is_image_name(path: &str) -> bool {
     Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
@@ -523,6 +546,23 @@ fn is_image_name(path: &str) -> bool {
                 "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp"
             )
         })
+}
+
+/// Maps an image file name to its decoder format. Keep in sync with `is_image_name`
+/// and the enabled `image` crate features in `Cargo.toml`.
+pub(crate) fn image_format(path: &str) -> ImageFormat {
+    match Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => ImageFormat::Jpeg,
+        Some("gif") => ImageFormat::Gif,
+        Some("bmp") => ImageFormat::Bmp,
+        Some("webp") => ImageFormat::WebP,
+        _ => ImageFormat::Png,
+    }
 }
 
 impl ContentTypes {
@@ -535,12 +575,39 @@ impl ContentTypes {
     }
 }
 
+pub(crate) fn is_xml_content_type(content_type: &str) -> bool {
+    let value = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    value == "application/xml" || value == "text/xml" || value.ends_with("+xml")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn normalizes_traversal_and_separators() {
         assert_eq!(normalize_package_path(r"/a\\b/../c"), "a/c");
+    }
+
+    #[test]
+    fn file_type_detection_is_case_insensitive() {
+        assert!(is_xml_name("custom.XML"));
+        assert!(is_image_name("media/PHOTO.JpEg"));
+        assert_eq!(image_format("media/PHOTO.JpEg"), ImageFormat::Jpeg);
+    }
+
+    #[test]
+    fn xml_content_types_are_detected() {
+        assert!(is_xml_content_type(
+            "application/vnd.openxmlformats-officedocument.presentationml.slide+xml"
+        ));
+        assert!(is_xml_content_type("application/xml"));
+        assert!(!is_xml_content_type("application/json"));
+        assert!(!is_xml_content_type("image/png"));
     }
     #[test]
     fn bounded_reader_rejects_declared_size() {

@@ -44,7 +44,7 @@ cargo install --path .
 oox path/to/document.pptx
 
 # Inspect the bundled sample file from a source checkout
-cargo run
+cargo run -- data/sample.pptx
 
 # Show command-line help and version
 oox --help

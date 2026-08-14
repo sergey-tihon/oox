@@ -147,6 +147,68 @@ pub fn load(path: Option<&Path>) -> io::Result<EditorMode> {
     Ok(mode)
 }
 
+/// A row in the help overlay: either an action with its configured keybindings
+/// or a fixed informational line (e.g. mouse usage).
+pub enum HelpRow {
+    Binding(Action, &'static str),
+    Text(&'static str),
+}
+
+/// Help content lives next to the action definitions so descriptions and
+/// bindings stay in sync; the UI renders these sections verbatim.
+pub fn help_sections() -> Vec<(&'static str, Vec<HelpRow>)> {
+    vec![
+        (
+            "Panels",
+            vec![
+                HelpRow::Binding(Action::FocusTree, "Focus tree"),
+                HelpRow::Binding(Action::FocusDetails, "Focus metadata"),
+                HelpRow::Binding(Action::FocusContent, "Focus content"),
+                HelpRow::Binding(Action::ToggleFocus, "Cycle panel focus"),
+            ],
+        ),
+        (
+            "Navigation",
+            vec![
+                HelpRow::Binding(Action::MoveDown, "Move down"),
+                HelpRow::Binding(Action::MoveUp, "Move up"),
+                HelpRow::Binding(Action::PageDown, "Scroll down"),
+                HelpRow::Binding(Action::PageUp, "Scroll up"),
+                HelpRow::Binding(Action::First, "First item"),
+                HelpRow::Binding(Action::Last, "Last item"),
+                HelpRow::Binding(Action::OpenContent, "Expand / preview content"),
+                HelpRow::Binding(Action::ShowMetadata, "Toggle metadata panel"),
+                HelpRow::Binding(Action::ShowSummary, "Toggle document summary"),
+                HelpRow::Text("Mouse click   Select/expand tree item"),
+                HelpRow::Text("Mouse wheel   Scroll tree/metadata"),
+                HelpRow::Text("Click link    Open related part"),
+                HelpRow::Binding(Action::ExpandAll, "Expand all"),
+                HelpRow::Binding(Action::CollapseAll, "Collapse all"),
+            ],
+        ),
+        (
+            "Search",
+            vec![
+                HelpRow::Binding(Action::StartSearch, "Search package paths"),
+                HelpRow::Text("Enter         Select first matching part"),
+                HelpRow::Binding(Action::NextMatch, "Next match"),
+                HelpRow::Binding(Action::PreviousMatch, "Previous match"),
+                HelpRow::Binding(Action::Cancel, "Cancel search/help"),
+            ],
+        ),
+        (
+            "General",
+            vec![
+                HelpRow::Binding(Action::ToggleHelp, "Show this help"),
+                HelpRow::Binding(Action::Quit, "Quit tree / Vim normal mode"),
+                HelpRow::Binding(Action::QuitEditor, "Quit Emacs editor"),
+                HelpRow::Binding(Action::NavigateBack, "Previous part"),
+                HelpRow::Binding(Action::NavigateForward, "Next part"),
+            ],
+        ),
+    ]
+}
+
 pub fn generate(path: &Path) -> io::Result<()> {
     if path.exists() {
         return Err(io::Error::new(

@@ -1,7 +1,7 @@
 use crossterm_keybind::{DisplayFormat, KeyBindTrait};
 use edtui::{EditorStatusLine, EditorTheme, EditorView, LineNumbers, SyntaxHighlighter};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation},
@@ -11,13 +11,37 @@ use ratatui_image::{Resize, StatefulImage};
 use tui_tree_widget::Tree;
 
 use crate::{
-    app::{App, CurrentWidget, PreviewKind},
-    keybindings::Action,
+    app::{App, CurrentWidget},
+    keybindings::HelpRow,
     layout::LayoutSnapshot,
+    preview::PreviewKind,
+    summary::DetailsView,
 };
 
+/// Below this size the panel layout cannot render usefully; show a guard instead.
+const MIN_TERMINAL_WIDTH: u16 = 40;
+const MIN_TERMINAL_HEIGHT: u16 = 12;
+
 pub fn ui(f: &mut Frame, app: &mut App) {
-    let snapshot = LayoutSnapshot::new(f.area(), app.details_visible);
+    let area = f.area();
+    if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
+        let message = Paragraph::new(format!(
+            "Terminal too small: need at least {MIN_TERMINAL_WIDTH}x{MIN_TERMINAL_HEIGHT}"
+        ))
+        .alignment(Alignment::Center);
+        let vertical_center = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Percentage(50),
+            ])
+            .split(area);
+        f.render_widget(message, vertical_center[1]);
+        return;
+    }
+
+    let snapshot = LayoutSnapshot::new(area, app.details_visible);
     let chunks = [snapshot.header, snapshot.body, snapshot.status];
 
     let accent_color = Color::LightGreen;
@@ -95,11 +119,16 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     }
 
     if app.details_visible {
+        // Copy scalars out first: `details_view` borrows `app` mutably to update
+        // the cache, so no other `app` access is allowed while the view is alive.
+        let details_focused = app.current_widget == CurrentWidget::Details;
+        let raw_scroll = app.details_scroll;
+        let raw_cursor = app.details_cursor;
         let details = app.details_view();
         let details_block = Block::bordered()
             .title("[2] Metadata")
             .title_top(Line::from("[d] Hide").right_aligned())
-            .border_style(if app.current_widget == CurrentWidget::Details {
+            .border_style(if details_focused {
                 active_style
             } else {
                 normal_style
@@ -110,46 +139,16 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             .lines()
             .count()
             .saturating_sub(details_inner.height as usize) as u16;
-        let details_scroll = app.details_scroll.min(max_scroll);
+        let details_scroll = raw_scroll.min(max_scroll);
         let details_cursor = if details.links.is_empty() {
-            0
+            None
         } else {
-            app.details_cursor.min(details.links.len() - 1)
+            Some(raw_cursor.min(details.links.len() - 1))
         };
-        let selected_link_line = details.links.get(details_cursor).map(|link| link.line);
-        let lines = details
-            .text
-            .lines()
-            .enumerate()
-            .map(|(line, text)| {
-                if let Some(link) = details.links.iter().find(|link| link.line == line) {
-                    let link_style = if Some(line) == selected_link_line {
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::UNDERLINED)
-                    };
-                    let prefix = text.chars().take(link.start).collect::<String>();
-                    let target = text
-                        .chars()
-                        .skip(link.start)
-                        .take(link.end - link.start)
-                        .collect::<String>();
-                    let suffix = text.chars().skip(link.end).collect::<String>();
-                    Line::from(vec![
-                        Span::raw(prefix),
-                        Span::styled(target, link_style),
-                        Span::raw(suffix),
-                    ])
-                } else {
-                    Line::from(text.to_string())
-                }
-            })
-            .collect::<Vec<_>>();
+        let selected_link_line = details_cursor
+            .and_then(|cursor| details.links.get(cursor))
+            .map(|link| link.line);
+        let lines = linked_lines(details, selected_link_line);
         let details = Paragraph::new(Text::from(lines))
             .block(details_block)
             .scroll((details_scroll, 0));
@@ -176,7 +175,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                 .count()
                 .saturating_sub(summary_inner.height as usize) as u16;
             let summary_scroll = app.summary_scroll.min(max_scroll);
-            let summary = Paragraph::new(Text::from(linked_lines(summary)))
+            let summary = Paragraph::new(Text::from(linked_lines(summary, None)))
                 .block(editor_block)
                 .scroll((summary_scroll, 0));
             f.render_widget(summary, sections[1]);
@@ -196,7 +195,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 
         let image = StatefulImage::default().resize(Resize::Fit(None));
         f.render_stateful_widget(image, image_area, image_state);
-    } else if let Some(message) = app.status_message.as_deref() {
+    } else if let Some(message) = app.content_message.as_deref() {
         let color = if app.preview_kind == PreviewKind::Info {
             Color::White
         } else {
@@ -243,48 +242,28 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     if app.show_help {
         let help_area = centered_rect(f.area(), 72, 78);
         f.render_widget(Clear, help_area);
-        let help = Paragraph::new(Text::from(vec![
-            Line::from("Panels"),
-            help_line(&Action::FocusTree, "Focus tree"),
-            help_line(&Action::FocusDetails, "Focus metadata"),
-            help_line(&Action::FocusContent, "Focus content"),
-            help_line(&Action::ToggleFocus, "Cycle panel focus"),
-            Line::from(""),
-            Line::from("Navigation"),
-            help_line(&Action::MoveDown, "Move down"),
-            help_line(&Action::MoveUp, "Move up"),
-            help_line(&Action::PageDown, "Scroll down"),
-            help_line(&Action::PageUp, "Scroll up"),
-            help_line(&Action::First, "First item"),
-            help_line(&Action::Last, "Last item"),
-            help_line(&Action::OpenContent, "Expand / preview content"),
-            help_line(&Action::ShowMetadata, "Toggle metadata panel"),
-            help_line(&Action::ShowSummary, "Toggle document summary"),
-            Line::from("  Mouse click   Select/expand tree item"),
-            Line::from("  Mouse wheel   Scroll tree/metadata"),
-            Line::from("  Click link    Open related part"),
-            help_line(&Action::ExpandAll, "Expand all"),
-            help_line(&Action::CollapseAll, "Collapse all"),
-            Line::from(""),
-            Line::from("Search"),
-            help_line(&Action::StartSearch, "Search package paths"),
-            Line::from("  Enter         Select first matching part"),
-            help_line(&Action::NextMatch, "Next match"),
-            help_line(&Action::PreviousMatch, "Previous match"),
-            help_line(&Action::Cancel, "Cancel search/help"),
-            Line::from(""),
-            help_line(&Action::ToggleHelp, "Show this help"),
-            help_line(&Action::Quit, "Quit tree / Vim normal mode"),
-            help_line(&Action::QuitEditor, "Quit Emacs editor"),
-            help_line(&Action::NavigateBack, "Previous part"),
-            help_line(&Action::NavigateForward, "Next part"),
-        ]))
-        .block(
-            Block::bordered()
-                .title("Help")
-                .title_bottom(Line::from("[Esc] Close").right_aligned()),
-        )
-        .style(Style::default().fg(Color::White));
+        let mut lines = Vec::new();
+        for (index, (section, rows)) in crate::keybindings::help_sections().iter().enumerate() {
+            if index > 0 {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(section.to_string()));
+            for row in rows {
+                match row {
+                    HelpRow::Binding(action, description) => {
+                        lines.push(help_line(action, description));
+                    }
+                    HelpRow::Text(text) => lines.push(Line::from(format!("  {text}"))),
+                }
+            }
+        }
+        let help = Paragraph::new(Text::from(lines))
+            .block(
+                Block::bordered()
+                    .title("Help")
+                    .title_bottom(Line::from("[Esc] Close").right_aligned()),
+            )
+            .style(Style::default().fg(Color::White));
         f.render_widget(help, help_area);
     }
 }
@@ -319,7 +298,10 @@ pub fn metadata_line_at(area: Rect, app: &App, x: u16, y: u16) -> Option<(usize,
     })
 }
 
-fn linked_lines(view: &crate::summary::DetailsView) -> Vec<Line<'static>> {
+/// Render a details/summary view, highlighting link targets. When
+/// `selected_link_line` is given (keyboard cursor in the metadata panel), that
+/// link is emphasized; otherwise links use the plain link style.
+fn linked_lines(view: &DetailsView, selected_link_line: Option<usize>) -> Vec<Line<'static>> {
     view.text
         .lines()
         .enumerate()
@@ -327,9 +309,16 @@ fn linked_lines(view: &crate::summary::DetailsView) -> Vec<Line<'static>> {
             let Some(link) = view.links.iter().find(|link| link.line == line) else {
                 return Line::from(text.to_string());
             };
-            let link_style = Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::UNDERLINED);
+            let link_style = if Some(line) == selected_link_line {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::UNDERLINED)
+            };
             let prefix = text.chars().take(link.start).collect::<String>();
             let target = text
                 .chars()
@@ -347,10 +336,12 @@ fn linked_lines(view: &crate::summary::DetailsView) -> Vec<Line<'static>> {
 }
 
 fn content_title(kind: PreviewKind) -> &'static str {
+    // Editor-backed previews are view-only: edtui has no read-only mode yet, so
+    // the title makes it explicit that edits are not saved anywhere.
     match kind {
-        PreviewKind::Xml => "XML content",
-        PreviewKind::PlainText => "Text content",
-        PreviewKind::Json => "JSON preview",
+        PreviewKind::Xml => "XML content (read-only)",
+        PreviewKind::PlainText => "Text content (read-only)",
+        PreviewKind::Json => "JSON preview (read-only)",
         PreviewKind::Hex => "Hex dump",
         PreviewKind::Image => "Image preview",
         PreviewKind::Summary => "Document summary",
@@ -359,7 +350,7 @@ fn content_title(kind: PreviewKind) -> &'static str {
     }
 }
 
-fn help_line(action: &Action, description: &str) -> Line<'static> {
+fn help_line(action: &crate::keybindings::Action, description: &str) -> Line<'static> {
     let bindings = action.key_bindings_display_with_format(&DisplayFormat::Abbreviation);
     Line::from(format!("  {bindings:<14} {description}"))
 }

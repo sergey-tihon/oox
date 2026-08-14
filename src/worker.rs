@@ -1,7 +1,8 @@
 //! Bounded background package work. UI state is never shared with this worker.
 use std::{
+    fs::File,
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
@@ -12,9 +13,9 @@ use std::{
 };
 
 use crate::{
-    app::{build_document_summary, build_preview, Preview},
-    package::{Diagnostic, Package, PackageIndex, MAX_ENTRY_BYTES},
-    summary::DetailsView,
+    package::{Diagnostic, Package, PackageIndex, PartInfo, MAX_ENTRY_BYTES},
+    preview::{build_preview, Preview},
+    summary::{build_document_summary, DetailsView},
 };
 
 #[derive(Debug)]
@@ -26,12 +27,8 @@ pub enum Job {
     ReadPart {
         request_id: u64,
         package_path: PathBuf,
-        selected_path: String,
-        archive_name: String,
-        content_type: Option<String>,
-        size: u64,
-        compressed_size: u64,
-        index: Box<PackageIndex>,
+        part: Box<PartInfo>,
+        index: Arc<PackageIndex>,
     },
 }
 
@@ -64,6 +61,29 @@ impl Drop for AliveGuard {
     }
 }
 
+/// Caches the open ZIP archive so per-part preview reads do not re-parse the
+/// central directory on every selection change. Only one package is open at a
+/// time, so a single-entry cache keyed by package path is sufficient.
+type ArchiveCache = Option<(PathBuf, zip::ZipArchive<File>)>;
+
+fn cached_archive<'a>(
+    cache: &'a mut ArchiveCache,
+    path: &Path,
+) -> io::Result<&'a mut zip::ZipArchive<File>> {
+    let stale = match cache {
+        Some((cached_path, _)) => cached_path != path,
+        None => true,
+    };
+    if stale {
+        let file = File::open(path)?;
+        *cache = Some((path.to_path_buf(), zip::ZipArchive::new(file)?));
+    }
+    cache
+        .as_mut()
+        .map(|(_, archive)| archive)
+        .ok_or_else(|| io::Error::other("archive cache is empty after refill"))
+}
+
 pub struct Worker {
     sender: Option<SyncSender<Job>>,
     receiver: Receiver<ResultMessage>,
@@ -87,6 +107,7 @@ impl Worker {
             .name("oox-package-worker".into())
             .spawn(move || {
                 let _alive_guard = AliveGuard(worker_alive);
+                let mut archive_cache: ArchiveCache = None;
                 'worker: while !worker_stop.load(Ordering::Acquire) {
                     // A pending job supersedes anything else waiting in the bounded
                     // queue. This keeps selection changes responsive without growing
@@ -112,8 +133,14 @@ impl Worker {
                     let result = match job {
                         Job::Open { request_id, path } => {
                             let (package, summary) = match Package::open(path.clone()) {
-                                Ok(package) => {
-                                    let summary = build_summary(&package);
+                                Ok(mut package) => {
+                                    let summary = build_summary(&mut archive_cache, &package);
+                                    // Summary diagnostics belong to the package's
+                                    // diagnostic log; merge them before publishing.
+                                    for diagnostic in &summary.diagnostics {
+                                        Arc::make_mut(&mut package.index)
+                                            .record(diagnostic.clone());
+                                    }
                                     (Ok(package), summary)
                                 }
                                 Err(error) => (
@@ -134,26 +161,15 @@ impl Worker {
                         Job::ReadPart {
                             request_id,
                             package_path,
-                            selected_path,
-                            archive_name,
-                            content_type,
-                            size,
-                            compressed_size,
+                            part,
                             index,
                         } => {
-                            let preview = read_preview(
-                                &package_path,
-                                &index,
-                                &selected_path,
-                                &archive_name,
-                                content_type.as_deref(),
-                                size,
-                                compressed_size,
-                            )
-                            .map_err(|error| error.to_string());
+                            let preview =
+                                read_preview(&mut archive_cache, &package_path, &part, &index)
+                                    .map_err(|error| error.to_string());
                             ResultMessage::PartRead {
                                 request_id,
-                                selected_path,
+                                selected_path: part.path.clone(),
                                 preview,
                             }
                         }
@@ -247,12 +263,9 @@ impl Drop for Worker {
     }
 }
 
-fn build_summary(package: &Package) -> SummaryPayload {
-    let result = (|| {
-        let file = std::fs::File::open(&package.source)?;
-        let mut archive = zip::ZipArchive::new(file)?;
-        build_document_summary(&mut archive, &package.index)
-    })();
+fn build_summary(cache: &mut ArchiveCache, package: &Package) -> SummaryPayload {
+    let result = cached_archive(cache, &package.source)
+        .and_then(|archive| build_document_summary(archive, &package.index));
     match result {
         Ok(view) => SummaryPayload {
             view,
@@ -270,22 +283,18 @@ fn build_summary(package: &Package) -> SummaryPayload {
 }
 
 fn read_preview(
-    package_path: &PathBuf,
+    cache: &mut ArchiveCache,
+    package_path: &Path,
+    part: &PartInfo,
     index: &PackageIndex,
-    selected_path: &str,
-    archive_name: &str,
-    content_type: Option<&str>,
-    size: u64,
-    compressed_size: u64,
 ) -> io::Result<Preview> {
-    let file = std::fs::File::open(package_path)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-    let bytes = index.read_part(&mut archive, selected_path, MAX_ENTRY_BYTES)?;
+    let archive = cached_archive(cache, package_path)?;
+    let bytes = index.read_part(archive, &part.path, MAX_ENTRY_BYTES)?;
     Ok(build_preview(
-        archive_name,
-        content_type,
-        size,
-        compressed_size,
+        &part.archive_name,
+        part.content_type.as_deref(),
+        part.size,
+        part.compressed_size,
         &bytes,
     ))
 }
