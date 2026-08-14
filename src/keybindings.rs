@@ -189,11 +189,11 @@ pub fn help_sections() -> Vec<(&'static str, Vec<HelpRow>)> {
         (
             "Search",
             vec![
-                HelpRow::Binding(Action::StartSearch, "Search package paths"),
-                HelpRow::Text("Enter         Select first matching part"),
+                HelpRow::Binding(Action::StartSearch, "Filter package paths (live)"),
+                HelpRow::Text("Enter         Keep filter, select first match"),
                 HelpRow::Binding(Action::NextMatch, "Next match"),
                 HelpRow::Binding(Action::PreviousMatch, "Previous match"),
-                HelpRow::Binding(Action::Cancel, "Cancel search/help"),
+                HelpRow::Binding(Action::Cancel, "Cancel search / clear filter"),
             ],
         ),
         (

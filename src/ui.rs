@@ -68,8 +68,13 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     let left_sections = [snapshot.tree, snapshot.details.unwrap_or(snapshot.tree)];
 
     // Tree widget
+    let tree_title = if app.tree_filter_active() {
+        "[1] Document Inspector (filtered)"
+    } else {
+        "[1] Document Inspector"
+    };
     let tree_block = Block::bordered()
-        .title("[1] Document Inspector")
+        .title(tree_title)
         .title_top(Line::from("[?] Help").right_aligned())
         .border_style(if app.current_widget == CurrentWidget::Tree {
             active_style
@@ -92,7 +97,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             left_sections[0],
         );
     } else {
-        match Tree::new(&app.tree_items) {
+        // `visible_tree_items` borrows `app` immutably, so the tree state is moved
+        // out for the duration of the render and put back afterwards.
+        let mut tree_state = std::mem::take(&mut app.tree_state);
+        match Tree::new(app.visible_tree_items()) {
             Ok(tree_widget) => {
                 let tree_widget = tree_widget
                     .block(tree_block)
@@ -108,7 +116,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                             .bg(accent_color)
                             .add_modifier(Modifier::BOLD),
                     );
-                f.render_stateful_widget(tree_widget, left_sections[0], &mut app.tree_state);
+                f.render_stateful_widget(tree_widget, left_sections[0], &mut tree_state);
             }
             Err(error) => {
                 let message = Paragraph::new(format!("Unable to render document tree: {error}"))
@@ -116,6 +124,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                 f.render_widget(message, left_sections[0]);
             }
         }
+        app.tree_state = tree_state;
     }
 
     if app.details_visible {

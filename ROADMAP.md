@@ -23,6 +23,7 @@
 - Cached metadata panel rendering and a redraw-on-change event loop (no idle 20 fps redraws).
 - Preview classification/formatting split into `src/preview.rs`; PowerPoint/Word/Excel parsers split into `src/summary/` modules; duplicated `Package`/`PackageIndex` state removed from `App`.
 - Minimum-terminal-size guard, capped navigation history, generated help overlay, read-only content labeling, and F1 help in Emacs editor mode.
+- Live visual tree filtering: non-matching paths are hidden while typing a search query, the selection follows the first match, Enter keeps the filter for n/N cycling, and Esc restores the full tree and its pre-search open/closed state.
 
 ## Most important remaining features
 
@@ -40,7 +41,6 @@ This should not be added to the current package-inspection code. It needs indepe
 
 ### Priority 2 — Better package navigation and inspection
 
-- **Visual tree filtering:** hide non-matching paths during search instead of only selecting the first match; update matches live while typing.
 - **Content search:** grep-style search across part contents in the background worker, not only package-path matching.
 - **Resizable panes:** allow users to adjust tree, metadata, and content widths/heights.
 - **Bookmarks or pinned parts:** keep frequently inspected package parts accessible.

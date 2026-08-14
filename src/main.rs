@@ -410,6 +410,10 @@ fn run_app(
                         app.next_search_match(false);
                     } else if actions.contains(&Action::PreviousMatch) {
                         app.next_search_match(true);
+                    } else if actions.contains(&Action::Cancel) && !app.search_query.is_empty() {
+                        // Esc with an applied (but inactive) search clears the filter
+                        // and restores the pre-search tree state.
+                        app.cancel_search();
                     }
                 }
             }

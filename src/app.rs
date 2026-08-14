@@ -31,6 +31,10 @@ pub struct App {
     pub file_path: String,
     pub tree_state: TreeState<String>,
     pub tree_items: Vec<TreeItem<'static, String>>,
+    /// Live path filter during search; `None` shows the full tree.
+    filtered_tree_items: Option<Vec<TreeItem<'static, String>>>,
+    /// Open/closed tree state from before the filter, restored when it clears.
+    opened_before_search: Option<Vec<Vec<String>>>,
     pub editor_state: EditorState,
     pub image_state: Option<StatefulProtocol>,
     pub preview_kind: PreviewKind,
@@ -117,6 +121,8 @@ impl App {
             file_path: path.clone(),
             tree_state: TreeState::default(),
             tree_items: Vec::new(),
+            filtered_tree_items: None,
+            opened_before_search: None,
             editor_state: EditorState::default(),
             image_state: None,
             preview_kind: PreviewKind::Empty,
@@ -314,23 +320,7 @@ impl App {
     }
 
     pub fn expand_all(&mut self) {
-        fn collect_open_paths(
-            items: &[TreeItem<'static, String>],
-            parent_path: &[String],
-            paths: &mut Vec<Vec<String>>,
-        ) {
-            for item in items {
-                let mut path = parent_path.to_vec();
-                path.push(item.identifier().clone());
-                if !item.children().is_empty() {
-                    paths.push(path.clone());
-                    collect_open_paths(item.children(), &path, paths);
-                }
-            }
-        }
-
-        let mut paths = Vec::new();
-        collect_open_paths(&self.tree_items, &[], &mut paths);
+        let paths = collect_open_paths(self.visible_tree_items());
         for path in paths {
             self.tree_state.open(path);
         }
@@ -338,11 +328,25 @@ impl App {
 
     pub fn collapse_all(&mut self) {
         self.tree_state.close_all();
-        if let Some(first) = self.tree_items.first() {
-            self.tree_state.select(vec![first.identifier().clone()]);
+        if let Some(first) = self.visible_tree_items().first() {
+            let identifier = first.identifier().clone();
+            self.tree_state.select(vec![identifier]);
         } else {
             self.tree_state.select(Vec::new());
         }
+    }
+
+    /// Tree items currently rendered: the live filter result while searching,
+    /// otherwise the full package tree.
+    pub fn visible_tree_items(&self) -> &[TreeItem<'static, String>] {
+        self.filtered_tree_items
+            .as_deref()
+            .unwrap_or(&self.tree_items)
+    }
+
+    /// Whether a search filter currently hides parts of the tree.
+    pub fn tree_filter_active(&self) -> bool {
+        self.filtered_tree_items.is_some()
     }
 
     /// The metadata view for the current selection. The view is cached and only
@@ -574,14 +578,22 @@ impl App {
         self.search_query.clear();
         self.search_matches.clear();
         self.search_index = None;
+        self.filtered_tree_items = None;
+        // Keep the earliest snapshot so re-entering search while a filter is
+        // applied still restores the original open/closed state on cancel.
+        if self.opened_before_search.is_none() {
+            self.opened_before_search = Some(self.tree_state.opened().iter().cloned().collect());
+        }
     }
 
     pub fn search_input_char(&mut self, character: char) {
         self.search_query.push(character);
+        self.update_tree_filter();
     }
 
     pub fn search_backspace(&mut self) {
         self.search_query.pop();
+        self.update_tree_filter();
     }
 
     pub fn finish_search(&mut self) {
@@ -601,6 +613,46 @@ impl App {
         self.search_query.clear();
         self.search_matches.clear();
         self.search_index = None;
+        self.clear_tree_filter();
+    }
+
+    /// Drop the filtered view and restore the open/closed state the tree had
+    /// before the search started.
+    fn clear_tree_filter(&mut self) {
+        self.filtered_tree_items = None;
+        if let Some(opened) = self.opened_before_search.take() {
+            self.tree_state.close_all();
+            for path in opened {
+                self.tree_state.open(path);
+            }
+        }
+    }
+
+    /// Recompute the live filter, open the retained branches so matches are
+    /// visible, and move the selection to the first match.
+    fn update_tree_filter(&mut self) {
+        let query = self.search_query.to_ascii_lowercase();
+        if query.is_empty() {
+            self.filtered_tree_items = None;
+            self.search_matches.clear();
+            self.search_index = None;
+            return;
+        }
+        match filter_tree(&self.tree_items, &query) {
+            Ok(items) => {
+                let paths = collect_open_paths(&items);
+                self.filtered_tree_items = Some(items);
+                for path in paths {
+                    self.tree_state.open(path);
+                }
+            }
+            Err(error) => {
+                self.filtered_tree_items = None;
+                self.content_message = Some(format!("Could not filter tree: {error}"));
+                return;
+            }
+        }
+        self.update_search_matches();
     }
 
     pub fn next_search_match(&mut self, reverse: bool) {
@@ -629,7 +681,11 @@ impl App {
     pub fn selection_status(&self) -> String {
         let Some(selected) = self.tree_state.selected().last() else {
             return if self.search_active {
-                format!("Search: {}_ | Enter select, Esc cancel", self.search_query)
+                format!(
+                    "Search: {}_ | {} matches | Enter select, Esc cancel",
+                    self.search_query,
+                    self.search_matches.len()
+                )
             } else {
                 "No package part selected".to_string()
             };
@@ -650,7 +706,10 @@ impl App {
         if self.search_active {
             status.push_str(&format!(" | Search: {}", self.search_query));
         } else if !self.search_query.is_empty() {
-            status.push_str(&format!(" | Search: {} (n/N next)", self.search_query));
+            status.push_str(&format!(
+                " | Search: {} (n/N next, Esc clear)",
+                self.search_query
+            ));
         }
         status
     }
@@ -773,6 +832,8 @@ impl App {
             .filter(|path| !path.is_empty())
             .map(str::to_string)
             .collect();
+        self.filtered_tree_items = None;
+        self.opened_before_search = None;
         match create_tree(&paths) {
             Ok(tree_items) => self.tree_items = tree_items,
             Err(error) => {
@@ -834,6 +895,62 @@ impl App {
 /// slash) without an intermediate node structure.
 fn create_tree(paths: &[String]) -> io::Result<Vec<TreeItem<'static, String>>> {
     create_tree_level("", paths, 0)
+}
+
+fn collect_open_paths(items: &[TreeItem<'static, String>]) -> Vec<Vec<String>> {
+    fn collect(
+        items: &[TreeItem<'static, String>],
+        parent: &[String],
+        paths: &mut Vec<Vec<String>>,
+    ) {
+        for item in items {
+            let mut path = parent.to_vec();
+            path.push(item.identifier().clone());
+            if !item.children().is_empty() {
+                paths.push(path.clone());
+                collect(item.children(), &path, paths);
+            }
+        }
+    }
+
+    let mut paths = Vec::new();
+    collect(items, &[], &mut paths);
+    paths
+}
+
+/// Keep items whose path matches `query`, retaining ancestor directories so
+/// matches stay reachable. An item that matches directly keeps its whole
+/// subtree. Item text is the final path component, so branches can be rebuilt
+/// without access to the original (crate-private) text.
+fn filter_tree(
+    items: &[TreeItem<'static, String>],
+    query: &str,
+) -> io::Result<Vec<TreeItem<'static, String>>> {
+    let mut result = Vec::new();
+    for item in items {
+        if item.identifier().to_ascii_lowercase().contains(query) {
+            result.push(item.clone());
+            continue;
+        }
+        if item.children().is_empty() {
+            continue;
+        }
+        let children = filter_tree(item.children(), query)?;
+        if children.is_empty() {
+            continue;
+        }
+        let name = item
+            .identifier()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        // Children are a subset of a valid sibling set, so identifiers stay unique.
+        let branch =
+            TreeItem::new(item.identifier().clone(), name, children).map_err(io::Error::other)?;
+        result.push(branch);
+    }
+    Ok(result)
 }
 
 /// `offset` is the byte length of the shared ancestor prefix including its
@@ -1150,6 +1267,87 @@ mod tests {
         assert_eq!(app.search_matches.len(), 1);
         assert!(app.selection_status().contains("Type: XML"));
 
+        Ok(())
+    }
+
+    fn flatten_identifiers(items: &[tui_tree_widget::TreeItem<'static, String>]) -> Vec<String> {
+        let mut result = Vec::new();
+        for item in items {
+            result.push(item.identifier().clone());
+            result.extend(flatten_identifiers(item.children()));
+        }
+        result
+    }
+
+    #[test]
+    fn search_filters_tree_live_while_typing() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        let full_tree = flatten_identifiers(&app.tree_items);
+        assert!(full_tree.contains(&"/docProps/core.xml".to_string()));
+
+        app.start_search();
+        for character in "slide1.xml".chars() {
+            app.search_input_char(character);
+        }
+
+        // Live, before Enter: non-matching paths are hidden, ancestors of
+        // matches are retained, and the selection already follows the filter.
+        let visible = flatten_identifiers(app.visible_tree_items());
+        assert!(visible.contains(&"/ppt/slides/slide1.xml".to_string()));
+        assert!(visible.contains(&"/ppt".to_string()));
+        assert!(visible.contains(&"/ppt/slides".to_string()));
+        assert!(!visible.contains(&"/docProps/core.xml".to_string()));
+        assert!(visible.len() < full_tree.len());
+        // Selection follows the first sorted match (the slide's .rels sorts first).
+        let first_match = app.search_matches.first().cloned();
+        assert_eq!(
+            app.tree_state.selected().last().cloned().as_ref(),
+            first_match.as_ref()
+        );
+        assert!(app.tree_filter_active());
+
+        // Backspacing to an empty query restores the full tree view.
+        for _ in 0.."slide1.xml".chars().count() {
+            app.search_backspace();
+        }
+        assert!(!app.tree_filter_active());
+        assert_eq!(flatten_identifiers(app.visible_tree_items()), full_tree);
+        Ok(())
+    }
+
+    #[test]
+    fn finish_search_keeps_filter_and_cancel_restores_tree_state() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        let opened_before: Vec<Vec<String>> = app.tree_state.opened().iter().cloned().collect();
+
+        app.start_search();
+        for character in "slideLayouts".chars() {
+            app.search_input_char(character);
+        }
+        app.finish_search();
+
+        // The filter stays applied after Enter so n/N can cycle the matches.
+        assert!(!app.search_active);
+        assert!(app.tree_filter_active());
+        // Every retained path either matches the query or is an ancestor of a match.
+        let visible = flatten_identifiers(app.visible_tree_items());
+        assert!(!visible.is_empty());
+        for path in &visible {
+            let is_ancestor_of_match = visible
+                .iter()
+                .any(|other| other.starts_with(&format!("{path}/")));
+            assert!(
+                path.contains("slideLayouts") || is_ancestor_of_match,
+                "unexpected path in filtered tree: {path}"
+            );
+        }
+
+        // Esc (cancel) restores the full tree and the pre-search open state.
+        app.cancel_search();
+        assert!(!app.tree_filter_active());
+        let opened_after: Vec<Vec<String>> = app.tree_state.opened().iter().cloned().collect();
+        assert_eq!(opened_before.len(), opened_after.len());
+        assert!(app.search_query.is_empty());
         Ok(())
     }
 

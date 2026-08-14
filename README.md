@@ -60,8 +60,9 @@ oox --version
 | `Ctrl-d` / `Ctrl-u` | Scroll down / up in the tree       |
 | `g` / `G` | Select the first / last visible item        |
 | `E` / `C` | Expand / collapse all tree nodes              |
-| `/`       | Search package paths                        |
+| `/`       | Search and live-filter package paths          |
 | `n` / `N` | Select the next / previous search match     |
+| `Esc`     | Cancel search / clear the applied filter    |
 | `Enter`   | Toggle directory / preview file content     |
 | `1` / `2` / `3` | Focus tree / metadata / content panels  |
 | `Tab`     | Cycle tree / metadata / content focus       |
@@ -69,7 +70,7 @@ oox --version
 | `d`       | Toggle the metadata panel                   |
 | `s`       | Toggle the document-specific summary        |
 | Mouse       | Select/expand tree; scroll tree/metadata; click relationship targets |
-| `Esc`     | Cancel search or close help                 |
+| `Esc`     | Cancel search or close help (clears filter) |
 | `q`       | Quit from tree / Vim normal mode             |
 | `Ctrl-q`  | Quit from Emacs editor                       |
 | `Alt-Left` / `Alt-Right` | Previous / next opened part       |
