@@ -67,6 +67,9 @@ pub enum Action {
     /// Start searching package paths.
     #[keybindings["/"]]
     StartSearch,
+    /// Start searching part contents in the background.
+    #[keybindings["Control+f"]]
+    StartContentSearch,
     /// Select the next search result.
     #[keybindings["n"]]
     NextMatch,
@@ -190,8 +193,12 @@ pub fn help_sections() -> Vec<(&'static str, Vec<HelpRow>)> {
             "Search",
             vec![
                 HelpRow::Binding(Action::StartSearch, "Filter package paths (live)"),
+                HelpRow::Binding(
+                    Action::StartContentSearch,
+                    "Grep part contents (background)",
+                ),
                 HelpRow::Text("Enter         Keep filter, select first match"),
-                HelpRow::Binding(Action::NextMatch, "Next match"),
+                HelpRow::Binding(Action::NextMatch, "Next match / content match"),
                 HelpRow::Binding(Action::PreviousMatch, "Previous match"),
                 HelpRow::Binding(Action::Cancel, "Cancel search / clear filter"),
             ],

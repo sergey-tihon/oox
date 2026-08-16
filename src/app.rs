@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     io,
     path::PathBuf,
     sync::{Arc, OnceLock},
@@ -19,6 +19,7 @@ use crate::worker::{accepts_result, Job, ResultMessage, Worker};
 /// Bounds the back/forward navigation history so long sessions cannot grow it
 /// without limit.
 const MAX_NAVIGATION_HISTORY: usize = 256;
+const MAX_CONTENT_SEARCH_QUERY_CHARS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CurrentWidget {
@@ -67,6 +68,12 @@ pub struct App {
     pub search_query: String,
     search_matches: Vec<String>,
     search_index: Option<usize>,
+    pub content_search_active: bool,
+    pub content_search_query: String,
+    content_search_matches: Vec<String>,
+    content_search_index: Option<usize>,
+    content_search_request_id: u64,
+    content_search_pending: bool,
 }
 
 fn part_kind_label(kind: &PartKind) -> &'static str {
@@ -153,6 +160,12 @@ impl App {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_index: None,
+            content_search_active: false,
+            content_search_query: String::new(),
+            content_search_matches: Vec::new(),
+            content_search_index: None,
+            content_search_request_id: 0,
+            content_search_pending: false,
         };
         app.worker.submit(Job::Open {
             request_id: app.open_request_id,
@@ -182,6 +195,7 @@ impl App {
                 Err(error) => {
                     self.loading = false;
                     self.preview_pending = false;
+                    self.content_search_pending = false;
                     self.worker_error = Some(error.to_string());
                     self.content_message = Some(format!("Package worker failed: {error}"));
                     return true;
@@ -264,12 +278,47 @@ impl App {
                         }
                     }
                 }
+                ResultMessage::ContentSearch {
+                    request_id,
+                    query,
+                    matches,
+                } => {
+                    if request_id != self.content_search_request_id {
+                        continue;
+                    }
+                    self.content_search_pending = false;
+                    match matches {
+                        Ok(matches) => {
+                            self.content_search_matches = matches;
+                            self.content_search_index =
+                                (!self.content_search_matches.is_empty()).then_some(0);
+                            let paths = self.content_search_matches.clone();
+                            self.apply_content_search_filter(&paths);
+                            if let Some(path) = self.content_search_matches.first().cloned() {
+                                self.select_path(&path);
+                                self.content_message = None;
+                            } else {
+                                self.content_message =
+                                    Some(format!("No package contents match: {query}"));
+                            }
+                        }
+                        Err(error) => {
+                            self.content_search_matches.clear();
+                            self.content_search_index = None;
+                            self.filtered_tree_items = Some(Vec::new());
+                            self.content_message = Some(format!("Content search failed: {error}"));
+                        }
+                    }
+                }
             }
         }
         // Watchdog: explicit in-flight flags instead of inspecting message text.
-        if !self.worker.is_alive() && (self.loading || self.preview_pending) {
+        if !self.worker.is_alive()
+            && (self.loading || self.preview_pending || self.content_search_pending)
+        {
             self.loading = false;
             self.preview_pending = false;
+            self.content_search_pending = false;
             let message = "Package worker exited before completing the request".to_string();
             self.worker_error = Some(message.clone());
             self.content_message = Some(message);
@@ -567,6 +616,9 @@ impl App {
     }
 
     pub fn start_search(&mut self) {
+        if self.content_search_active || !self.content_search_query.is_empty() {
+            self.cancel_content_search();
+        }
         self.search_active = true;
         if self
             .content_message
@@ -599,6 +651,9 @@ impl App {
     pub fn finish_search(&mut self) {
         self.search_active = false;
         self.update_search_matches();
+        if self.search_query.is_empty() {
+            self.opened_before_search = None;
+        }
     }
 
     pub fn cancel_search(&mut self) {
@@ -678,8 +733,150 @@ impl App {
         self.select_path(&path);
     }
 
+    pub fn start_content_search(&mut self) {
+        if self.search_active || !self.search_query.is_empty() {
+            self.cancel_search();
+        }
+        if self.content_search_active || !self.content_search_query.is_empty() {
+            self.cancel_content_search();
+        }
+        self.content_search_active = true;
+        self.content_search_query.clear();
+        self.content_search_matches.clear();
+        self.content_search_index = None;
+        self.filtered_tree_items = None;
+        if self.opened_before_search.is_none() {
+            self.opened_before_search = Some(self.tree_state.opened().iter().cloned().collect());
+        }
+    }
+
+    pub fn content_search_input_char(&mut self, character: char) {
+        if self.content_search_query.chars().count() >= MAX_CONTENT_SEARCH_QUERY_CHARS {
+            return;
+        }
+        self.content_search_query.push(character);
+        self.submit_content_search();
+    }
+
+    pub fn content_search_backspace(&mut self) {
+        self.content_search_query.pop();
+        self.submit_content_search();
+    }
+
+    pub fn finish_content_search(&mut self) {
+        self.content_search_active = false;
+        if self.content_search_query.is_empty() {
+            self.opened_before_search = None;
+        }
+    }
+
+    pub fn cancel_content_search(&mut self) {
+        self.content_search_active = false;
+        self.content_search_request_id = self.content_search_request_id.wrapping_add(1);
+        self.content_search_pending = false;
+        self.content_search_query.clear();
+        self.content_search_matches.clear();
+        self.content_search_index = None;
+        if self.content_message.as_deref().is_some_and(|message| {
+            message.starts_with("No package contents match:")
+                || message.starts_with("Content search failed:")
+        }) {
+            self.content_message = None;
+        }
+        self.clear_tree_filter();
+    }
+
+    pub fn has_content_search_query(&self) -> bool {
+        !self.content_search_query.is_empty()
+    }
+
+    pub fn cancel_any_search(&mut self) {
+        if self.content_search_active || !self.content_search_query.is_empty() {
+            self.cancel_content_search();
+        } else if self.search_active || !self.search_query.is_empty() {
+            self.cancel_search();
+        }
+    }
+
+    pub fn next_content_search_match(&mut self, reverse: bool) {
+        if self.content_search_matches.is_empty() {
+            return;
+        }
+        let current = self.content_search_index.unwrap_or(0);
+        let next = if reverse {
+            if current == 0 {
+                self.content_search_matches.len() - 1
+            } else {
+                current - 1
+            }
+        } else {
+            (current + 1) % self.content_search_matches.len()
+        };
+        self.content_search_index = Some(next);
+        let path = self.content_search_matches[next].clone();
+        self.select_path(&path);
+    }
+
+    fn submit_content_search(&mut self) {
+        self.content_search_request_id = self.content_search_request_id.wrapping_add(1);
+        self.content_search_pending = false;
+        self.content_search_matches.clear();
+        self.content_search_index = None;
+        self.filtered_tree_items = None;
+        if self.content_search_query.is_empty() {
+            return;
+        }
+        let Some((package_source, index)) = self
+            .package
+            .as_ref()
+            .map(|package| (package.source.clone(), Arc::clone(&package.index)))
+        else {
+            self.content_message = Some("Package is still loading".to_string());
+            return;
+        };
+        let request_id = self.content_search_request_id;
+        if let Err(error) = self.worker.submit(Job::SearchContent {
+            request_id,
+            package_path: package_source,
+            query: self.content_search_query.clone(),
+            index,
+        }) {
+            self.content_message = Some(format!("Content search failed: {error}"));
+            return;
+        }
+        self.content_search_pending = true;
+        self.content_message = Some(format!(
+            "Searching package contents for: {}…",
+            self.content_search_query
+        ));
+    }
+
+    fn apply_content_search_filter(&mut self, paths: &[String]) {
+        let matches = paths.iter().collect::<HashSet<_>>();
+        match filter_tree_matches(&self.tree_items, &matches) {
+            Ok(items) => {
+                let open_paths = collect_open_paths(&items);
+                self.filtered_tree_items = Some(items);
+                for path in open_paths {
+                    self.tree_state.open(path);
+                }
+            }
+            Err(error) => {
+                self.filtered_tree_items = None;
+                self.content_message = Some(format!("Could not filter tree: {error}"));
+            }
+        }
+    }
+
     pub fn selection_status(&self) -> String {
         let Some(selected) = self.tree_state.selected().last() else {
+            if self.content_search_active {
+                return format!(
+                    "Content search: {}_ | {} matches | Enter finish, Esc cancel",
+                    self.content_search_query,
+                    self.content_search_matches.len()
+                );
+            }
             return if self.search_active {
                 format!(
                     "Search: {}_ | {} matches | Enter select, Esc cancel",
@@ -703,7 +900,18 @@ impl App {
         };
 
         let mut status = format!("Part: {display_name} | Type: {part_type}");
-        if self.search_active {
+        if self.content_search_active {
+            status.push_str(&format!(
+                " | Content search: {}_ | {} matches",
+                self.content_search_query,
+                self.content_search_matches.len()
+            ));
+        } else if !self.content_search_query.is_empty() {
+            status.push_str(&format!(
+                " | Content search: {} (n/N next, Esc clear)",
+                self.content_search_query
+            ));
+        } else if self.search_active {
             status.push_str(&format!(" | Search: {}", self.search_query));
         } else if !self.search_query.is_empty() {
             status.push_str(&format!(
@@ -946,6 +1154,36 @@ fn filter_tree(
             .unwrap_or_default()
             .to_string();
         // Children are a subset of a valid sibling set, so identifiers stay unique.
+        let branch =
+            TreeItem::new(item.identifier().clone(), name, children).map_err(io::Error::other)?;
+        result.push(branch);
+    }
+    Ok(result)
+}
+
+fn filter_tree_matches(
+    items: &[TreeItem<'static, String>],
+    matches: &HashSet<&String>,
+) -> io::Result<Vec<TreeItem<'static, String>>> {
+    let mut result = Vec::new();
+    for item in items {
+        if matches.contains(item.identifier()) {
+            result.push(item.clone());
+            continue;
+        }
+        if item.children().is_empty() {
+            continue;
+        }
+        let children = filter_tree_matches(item.children(), matches)?;
+        if children.is_empty() {
+            continue;
+        }
+        let name = item
+            .identifier()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
         let branch =
             TreeItem::new(item.identifier().clone(), name, children).map_err(io::Error::other)?;
         result.push(branch);
@@ -1348,6 +1586,34 @@ mod tests {
         let opened_after: Vec<Vec<String>> = app.tree_state.opened().iter().cloned().collect();
         assert_eq!(opened_before.len(), opened_after.len());
         assert!(app.search_query.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn content_search_runs_in_background_and_filters_matching_parts() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        app.start_content_search();
+        for character in "OOXML TUI".chars() {
+            app.content_search_input_char(character);
+        }
+        pump_until(&mut app, |app| !app.content_search_pending);
+
+        assert!(app.content_search_active);
+        assert!(app
+            .content_search_matches
+            .iter()
+            .any(|path| path == "/ppt/slides/slide1.xml"));
+        assert!(app.tree_filter_active());
+        assert!(app
+            .visible_tree_items()
+            .iter()
+            .any(|item| item.identifier() == "/ppt"));
+
+        app.finish_content_search();
+        app.next_content_search_match(false);
+        app.cancel_content_search();
+        assert!(!app.tree_filter_active());
+        assert!(app.content_search_query.is_empty());
         Ok(())
     }
 

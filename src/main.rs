@@ -261,6 +261,31 @@ fn run_app(
                 continue;
             }
 
+            if app.content_search_active && app.current_widget == CurrentWidget::Tree {
+                if actions.contains(&Action::Cancel) {
+                    debug_log("canceling content search");
+                    app.cancel_content_search();
+                } else if actions.contains(&Action::Confirm) {
+                    debug_log(format!(
+                        "finishing content search query={:?}",
+                        app.content_search_query
+                    ));
+                    app.finish_content_search();
+                } else if actions.contains(&Action::Backspace) {
+                    app.content_search_backspace();
+                } else {
+                    match key.code {
+                        KeyCode::Char(character)
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            app.content_search_input_char(character);
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+
             if app.search_active && app.current_widget == CurrentWidget::Tree {
                 if actions.contains(&Action::Cancel) {
                     debug_log("canceling search");
@@ -406,14 +431,26 @@ fn run_app(
                         app.collapse_all();
                     } else if actions.contains(&Action::StartSearch) {
                         app.start_search();
+                    } else if actions.contains(&Action::StartContentSearch) {
+                        app.start_content_search();
                     } else if actions.contains(&Action::NextMatch) {
-                        app.next_search_match(false);
+                        if app.has_content_search_query() {
+                            app.next_content_search_match(false);
+                        } else {
+                            app.next_search_match(false);
+                        }
                     } else if actions.contains(&Action::PreviousMatch) {
-                        app.next_search_match(true);
-                    } else if actions.contains(&Action::Cancel) && !app.search_query.is_empty() {
+                        if app.has_content_search_query() {
+                            app.next_content_search_match(true);
+                        } else {
+                            app.next_search_match(true);
+                        }
+                    } else if actions.contains(&Action::Cancel)
+                        && (!app.search_query.is_empty() || app.has_content_search_query())
+                    {
                         // Esc with an applied (but inactive) search clears the filter
                         // and restores the pre-search tree state.
-                        app.cancel_search();
+                        app.cancel_any_search();
                     }
                 }
             }

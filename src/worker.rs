@@ -13,10 +13,13 @@ use std::{
 };
 
 use crate::{
-    package::{Diagnostic, Package, PackageIndex, PartInfo, MAX_ENTRY_BYTES},
+    package::{Diagnostic, Package, PackageIndex, PartInfo, PartKind, MAX_ENTRY_BYTES},
     preview::{build_preview, Preview},
     summary::{build_document_summary, DetailsView},
 };
+
+const MAX_CONTENT_SEARCH_RESULTS: usize = 4096;
+const SEARCH_BUFFER_BYTES: usize = 8192;
 
 #[derive(Debug)]
 pub enum Job {
@@ -28,6 +31,12 @@ pub enum Job {
         request_id: u64,
         package_path: PathBuf,
         part: Box<PartInfo>,
+        index: Arc<PackageIndex>,
+    },
+    SearchContent {
+        request_id: u64,
+        package_path: PathBuf,
+        query: String,
         index: Arc<PackageIndex>,
     },
 }
@@ -50,6 +59,11 @@ pub enum ResultMessage {
         request_id: u64,
         selected_path: String,
         preview: Result<Preview, String>,
+    },
+    ContentSearch {
+        request_id: u64,
+        query: String,
+        matches: Result<Vec<String>, String>,
     },
 }
 
@@ -171,6 +185,21 @@ impl Worker {
                                 request_id,
                                 selected_path: part.path.clone(),
                                 preview,
+                            }
+                        }
+                        Job::SearchContent {
+                            request_id,
+                            package_path,
+                            query,
+                            index,
+                        } => {
+                            let matches =
+                                search_content(&mut archive_cache, &package_path, &index, &query)
+                                    .map_err(|error| error.to_string());
+                            ResultMessage::ContentSearch {
+                                request_id,
+                                query,
+                                matches,
                             }
                         }
                     };
@@ -299,6 +328,64 @@ fn read_preview(
     ))
 }
 
+fn search_content(
+    cache: &mut ArchiveCache,
+    package_path: &Path,
+    index: &PackageIndex,
+    query: &str,
+) -> io::Result<Vec<String>> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let needle = query.as_bytes();
+    let archive = cached_archive(cache, package_path)?;
+    let mut matches = Vec::new();
+
+    for part in index.parts.values() {
+        if matches.len() >= MAX_CONTENT_SEARCH_RESULTS {
+            break;
+        }
+        if part.kind == PartKind::Directory || part.size > MAX_ENTRY_BYTES {
+            continue;
+        }
+        let Ok(mut entry) = archive.by_name(&part.archive_name) else {
+            continue;
+        };
+        if stream_contains(&mut entry, needle)? {
+            matches.push(part.path.clone());
+        }
+    }
+    Ok(matches)
+}
+
+fn stream_contains<R: io::Read>(reader: &mut R, needle: &[u8]) -> io::Result<bool> {
+    if needle.is_empty() {
+        return Ok(true);
+    }
+    let mut window = Vec::with_capacity(needle.len());
+    let mut buffer = [0u8; SEARCH_BUFFER_BYTES];
+    let mut total = 0u64;
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(false);
+        }
+        total = total.saturating_add(count as u64);
+        if total > MAX_ENTRY_BYTES {
+            return Ok(false);
+        }
+        for byte in &buffer[..count] {
+            window.push(*byte);
+            if window.len() > needle.len() {
+                window.remove(0);
+            }
+            if window == needle {
+                return Ok(true);
+            }
+        }
+    }
+}
+
 /// A result is applicable only to the request and selection that produced it.
 /// Keeping this predicate separate makes stale-result handling deterministic and testable.
 pub fn accepts_result(
@@ -312,14 +399,26 @@ pub fn accepts_result(
 
 #[cfg(test)]
 mod tests {
-    use super::{accepts_result, Job, Worker};
-    use std::{path::PathBuf, time::Instant};
+    use super::{accepts_result, stream_contains, Job, Worker};
+    use std::{io::Cursor, path::PathBuf, time::Instant};
 
     #[test]
     fn stale_request_is_discarded() {
         assert!(!accepts_result(1, 2, "/a.xml", "/a.xml"));
         assert!(!accepts_result(2, 2, "/a.xml", "/b.xml"));
         assert!(accepts_result(2, 2, "/a.xml", "/a.xml"));
+    }
+
+    #[test]
+    fn content_search_matches_exact_bytes_across_buffer_boundaries() {
+        let mut bytes = vec![b'x'; super::SEARCH_BUFFER_BYTES - 2];
+        bytes.extend_from_slice(b"needle");
+        let found = stream_contains(&mut Cursor::new(bytes), b"needle")
+            .expect("stream search should not fail");
+        assert!(found);
+
+        let mut input = Cursor::new(b"some text".to_vec());
+        assert!(!stream_contains(&mut input, b"missing").unwrap());
     }
 
     #[test]

@@ -8,6 +8,7 @@ A terminal user interface for inspecting Office Open XML (OOXML) documents such 
 - **XML viewer** — View selected XML parts with syntax highlighting and indentation.
 - **Image preview** — Preview common embedded PNG, JPEG, GIF, BMP, and WebP images.
 - **Raw file previews** — View plain text and JSON, inspect `.bin` files as hex, and see metadata for binary media, fonts, and OLE parts.
+- **Content search** — Grep package-part contents in the background and filter the tree to matching parts.
 - **Document summaries** — Press `s` to inspect slide, paragraph, heading, table, sheet, cell, and formula summaries for PowerPoint, Word, and Excel packages; linked part paths navigate back to the tree.
 - **Vim-like navigation** — Move through files with `j`/`k` and the editor with Vim bindings.
 
@@ -61,6 +62,7 @@ oox --version
 | `g` / `G` | Select the first / last visible item        |
 | `E` / `C` | Expand / collapse all tree nodes              |
 | `/`       | Search and live-filter package paths          |
+| `Ctrl-f`  | Search part contents in the background       |
 | `n` / `N` | Select the next / previous search match     |
 | `Esc`     | Cancel search / clear the applied filter    |
 | `Enter`   | Toggle directory / preview file content     |
@@ -70,7 +72,6 @@ oox --version
 | `d`       | Toggle the metadata panel                   |
 | `s`       | Toggle the document-specific summary        |
 | Mouse       | Select/expand tree; scroll tree/metadata; click relationship targets |
-| `Esc`     | Cancel search or close help (clears filter) |
 | `q`       | Quit from tree / Vim normal mode             |
 | `Ctrl-q`  | Quit from Emacs editor                       |
 | `Alt-Left` / `Alt-Right` | Previous / next opened part       |
