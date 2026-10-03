@@ -73,8 +73,10 @@ fn validate_xml_bytes(bytes: &[u8], part: &str) -> io::Result<()> {
     }
 }
 
-fn element_is(name: &[u8], expected: &[u8]) -> bool {
-    name.rsplit(|byte| *byte == b':').next() == Some(expected)
+fn element_is(name: &str, expected: &[u8]) -> bool {
+    name.rsplit(':')
+        .next()
+        .is_some_and(|local_name| local_name.as_bytes() == expected)
 }
 
 fn relationship_target_for_id(
@@ -114,10 +116,7 @@ fn append_decoded_reference(
     event: &quick_xml::events::BytesRef<'_>,
     limit: usize,
 ) {
-    let Ok(reference) = event.decode() else {
-        return;
-    };
-    let encoded = format!("&{};", reference);
+    let encoded = format!("&{};", event.as_ref());
     let Ok(decoded) = quick_xml::escape::unescape(&encoded) else {
         return;
     };
@@ -133,15 +132,8 @@ fn append_decoded_text(
     if output.chars().count() >= limit {
         return;
     }
-    let decoded = event
-        .decode()
-        .ok()
-        .and_then(|value| {
-            quick_xml::escape::unescape(value.as_ref())
-                .ok()
-                .map(|unescaped| unescaped.into_owned())
-        })
-        .unwrap_or_else(|| String::from_utf8_lossy(event.as_ref()).into_owned());
+    let decoded =
+        quick_xml::escape::unescape(event.as_ref()).unwrap_or_else(|_| event.as_ref().into());
     let remaining = limit.saturating_sub(output.chars().count());
     output.extend(decoded.chars().take(remaining));
 }
@@ -199,8 +191,8 @@ mod tests {
 
     #[test]
     fn summary_text_decodes_entities_and_stays_bounded() {
-        let text = ppt::extract_all_text(br#"<root>one &amp; &lt;two&gt;</root>"#);
-        assert_eq!(text, "one & <two>");
+        let text = ppt::extract_all_text(br#"<root>one &amp; &lt;two&gt;&#x21;</root>"#);
+        assert_eq!(text, "one & <two>!");
 
         let mut view = DetailsView {
             text: String::new(),
