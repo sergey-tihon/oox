@@ -8,8 +8,8 @@ use std::{
 
 use image::ImageFormat;
 use quick_xml::{
-    events::{BytesStart, Event},
     Reader,
+    events::{BytesStart, Event},
 };
 
 pub const MAX_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
@@ -698,10 +698,12 @@ mod tests {
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let index = PackageIndex::from_archive(&mut archive).unwrap();
         assert!(index.parts.is_empty());
-        assert!(index
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("maximum depth")));
+        assert!(
+            index
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("maximum depth"))
+        );
     }
 
     #[test]

@@ -1,14 +1,14 @@
 //! Lightweight Word package summary.
 use std::io::{self, Read};
 
-use quick_xml::{events::Event, Reader};
+use quick_xml::{Reader, events::Event};
 
 use super::{
-    append_decoded_reference, append_decoded_text, clean_summary_text, element_is,
-    push_summary_line, read_part, relationship_count, validate_xml_bytes, DetailsView,
-    MAX_SUMMARY_ITEMS, MAX_SUMMARY_TEXT_CHARS,
+    DetailsView, MAX_SUMMARY_ITEMS, MAX_SUMMARY_TEXT_CHARS, append_decoded_reference,
+    append_decoded_text, clean_summary_text, element_is, push_summary_line, read_part,
+    relationship_count, validate_xml_bytes,
 };
-use crate::package::{xml_attribute, PackageIndex};
+use crate::package::{PackageIndex, xml_attribute};
 
 pub(super) fn build_word_summary<R: Read + io::Seek>(
     archive: &mut zip::ZipArchive<R>,

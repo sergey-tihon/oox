@@ -8,9 +8,9 @@ mod word;
 
 use std::io::{self, Read};
 
-use quick_xml::{events::Event, Reader};
+use quick_xml::{Reader, events::Event};
 
-use crate::package::{PackageIndex, MAX_ENTRY_BYTES};
+use crate::package::{MAX_ENTRY_BYTES, PackageIndex};
 
 pub const MAX_SUMMARY_LINES: usize = 4096;
 pub const MAX_SUMMARY_CHARS: usize = 512 * 1024;

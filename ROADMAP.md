@@ -24,6 +24,7 @@
 - Preview classification/formatting split into `src/preview.rs`; PowerPoint/Word/Excel parsers split into `src/summary/` modules; duplicated `Package`/`PackageIndex` state removed from `App`.
 - Minimum-terminal-size guard, capped navigation history, generated help overlay, read-only content labeling, and F1 help in Emacs editor mode.
 - Live visual tree filtering: non-matching paths are hidden while typing a search query, the selection follows the first match, Enter keeps the filter for n/N cycling, and Esc restores the full tree and its pre-search open/closed state.
+- Background content search: `Ctrl-f` performs bounded grep-style searches across package parts, filters the tree to matching parts, and supports n/N navigation.
 
 ## Most important remaining features
 
@@ -41,7 +42,6 @@ This should not be added to the current package-inspection code. It needs indepe
 
 ### Priority 2 — Better package navigation and inspection
 
-- **Content search:** grep-style search across part contents in the background worker, not only package-path matching.
 - **Resizable panes:** allow users to adjust tree, metadata, and content widths/heights.
 - **Bookmarks or pinned parts:** keep frequently inspected package parts accessible.
 - **Relationship graph view:** show a navigable graph for slides, worksheets, document parts, images, and layouts.

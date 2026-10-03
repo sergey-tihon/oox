@@ -4,18 +4,18 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
-        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use crate::{
-    package::{Diagnostic, Package, PackageIndex, PartInfo, PartKind, MAX_ENTRY_BYTES},
-    preview::{build_preview, Preview},
-    summary::{build_document_summary, DetailsView},
+    package::{Diagnostic, MAX_ENTRY_BYTES, Package, PackageIndex, PartInfo, PartKind},
+    preview::{Preview, build_preview},
+    summary::{DetailsView, build_document_summary},
 };
 
 const MAX_CONTENT_SEARCH_RESULTS: usize = 4096;
@@ -399,7 +399,7 @@ pub fn accepts_result(
 
 #[cfg(test)]
 mod tests {
-    use super::{accepts_result, stream_contains, Job, Worker};
+    use super::{Job, Worker, accepts_result, stream_contains};
     use std::{io::Cursor, path::PathBuf, time::Instant};
 
     #[test]

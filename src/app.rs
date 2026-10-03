@@ -10,11 +10,11 @@ use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use tui_tree_widget::{TreeItem, TreeState};
 
 use crate::package::{
-    is_image_name, is_xml_name, Package, PackageIndex, PartKind, Relationship, TargetMode,
+    Package, PackageIndex, PartKind, Relationship, TargetMode, is_image_name, is_xml_name,
 };
 use crate::preview::{Preview, PreviewKind};
 use crate::summary::{DetailLink, DetailsView};
-use crate::worker::{accepts_result, Job, ResultMessage, Worker};
+use crate::worker::{Job, ResultMessage, Worker, accepts_result};
 
 /// Bounds the back/forward navigation history so long sessions cannot grow it
 /// without limit.
@@ -1232,7 +1232,7 @@ fn create_tree_level(
 #[cfg(test)]
 mod tests {
     use crate::preview::PreviewKind;
-    use crate::{worker::Worker, App};
+    use crate::{App, worker::Worker};
     use ratatui_image::picker::Picker;
     use std::{io, time::Duration};
 
@@ -1295,10 +1295,12 @@ mod tests {
             .expect("sample presentation should have a summary");
         assert!(summary.text.contains("Slides: 2"));
         assert!(summary.text.contains("OOXML TUI"));
-        assert!(summary
-            .links
-            .iter()
-            .any(|link| link.target == "/ppt/slides/slide1.xml"));
+        assert!(
+            summary
+                .links
+                .iter()
+                .any(|link| link.target == "/ppt/slides/slide1.xml")
+        );
 
         Ok(())
     }
@@ -1451,10 +1453,12 @@ mod tests {
             .get("/ppt/slides/slide1.xml")
             .expect("sample slide should be indexed");
         assert_eq!(slide.kind, crate::package::PartKind::Xml);
-        assert!(slide
-            .content_type
-            .as_deref()
-            .is_some_and(|content_type| { content_type.contains("presentationml.slide+xml") }));
+        assert!(
+            slide
+                .content_type
+                .as_deref()
+                .is_some_and(|content_type| { content_type.contains("presentationml.slide+xml") })
+        );
 
         let outgoing = app
             .index()
@@ -1599,15 +1603,17 @@ mod tests {
         pump_until(&mut app, |app| !app.content_search_pending);
 
         assert!(app.content_search_active);
-        assert!(app
-            .content_search_matches
-            .iter()
-            .any(|path| path == "/ppt/slides/slide1.xml"));
+        assert!(
+            app.content_search_matches
+                .iter()
+                .any(|path| path == "/ppt/slides/slide1.xml")
+        );
         assert!(app.tree_filter_active());
-        assert!(app
-            .visible_tree_items()
-            .iter()
-            .any(|item| item.identifier() == "/ppt"));
+        assert!(
+            app.visible_tree_items()
+                .iter()
+                .any(|item| item.identifier() == "/ppt")
+        );
 
         app.finish_content_search();
         app.next_content_search_match(false);

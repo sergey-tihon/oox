@@ -241,8 +241,8 @@ pub fn generate(path: &Path) -> io::Result<()> {
 mod tests {
     use super::Action;
     use crossterm_keybind::{
-        event::{KeyCode, KeyEvent, KeyModifiers},
         KeyBindTrait,
+        event::{KeyCode, KeyEvent, KeyModifiers},
     };
 
     #[test]

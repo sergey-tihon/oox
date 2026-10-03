@@ -12,10 +12,10 @@ use app::{App, CurrentWidget};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use crossterm_keybind::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm_keybind::KeyBindTrait;
+use crossterm_keybind::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use edtui::{EditorEventHandler, EditorMode as EdtuiMode};
 use keybindings::Action;
 use ratatui::prelude::*;

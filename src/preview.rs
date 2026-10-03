@@ -9,7 +9,7 @@ use std::{
 };
 
 use image::{DynamicImage, ImageReader, Limits};
-use quick_xml::{events::Event, Reader, Writer};
+use quick_xml::{Reader, Writer, events::Event};
 
 use crate::package::{image_format, is_image_name, is_xml_content_type, is_xml_name};
 

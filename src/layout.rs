@@ -88,8 +88,10 @@ mod tests {
             layout.tree.y
         ));
         assert!(!LayoutSnapshot::contains(layout.tree, 99, 29));
-        assert!(layout
-            .content_line(2, layout.content_inner.x, layout.content_inner.y)
-            .is_some());
+        assert!(
+            layout
+                .content_line(2, layout.content_inner.x, layout.content_inner.y)
+                .is_some()
+        );
     }
 }
