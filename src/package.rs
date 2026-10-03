@@ -375,7 +375,7 @@ fn parse_content_types(bytes: &[u8]) -> io::Result<ContentTypes> {
             Ok(Event::Eof) => break,
             Ok(Event::Empty(event)) | Ok(Event::Start(event)) => {
                 match local_name(event.name().as_ref()) {
-                    b"Default" => {
+                    "Default" => {
                         if let (Some(extension), Some(content_type)) = (
                             xml_attribute(&event, b"Extension"),
                             xml_attribute(&event, b"ContentType"),
@@ -385,7 +385,7 @@ fn parse_content_types(bytes: &[u8]) -> io::Result<ContentTypes> {
                                 .insert(extension.to_ascii_lowercase(), content_type);
                         }
                     }
-                    b"Override" => {
+                    "Override" => {
                         if let (Some(part), Some(content_type)) = (
                             xml_attribute(&event, b"PartName"),
                             xml_attribute(&event, b"ContentType"),
@@ -415,7 +415,7 @@ fn parse_relationships(bytes: &[u8], source: &str) -> io::Result<Vec<Relationshi
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Eof) => break,
             Ok(Event::Empty(event)) | Ok(Event::Start(event))
-                if local_name(event.name().as_ref()) == b"Relationship" =>
+                if local_name(event.name().as_ref()) == "Relationship" =>
             {
                 let id = required_xml_attribute(&event, b"Id", "Relationship")?;
                 let relationship_type = required_xml_attribute(&event, b"Type", "Relationship")?;
@@ -453,18 +453,19 @@ pub(crate) fn xml_attribute(event: &BytesStart<'_>, name: &[u8]) -> Option<Strin
         .with_checks(true)
         .filter_map(Result::ok)
         .collect::<Vec<_>>();
-    let requested_local = local_name(name);
+    let requested_name = std::str::from_utf8(name).ok()?;
+    let requested_local = local_name(requested_name);
     let attribute = attributes
         .iter()
-        .find(|a| a.key.as_ref() == name)
+        .find(|a| a.key.as_ref() == requested_name)
         .or_else(|| {
             attributes.iter().find(|a| {
                 local_name(a.key.as_ref()) == requested_local
-                    && (!name.contains(&b':') || a.key.as_ref().contains(&b':'))
+                    && (!requested_name.contains(':') || a.key.as_ref().contains(':'))
             })
         })?;
     attribute
-        .decoded_and_normalized_value(quick_xml::XmlVersion::default(), event.decoder())
+        .normalized_value(quick_xml::XmlVersion::default())
         .ok()
         .map(|v| v.into_owned())
 }
@@ -486,8 +487,8 @@ fn required_xml_attribute(
             )
         })
 }
-fn local_name(name: &[u8]) -> &[u8] {
-    name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
+fn local_name(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
 }
 fn relationship_source(path: &str) -> Option<String> {
     if path == "_rels/.rels" {
