@@ -2308,9 +2308,13 @@ impl App {
         }
         let written_here = self.last_saved.as_deref() == Some(Path::new(&target));
         // `exists()` follows symlinks, so a dangling one would slip past the
-        // confirmation and be replaced by the final rename. Any directory entry
-        // at the path, symlink included, has to be asked about.
+        // confirmation and be replaced by the install. Any directory entry at
+        // the path, symlink included, has to be asked about.
         let occupied = std::fs::symlink_metadata(&target_path).is_ok();
+        // The authorization is decided here, where the user's answer lives, and
+        // carried into the job: the worker must not re-decide it against a path
+        // that may have changed in the meantime.
+        let overwrite = written_here || self.save_confirm.as_deref() == Some(&target);
         if occupied && !written_here && self.save_confirm.as_deref() != Some(&target) {
             // The prompt itself renders the confirmation, so no status message.
             self.save_confirm = Some(target.clone());
@@ -2320,10 +2324,10 @@ impl App {
         self.save_query.clear();
         self.save_confirm = None;
         self.save_warnings.clear();
-        self.submit_save(target_path)
+        self.submit_save(target_path, overwrite)
     }
 
-    fn submit_save(&mut self, target: PathBuf) -> io::Result<()> {
+    fn submit_save(&mut self, target: PathBuf, overwrite: bool) -> io::Result<()> {
         let Some(package) = self.package.as_ref() else {
             self.status_message = Some("Package is still loading".to_string());
             return Ok(());
@@ -2341,6 +2345,7 @@ impl App {
             request_id,
             package_path: package_source,
             target,
+            overwrite,
             index,
             edits,
         }) {
@@ -4227,7 +4232,7 @@ mod tests {
 
         let target = temp_save_path("out.pptx");
         let _ = std::fs::remove_file(&target);
-        app.submit_save(target.clone())?;
+        app.submit_save(target.clone(), true)?;
         pump_until(&mut app, |app| !app.save_pending);
         // The saved package is re-indexed through the worker and the part is
         // shown again, so the tree, diagnostics and summary all describe it.
@@ -4393,7 +4398,7 @@ mod tests {
 
         let target = temp_save_path("locked.pptx");
         let _ = std::fs::remove_file(&target);
-        app.submit_save(target.clone())?;
+        app.submit_save(target.clone(), true)?;
         // Without pumping, so the job is still in flight.
         assert!(app.is_saving());
 
@@ -4485,7 +4490,7 @@ mod tests {
 
         let target = temp_save_path("cursor.pptx");
         let _ = std::fs::remove_file(&target);
-        app.submit_save(target.clone())?;
+        app.submit_save(target.clone(), true)?;
         pump_until(&mut app, |app| {
             !app.save_pending && !app.loading && !app.preview_pending
         });
@@ -4523,7 +4528,7 @@ mod tests {
 
         let target = temp_save_path("frozen.pptx");
         let _ = std::fs::remove_file(&target);
-        app.submit_save(target.clone())?;
+        app.submit_save(target.clone(), true)?;
         // The job is still in flight, and this is exactly what the loop checks
         // before dispatching any event.
         assert!(app.is_saving());
@@ -4544,6 +4549,39 @@ mod tests {
         Ok(())
     }
 
+    /// A target that appeared after the user was asked must not be clobbered: the
+    /// authorization is decided at confirmation time and carried into the job.
+    #[test]
+    fn a_target_created_after_confirmation_is_not_replaced() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+
+        // The user confirms a target that does not exist yet, without overwrite
+        // rights, exactly as `confirm_save` computes them for a fresh path.
+        let target = temp_save_path("appeared.pptx");
+        let _ = std::fs::remove_file(&target);
+        app.submit_save(target.clone(), false)?;
+        // Something else claims the path before the worker installs.
+        std::fs::write(&target, b"not ours")?;
+
+        pump_until(&mut app, |app| !app.save_pending);
+        assert_eq!(
+            std::fs::read(&target)?,
+            b"not ours",
+            "the file that appeared must survive"
+        );
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("Save failed:")),
+            "the refusal must be reported: {:?}",
+            app.status_message
+        );
+
+        std::fs::remove_file(&target)?;
+        Ok(())
+    }
+
     /// A new target must not be written owner-only just because the temporary
     /// file it is built from is.
     #[cfg(unix)]
@@ -4555,7 +4593,7 @@ mod tests {
 
         let target = temp_save_path("perm.pptx");
         let _ = std::fs::remove_file(&target);
-        app.submit_save(target.clone())?;
+        app.submit_save(target.clone(), true)?;
         pump_until(&mut app, |app| !app.save_pending);
 
         let written = std::fs::metadata(&target)?.permissions().mode() & 0o777;

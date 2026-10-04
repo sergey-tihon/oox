@@ -65,10 +65,16 @@ pub enum Job {
     },
     /// Write a new package with the listed parts replaced, then re-index it for
     /// the UI. `edits` maps package paths to their new contents.
+    ///
+    /// `overwrite` carries the authorization the user gave on the UI thread: the
+    /// UI decides whether a target may be replaced, and the install honors that
+    /// decision rather than re-deciding it here. Without it, a file created
+    /// between the confirmation and the rename would be clobbered silently.
     SavePackage {
         request_id: u64,
         package_path: PathBuf,
         target: PathBuf,
+        overwrite: bool,
         index: Arc<PackageIndex>,
         edits: Vec<(String, Vec<u8>)>,
     },
@@ -412,6 +418,7 @@ impl Worker {
                             request_id,
                             package_path,
                             target,
+                            overwrite,
                             index,
                             edits,
                         } => {
@@ -419,6 +426,7 @@ impl Worker {
                                 &mut archive_cache,
                                 &package_path,
                                 &target,
+                                overwrite,
                                 &index,
                                 edits,
                             )
@@ -708,12 +716,15 @@ fn write_new_file(path: &Path, bytes: &[u8], owner_only: bool) -> io::Result<()>
 
 /// Rewrite the package with the edited parts replaced.
 ///
-/// The new package is built in a sibling temporary file and renamed over the
-/// target, so a failure part-way through leaves the original untouched.
+/// The new package is built in a sibling temporary file and installed onto the
+/// target, so a failure part-way through leaves the original untouched. When
+/// `overwrite` is false the install refuses to replace an existing file, so a
+/// target that appeared after the user confirmed is never silently clobbered.
 fn save_package(
     cache: &mut ArchiveCache,
     package_path: &Path,
     target: &Path,
+    overwrite: bool,
     index: &PackageIndex,
     edits: Vec<(String, Vec<u8>)>,
 ) -> io::Result<()> {
@@ -747,11 +758,46 @@ fn save_package(
     if let Ok(template) = template {
         std::fs::set_permissions(temp.path(), template.permissions())?;
     }
-    // The cached handles are stale after the rename, and on Windows a read
+    // The cached handles are stale after the install, and on Windows a read
     // handle would block it. `temp` deletes its file if anything fails here.
     cache.retain(|(cached, _)| cached != target && cached != package_path);
-    std::fs::rename(temp.path(), target)?;
+    if overwrite {
+        // `rename` replaces the target atomically, which is what the user
+        // confirmed on the prompt.
+        std::fs::rename(temp.path(), target)?;
+    } else {
+        install_without_replacing(temp.path(), target)?;
+    }
     Ok(())
+}
+
+/// Move `source` onto `target`, refusing to replace anything that is already
+/// there.
+///
+/// The last step is a `rename`, which can only succeed while `target` does not
+/// exist, so two saves racing for the same new path cannot lose one another's
+/// write. `source` is a `link`ed copy of the temporary file, not the temporary
+/// file itself, whose removal must stay with `TempPart`.
+///
+/// `hard_link` is what makes the sequence no-clobber: `rename` in its place
+/// would silently replace a file created between the check and the swap. The
+/// link is made in the same directory the target lives in, so it cannot cross a
+/// filesystem boundary.
+fn install_without_replacing(source: &Path, target: &Path) -> io::Result<()> {
+    match std::fs::hard_link(source, target) {
+        Ok(()) => {
+            std::fs::remove_file(source)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} was created while the package was being written",
+                target.display()
+            ),
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 /// A fresh, empty, owner-only file next to `target`. `create_new` refuses to
@@ -986,5 +1032,69 @@ mod tests {
         // result channel is disconnected, or the app quits with it still queued.
         drop(ExportOutcome::TempFile(temp));
         assert!(!path.exists());
+    }
+
+    /// The unconfirmed install must refuse to replace a file that appeared after
+    /// the user was asked, which a `rename` would silently clobber.
+    #[test]
+    fn unconfirmed_install_never_replaces_an_existing_file() {
+        let directory = std::env::temp_dir().join(format!("oox-install-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("create scratch directory");
+        let source = directory.join("source.tmp");
+        let target = directory.join("target.pptx");
+
+        std::fs::write(&source, b"new").expect("write source");
+        std::fs::write(&target, b"existing").expect("write target");
+        let error = super::install_without_replacing(&source, &target)
+            .expect_err("an existing target must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&target).expect("target readable"),
+            b"existing",
+            "the existing file must survive"
+        );
+        assert!(
+            source.exists(),
+            "the refused install must leave the source alone"
+        );
+
+        // With the path free, the install succeeds and consumes the source.
+        std::fs::remove_file(&target).expect("clear target");
+        super::install_without_replacing(&source, &target).expect("a free path installs");
+        assert_eq!(std::fs::read(&target).expect("target readable"), b"new");
+        assert!(!source.exists(), "the source is moved onto the target");
+
+        std::fs::remove_file(&target).expect("clean up");
+    }
+
+    /// A dangling symlink occupies the path, so an unconfirmed install must not
+    /// replace it either.
+    #[cfg(unix)]
+    #[test]
+    fn unconfirmed_install_refuses_a_dangling_symlink() {
+        let directory =
+            std::env::temp_dir().join(format!("oox-install-link-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("create scratch directory");
+        let source = directory.join("source.tmp");
+        let target = directory.join("target.pptx");
+        let missing = directory.join("never-created.pptx");
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&missing);
+        std::fs::write(&source, b"new").expect("write source");
+        std::os::unix::fs::symlink(&missing, &target).expect("create dangling symlink");
+
+        let error = super::install_without_replacing(&source, &target)
+            .expect_err("a dangling symlink must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .expect("target entry")
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive"
+        );
+
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&source);
     }
 }

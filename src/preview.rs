@@ -313,6 +313,13 @@ pub fn xml_well_formed(xml: &str) -> Result<(), String> {
                     return Err("character data outside the document element".to_string());
                 }
             }
+            // `&amp;` and `&#32;` arrive as their own event, not as text, so a
+            // reference outside the root has to be caught here as well.
+            Ok(Event::GeneralRef(_)) => {
+                if depth == 0 {
+                    return Err("character data outside the document element".to_string());
+                }
+            }
             Ok(_) => {}
             Err(error) => return Err(error.to_string()),
         }
@@ -510,6 +517,12 @@ mod tests {
         assert!(xml_well_formed("text").is_err());
         assert!(xml_well_formed("<a/>trailing").is_err());
         assert!(xml_well_formed("<a/>\n  ").is_ok());
+        // Entity and character references arrive as their own event, so they
+        // need the same treatment as literal text.
+        assert!(xml_well_formed("&amp;<a/>").is_err());
+        assert!(xml_well_formed("<a/>&#32;").is_err());
+        // Inside the element they are ordinary content.
+        assert!(xml_well_formed("<a>&amp;</a>").is_ok());
     }
 
     #[test]
