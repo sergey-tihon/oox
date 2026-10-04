@@ -2152,8 +2152,8 @@ impl App {
         self.unsaved_edit_count() > 0
     }
 
-    /// Re-diff the buffer against its baseline. Called after editor input, which
-    /// is the only thing that can change the verdict.
+    /// Re-diff the buffer against its baseline. Used for explicit reconciliation
+    /// (save, quit, navigation, undo/redo), not cursor-only editor events.
     pub fn refresh_editor_dirty(&mut self) {
         let dirty = match (&self.previewed_path, &self.editor_baseline) {
             (Some(_), Some(baseline)) => {
@@ -2165,6 +2165,24 @@ impl App {
             self.editor_dirty = dirty;
             self.refresh_tree_labels();
         }
+    }
+
+    /// Editor events only need a full baseline comparison when their input can
+    /// change content. Once dirty, ordinary edits stay dirty without rescanning;
+    /// undo/redo reconciles against the baseline so undoing back to the original
+    /// clears the marker.
+    pub fn refresh_editor_dirty_after_input(
+        &mut self,
+        may_change_content: bool,
+        may_restore_baseline: bool,
+    ) {
+        if !may_change_content && !may_restore_baseline {
+            return;
+        }
+        if self.editor_dirty && !may_restore_baseline {
+            return;
+        }
+        self.refresh_editor_dirty();
     }
 
     /// Set the buffer of the part on screen aside before the pane is replaced,
@@ -2250,6 +2268,10 @@ impl App {
             self.status_message = Some("Save in progress".to_string());
             return;
         }
+        if self.external_edit_request.is_some() {
+            self.status_message = Some("External edit is still loading".to_string());
+            return;
+        }
         if !self.is_package_loaded() {
             self.status_message = Some("Package is still loading".to_string());
             return;
@@ -2258,6 +2280,9 @@ impl App {
             self.status_message = Some("Editing is unavailable in compare mode".to_string());
             return;
         }
+        // Saving is explicit; reconcile once in case the user manually restored
+        // the original text while the dirty flag stayed sticky.
+        self.refresh_editor_dirty();
         if !self.has_unsaved_edits() {
             self.status_message = Some("No edits to save".to_string());
             return;
@@ -2453,6 +2478,10 @@ impl App {
     /// Ask for the selected part to be edited in `$VISUAL`/`$EDITOR`. The event
     /// loop launches the editor once the part's buffer is on screen.
     pub fn request_external_edit(&mut self) -> io::Result<()> {
+        if self.save_active {
+            self.status_message = Some("Save prompt is active".to_string());
+            return Ok(());
+        }
         if self.save_pending {
             self.status_message = Some("Save in progress".to_string());
             return Ok(());
@@ -2484,6 +2513,9 @@ impl App {
 
     /// Whether the requested part is on screen and ready to be handed over.
     pub fn external_edit_ready(&self) -> bool {
+        if self.save_active || self.save_pending {
+            return false;
+        }
         match self.external_edit_request.as_deref() {
             Some(path) => self.previewed_path.as_deref() == Some(path),
             None => false,
@@ -2601,6 +2633,9 @@ impl App {
 
     /// Quitting with unsaved edits must be asked for twice.
     pub fn request_quit(&mut self) -> bool {
+        // Dirty state is sticky during ordinary typing for performance; this
+        // explicit decision reconciles it before deciding whether to warn.
+        self.refresh_editor_dirty();
         if matches!(self.pending_confirmation, Some(Confirmation::Quit))
             || !self.has_unsaved_edits()
         {
@@ -2620,6 +2655,20 @@ impl App {
     pub fn disarm_confirmation(&mut self) {
         if self.pending_confirmation.take().is_some() {
             self.status_message = None;
+        }
+    }
+
+    /// Keep a pending confirmation only when this event can answer its exact
+    /// destructive action in the current input context. Global bindings alone
+    /// are insufficient: e.g. Emacs `q` is text, not a quit action.
+    pub fn disarm_confirmation_unless(&mut self, confirms_quit: bool, confirms_revert: bool) {
+        let confirms_pending = match self.pending_confirmation.as_ref() {
+            Some(Confirmation::Quit) => confirms_quit,
+            Some(Confirmation::Revert(_)) => confirms_revert,
+            None => true,
+        };
+        if !confirms_pending {
+            self.disarm_confirmation();
         }
     }
 
@@ -4210,6 +4259,33 @@ mod tests {
     }
 
     #[test]
+    fn only_a_matching_confirmation_action_keeps_the_guard_armed() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+
+        assert!(!app.request_quit());
+        // A globally-bound Quit that is invalid in this editor context is not
+        // confirmation; it must disarm rather than authorize a later quit.
+        app.disarm_confirmation_unless(false, false);
+        assert!(!app.request_quit());
+        app.disarm_confirmation_unless(true, false);
+        assert!(app.request_quit(), "a valid second quit confirms");
+
+        app.disarm_confirmation();
+        app.request_revert();
+        // A valid quit action cannot confirm a pending revert.
+        app.disarm_confirmation_unless(true, false);
+        app.request_revert();
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("again")),
+            "the revert must ask again after an unrelated confirmation action"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn quitting_with_unsaved_edits_is_asked_twice() -> io::Result<()> {
         let mut app = test_app("data/sample.pptx")?;
         // Nothing to lose: the first quit goes through.
@@ -4326,6 +4402,37 @@ mod tests {
         preview_loaded(&mut app);
         assert!(!app.external_edit_ready());
         assert!(app.take_external_edit_request().is_none());
+        Ok(())
+    }
+
+    /// A save cannot snapshot buffers while an external edit request is still
+    /// waiting for its asynchronous preview to arrive.
+    #[test]
+    fn deferred_external_edit_blocks_save_prompt() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+        app.tree_state
+            .select(vec!["/ppt/presentation.xml".to_string()]);
+        app.request_external_edit()?;
+        assert!(app.external_edit_request.is_some());
+        assert!(!app.external_edit_ready(), "the preview is still pending");
+
+        app.start_save();
+        assert!(!app.save_active, "saving must wait for the deferred edit");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("External edit is still loading")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_edit_request_is_refused_while_save_prompt_is_open() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        app.save_active = true;
+        app.request_external_edit()?;
+        assert!(app.external_edit_request.is_none());
+        assert_eq!(app.status_message.as_deref(), Some("Save prompt is active"));
         Ok(())
     }
 
@@ -4469,6 +4576,29 @@ mod tests {
         assert_eq!(
             app.status_message.as_deref(),
             Some("Reverted ppt/slides/slide1.xml")
+        );
+        Ok(())
+    }
+
+    /// Ordinary editor events do not re-scan a sticky dirty buffer; an undo/redo
+    /// event does, so returning exactly to baseline clears the marker.
+    #[test]
+    fn dirty_state_is_reconciled_only_on_content_or_history_events() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+        let baseline = app.editor_baseline.clone().expect("loaded baseline");
+        assert!(app.editor_is_dirty());
+
+        app.editor_state.lines = baseline;
+        app.refresh_editor_dirty_after_input(false, false);
+        assert!(
+            app.editor_is_dirty(),
+            "ordinary events keep the sticky flag"
+        );
+        app.refresh_editor_dirty_after_input(false, true);
+        assert!(
+            !app.editor_is_dirty(),
+            "undo reconciliation clears baseline"
         );
         Ok(())
     }
