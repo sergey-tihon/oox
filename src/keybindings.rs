@@ -70,6 +70,15 @@ pub enum Action {
     /// Start searching part contents in the background.
     #[keybindings["Control+f"]]
     StartContentSearch,
+    /// Extract the selected part to a file.
+    #[keybindings["e"]]
+    ExtractPart,
+    /// Open the selected part in `$PAGER`/`$EDITOR` from a temporary file.
+    #[keybindings["o"]]
+    OpenPartExternally,
+    /// Copy the pretty-printed part content to the clipboard (OSC 52).
+    #[keybindings["y"]]
+    CopyPartContent,
     /// Select the next search result.
     #[keybindings["n"]]
     NextMatch,
@@ -201,6 +210,14 @@ pub fn help_sections() -> Vec<(&'static str, Vec<HelpRow>)> {
                 HelpRow::Binding(Action::NextMatch, "Next match / content match"),
                 HelpRow::Binding(Action::PreviousMatch, "Previous match"),
                 HelpRow::Binding(Action::Cancel, "Cancel search / clear filter"),
+            ],
+        ),
+        (
+            "Export",
+            vec![
+                HelpRow::Binding(Action::ExtractPart, "Extract part to a file"),
+                HelpRow::Binding(Action::OpenPartExternally, "Open in $PAGER / $EDITOR"),
+                HelpRow::Binding(Action::CopyPartContent, "Copy pretty content to clipboard"),
             ],
         ),
         (

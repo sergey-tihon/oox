@@ -10,16 +10,27 @@ use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use tui_tree_widget::{TreeItem, TreeState};
 
 use crate::package::{
-    Package, PackageIndex, PartKind, Relationship, TargetMode, is_image_name, is_xml_name,
+    Package, PackageIndex, PartInfo, PartKind, Relationship, TargetMode, is_image_name, is_xml_name,
 };
 use crate::preview::{Preview, PreviewKind};
 use crate::summary::{DetailLink, DetailsView};
-use crate::worker::{Job, ResultMessage, Worker, accepts_result};
+use crate::worker::{
+    ExportMode, ExportOutcome, Job, ResultMessage, TempPart, Worker, accepts_result,
+};
 
 /// Bounds the back/forward navigation history so long sessions cannot grow it
 /// without limit.
 const MAX_NAVIGATION_HISTORY: usize = 256;
 const MAX_CONTENT_SEARCH_QUERY_CHARS: usize = 256;
+const MAX_EXPORT_PATH_CHARS: usize = 1024;
+
+/// Work an export produced that only the event loop can finish: running a
+/// command needs the terminal, and OSC 52 needs the backend's writer.
+pub enum PendingExport {
+    Extracted(PathBuf),
+    OpenTemp(TempPart),
+    Clipboard(String),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CurrentWidget {
@@ -74,6 +85,14 @@ pub struct App {
     content_search_index: Option<usize>,
     content_search_request_id: u64,
     content_search_pending: bool,
+    pub export_active: bool,
+    pub export_query: String,
+    export_request_id: u64,
+    export_pending: bool,
+    pending_export: Option<PendingExport>,
+    /// One-line feedback for work that has no other visible surface (export
+    /// results). Rendered in the status bar and cleared on the next selection.
+    pub status_message: Option<String>,
 }
 
 fn part_kind_label(kind: &PartKind) -> &'static str {
@@ -166,6 +185,12 @@ impl App {
             content_search_index: None,
             content_search_request_id: 0,
             content_search_pending: false,
+            export_active: false,
+            export_query: String::new(),
+            export_request_id: 0,
+            export_pending: false,
+            pending_export: None,
+            status_message: None,
         };
         app.worker.submit(Job::Open {
             request_id: app.open_request_id,
@@ -310,15 +335,43 @@ impl App {
                         }
                     }
                 }
+                ResultMessage::Exported {
+                    request_id,
+                    outcome,
+                } => {
+                    if request_id != self.export_request_id {
+                        // A stale `TempPart` removes its file as it drops.
+                        continue;
+                    }
+                    self.export_pending = false;
+                    match outcome {
+                        Ok(ExportOutcome::Saved(path)) => {
+                            self.pending_export = Some(PendingExport::Extracted(path));
+                        }
+                        Ok(ExportOutcome::TempFile(temp)) => {
+                            self.pending_export = Some(PendingExport::OpenTemp(temp));
+                        }
+                        Ok(ExportOutcome::Clipboard(text)) => {
+                            self.pending_export = Some(PendingExport::Clipboard(text));
+                        }
+                        Err(error) => {
+                            self.status_message = Some(format!("Export failed: {error}"));
+                        }
+                    }
+                }
             }
         }
         // Watchdog: explicit in-flight flags instead of inspecting message text.
         if !self.worker.is_alive()
-            && (self.loading || self.preview_pending || self.content_search_pending)
+            && (self.loading
+                || self.preview_pending
+                || self.content_search_pending
+                || self.export_pending)
         {
             self.loading = false;
             self.preview_pending = false;
             self.content_search_pending = false;
+            self.export_pending = false;
             let message = "Package worker exited before completing the request".to_string();
             self.worker_error = Some(message.clone());
             self.content_message = Some(message);
@@ -869,15 +922,20 @@ impl App {
     }
 
     pub fn selection_status(&self) -> String {
+        if self.export_active {
+            return format!(
+                "Extract to: {}_ | Enter save, Esc cancel",
+                self.export_query
+            );
+        }
         let Some(selected) = self.tree_state.selected().last() else {
-            if self.content_search_active {
-                return format!(
+            let status = if self.content_search_active {
+                format!(
                     "Content search: {}_ | {} matches | Enter finish, Esc cancel",
                     self.content_search_query,
                     self.content_search_matches.len()
-                );
-            }
-            return if self.search_active {
+                )
+            } else if self.search_active {
                 format!(
                     "Search: {}_ | {} matches | Enter select, Esc cancel",
                     self.search_query,
@@ -886,6 +944,7 @@ impl App {
             } else {
                 "No package part selected".to_string()
             };
+            return self.with_status_message(status);
         };
 
         let display_name = selected.trim_start_matches('/');
@@ -918,6 +977,16 @@ impl App {
                 " | Search: {} (n/N next, Esc clear)",
                 self.search_query
             ));
+        }
+        self.with_status_message(status)
+    }
+
+    /// Export feedback has no other visible surface. Appending it last keeps it
+    /// visible even when no tree item is selected.
+    fn with_status_message(&self, mut status: String) -> String {
+        if let Some(message) = self.status_message.as_deref() {
+            status.push_str(" | ");
+            status.push_str(message);
         }
         status
     }
@@ -977,6 +1046,7 @@ impl App {
         self.preview_kind = PreviewKind::Empty;
         self.summary_visible = false;
         self.summary_scroll = 0;
+        self.status_message = None;
         self.content_message = Some("Select a package part to inspect".to_string());
 
         let selected = match self.tree_state.selected().last().cloned() {
@@ -1028,6 +1098,99 @@ impl App {
 
     fn is_directory(&self, path: &str) -> bool {
         self.index().is_directory(path)
+    }
+
+    /// The selected part when it can actually be read out of the package.
+    fn selected_exportable_part(&self) -> Option<PartInfo> {
+        let selected = self.tree_state.selected().last()?;
+        let part = self.index().parts.get(selected)?;
+        (part.kind != PartKind::Directory).then(|| part.clone())
+    }
+
+    /// Begin the extract prompt, pre-filled with the part's file name so the
+    /// common case is Enter only.
+    pub fn start_extract(&mut self) {
+        if self.selected_exportable_part().is_none() {
+            self.status_message = Some("Select a package part to extract".to_string());
+            return;
+        }
+        if let Some(selected) = self.tree_state.selected().last() {
+            self.export_query = selected.rsplit('/').next().unwrap_or(selected).to_string();
+        }
+        self.export_active = true;
+    }
+
+    pub fn export_input_char(&mut self, character: char) {
+        if self.export_query.chars().count() >= MAX_EXPORT_PATH_CHARS {
+            return;
+        }
+        self.export_query.push(character);
+    }
+
+    pub fn export_backspace(&mut self) {
+        self.export_query.pop();
+    }
+
+    pub fn cancel_extract(&mut self) {
+        self.export_active = false;
+        self.export_query.clear();
+    }
+
+    pub fn confirm_extract(&mut self) -> io::Result<()> {
+        self.export_active = false;
+        let destination = self.export_query.trim().to_string();
+        self.export_query.clear();
+        if destination.is_empty() {
+            self.status_message = Some("Extraction path is empty".to_string());
+            return Ok(());
+        }
+        self.submit_export(ExportMode::SaveTo(PathBuf::from(destination)))
+    }
+
+    /// Write the selected part to a temporary file and hand it to `$PAGER`/`$EDITOR`.
+    pub fn open_selected_externally(&mut self) -> io::Result<()> {
+        self.submit_export(ExportMode::OpenTemp)
+    }
+
+    /// Copy the pretty-printed preview text of the selected part as OSC 52.
+    pub fn copy_selected_content(&mut self) -> io::Result<()> {
+        self.submit_export(ExportMode::Clipboard)
+    }
+
+    /// Hand a finished export to the event loop, which owns the terminal.
+    pub fn take_pending_export(&mut self) -> Option<PendingExport> {
+        self.pending_export.take()
+    }
+
+    fn submit_export(&mut self, mode: ExportMode) -> io::Result<()> {
+        let Some(part) = self.selected_exportable_part() else {
+            self.status_message = Some("Select a package part to export".to_string());
+            return Ok(());
+        };
+        let Some((package_source, index)) = self
+            .package
+            .as_ref()
+            .map(|package| (package.source.clone(), Arc::clone(&package.index)))
+        else {
+            self.status_message = Some("Package is still loading".to_string());
+            return Ok(());
+        };
+        self.export_request_id = self.export_request_id.wrapping_add(1);
+        let request_id = self.export_request_id;
+        if let Err(error) = self.worker.submit(Job::ExportPart {
+            request_id,
+            package_path: package_source,
+            part: Box::new(part),
+            index,
+            mode,
+        }) {
+            self.export_pending = false;
+            self.status_message = Some(format!("Export failed: {error}"));
+            return Ok(());
+        }
+        self.export_pending = true;
+        self.status_message = Some("Preparing export…".to_string());
+        Ok(())
     }
 
     fn install_tree(&mut self) {
@@ -1231,6 +1394,7 @@ fn create_tree_level(
 
 #[cfg(test)]
 mod tests {
+    use super::PendingExport;
     use crate::preview::PreviewKind;
     use crate::{App, worker::Worker};
     use ratatui_image::picker::Picker;
@@ -1620,6 +1784,82 @@ mod tests {
         app.cancel_content_search();
         assert!(!app.tree_filter_active());
         assert!(app.content_search_query.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn extract_writes_a_byte_identical_part() -> io::Result<()> {
+        use std::io::Read as _;
+
+        let mut app = test_app("data/sample.pptx")?;
+        app.tree_state
+            .select(vec!["/[Content_Types].xml".to_string()]);
+        app.start_extract();
+        assert_eq!(app.export_query, "[Content_Types].xml");
+
+        let destination = std::env::temp_dir().join(format!(
+            "oox-test-extract-{}-{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        app.export_query = destination.to_string_lossy().into_owned();
+        app.confirm_extract()?;
+        pump_until(&mut app, |app| !app.export_pending);
+
+        let Some(PendingExport::Extracted(path)) = app.take_pending_export() else {
+            panic!("expected an extracted file");
+        };
+        assert_eq!(path, destination);
+
+        let mut expected = Vec::new();
+        zip::ZipArchive::new(std::fs::File::open("data/sample.pptx")?)?
+            .by_name("[Content_Types].xml")?
+            .read_to_end(&mut expected)?;
+        assert_eq!(std::fs::read(&path)?, expected);
+
+        // Extracting again refuses to clobber the file that was just written.
+        app.select_path("/[Content_Types].xml");
+        app.export_query = path.to_string_lossy().into_owned();
+        app.confirm_extract()?;
+        pump_until(&mut app, |app| !app.export_pending);
+        assert!(app.take_pending_export().is_none());
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("Export failed"))
+        );
+
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn copy_produces_pretty_printed_text_for_xml_parts() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        app.tree_state
+            .select(vec!["/[Content_Types].xml".to_string()]);
+        app.copy_selected_content()?;
+        pump_until(&mut app, |app| !app.export_pending);
+
+        match app.take_pending_export() {
+            Some(PendingExport::Clipboard(text)) => {
+                assert!(text.contains("<Types"));
+                assert!(text.contains("\n  "), "expected indented XML, got: {text}");
+            }
+            _ => panic!("expected clipboard text"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn status_message_is_visible_without_a_selection() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        app.tree_state.select(Vec::new());
+        app.status_message = Some("Export failed: boom".to_string());
+        assert!(app.selection_status().contains("Export failed: boom"));
         Ok(())
     }
 
