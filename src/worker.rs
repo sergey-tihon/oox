@@ -60,11 +60,30 @@ pub enum ExportMode {
     Clipboard,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum ExportOutcome {
     Saved(PathBuf),
-    TempFile(PathBuf),
+    TempFile(TempPart),
     Clipboard(String),
+}
+
+/// A temporary snapshot that deletes itself on drop. Cleanup then survives
+/// every path an export result can take: a superseded request, a worker still
+/// holding the result at shutdown, a disconnected result channel, or an error
+/// on the way to the UI.
+#[derive(Debug)]
+pub struct TempPart(PathBuf);
+
+impl TempPart {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempPart {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 #[derive(Debug)]
@@ -476,7 +495,7 @@ fn write_new_file(path: &Path, bytes: &[u8], owner_only: bool) -> io::Result<()>
 
 /// Temporary files keep the part's file name so editors and pagers can pick a
 /// syntax mode from the extension.
-fn write_temp_file(archive_name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+fn write_temp_file(archive_name: &str, bytes: &[u8]) -> io::Result<TempPart> {
     let base = Path::new(archive_name)
         .file_name()
         .and_then(|name| name.to_str())
@@ -485,7 +504,7 @@ fn write_temp_file(archive_name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
     for attempt in 0..100 {
         let candidate = directory.join(format!("oox-{}-{attempt}-{base}", std::process::id()));
         match write_new_file(&candidate, bytes, true) {
-            Ok(()) => return Ok(candidate),
+            Ok(()) => return Ok(TempPart(candidate)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
@@ -649,26 +668,37 @@ mod tests {
             .submit(export_job(11, ExportMode::OpenTemp))
             .expect("export should be queued");
 
-        let ExportOutcome::TempFile(path) = wait_for_export(&worker, 11) else {
+        let ExportOutcome::TempFile(temp) = wait_for_export(&worker, 11) else {
             panic!("expected a temporary file outcome");
         };
-        let mode = std::fs::metadata(&path)
+        let mode = std::fs::metadata(temp.path())
             .expect("temporary file should exist")
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "temporary part copies must stay private");
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn temp_file_name_keeps_the_part_extension() {
-        let path = super::write_temp_file("ppt/slides/slide1.xml", b"<xml/>")
+        let temp = super::write_temp_file("ppt/slides/slide1.xml", b"<xml/>")
             .expect("temp file should be created");
         assert_eq!(
-            path.extension().and_then(|value| value.to_str()),
+            temp.path().extension().and_then(|value| value.to_str()),
             Some("xml")
         );
-        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_undelivered_temp_result_removes_its_file() {
+        let temp =
+            super::write_temp_file("slide1.xml", b"<xml/>").expect("temp file should be created");
+        let path = temp.path().to_path_buf();
+        assert!(path.exists());
+
+        // Dropping the result is what happens when a request is superseded, the
+        // result channel is disconnected, or the app quits with it still queued.
+        drop(ExportOutcome::TempFile(temp));
+        assert!(!path.exists());
     }
 }

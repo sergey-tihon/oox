@@ -14,7 +14,9 @@ use crate::package::{
 };
 use crate::preview::{Preview, PreviewKind};
 use crate::summary::{DetailLink, DetailsView};
-use crate::worker::{ExportMode, ExportOutcome, Job, ResultMessage, Worker, accepts_result};
+use crate::worker::{
+    ExportMode, ExportOutcome, Job, ResultMessage, TempPart, Worker, accepts_result,
+};
 
 /// Bounds the back/forward navigation history so long sessions cannot grow it
 /// without limit.
@@ -26,7 +28,7 @@ const MAX_EXPORT_PATH_CHARS: usize = 1024;
 /// command needs the terminal, and OSC 52 needs the backend's writer.
 pub enum PendingExport {
     Extracted(PathBuf),
-    OpenTemp(PathBuf),
+    OpenTemp(TempPart),
     Clipboard(String),
 }
 
@@ -91,15 +93,6 @@ pub struct App {
     /// One-line feedback for work that has no other visible surface (export
     /// results). Rendered in the status bar and cleared on the next selection.
     pub status_message: Option<String>,
-}
-
-/// A superseded export result is dropped before it reaches the event loop, so
-/// this is the only chance to release resources it already created. Only
-/// `OpenTemp` owns any: a discarded result would otherwise leak its file.
-fn discard_stale_export(outcome: &Result<ExportOutcome, String>) {
-    if let Ok(ExportOutcome::TempFile(path)) = outcome {
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 fn part_kind_label(kind: &PartKind) -> &'static str {
@@ -347,7 +340,7 @@ impl App {
                     outcome,
                 } => {
                     if request_id != self.export_request_id {
-                        discard_stale_export(&outcome);
+                        // A stale `TempPart` removes its file as it drops.
                         continue;
                     }
                     self.export_pending = false;
@@ -355,8 +348,8 @@ impl App {
                         Ok(ExportOutcome::Saved(path)) => {
                             self.pending_export = Some(PendingExport::Extracted(path));
                         }
-                        Ok(ExportOutcome::TempFile(path)) => {
-                            self.pending_export = Some(PendingExport::OpenTemp(path));
+                        Ok(ExportOutcome::TempFile(temp)) => {
+                            self.pending_export = Some(PendingExport::OpenTemp(temp));
                         }
                         Ok(ExportOutcome::Clipboard(text)) => {
                             self.pending_export = Some(PendingExport::Clipboard(text));
@@ -1867,23 +1860,6 @@ mod tests {
         app.tree_state.select(Vec::new());
         app.status_message = Some("Export failed: boom".to_string());
         assert!(app.selection_status().contains("Export failed: boom"));
-        Ok(())
-    }
-
-    #[test]
-    fn superseded_temp_export_is_removed() -> io::Result<()> {
-        let path = std::env::temp_dir().join(format!(
-            "oox-test-stale-{}-{}.xml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&path, b"part bytes")?;
-
-        super::discard_stale_export(&Ok(crate::worker::ExportOutcome::TempFile(path.clone())));
-        assert!(!path.exists());
         Ok(())
     }
 

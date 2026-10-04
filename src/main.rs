@@ -150,10 +150,10 @@ fn apply_export(
                 app.status_message = Some(format!("Clipboard copy failed: {error}"));
             }
         },
-        PendingExport::OpenTemp(path) => {
+        PendingExport::OpenTemp(temp) => {
+            // The snapshot deletes itself when `temp` drops at the end of this arm.
+            let path = temp.path().to_path_buf();
             let result = open_external(terminal, &path);
-            // The temp copy is a read-only snapshot; drop it on return.
-            let _ = std::fs::remove_file(&path);
             app.status_message = Some(match result {
                 Ok(()) => format!("Returned from external viewer for {}", path.display()),
                 Err(error) => format!("Could not open external viewer: {error}"),
