@@ -332,35 +332,44 @@ pub fn canonical_xml(bytes: &[u8]) -> io::Result<String> {
     let mut buffer = Vec::new();
     let mut depth = 0usize;
     let mut pending = String::new();
-    let mut preserve_space = Vec::new();
+    let mut elements = Vec::new();
+    let mut formatting_whitespace = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Eof) => break,
             Ok(Event::Start(event)) => {
-                let inherited = preserve_space.last().copied().unwrap_or(false);
-                flush_text(&mut output, &mut pending, depth, inherited);
-                preserve_space.push(xml_space_preserved(&event, inherited));
+                let inherited = elements
+                    .last()
+                    .is_some_and(|element: &ElementContext| element.preserve_space);
+                if let Some(parent) = elements.last_mut() {
+                    parent.has_child_elements = true;
+                }
+                flush_text(&mut output, &mut pending, depth, elements.last_mut());
+                elements.push(ElementContext {
+                    preserve_space: xml_space_preserved(&event, inherited),
+                    ..ElementContext::default()
+                });
                 write_tag(&mut output, depth, &event, false);
                 depth += 1;
             }
             Ok(Event::Empty(event)) => {
-                flush_text(
-                    &mut output,
-                    &mut pending,
-                    depth,
-                    preserve_space.last().copied().unwrap_or(false),
-                );
+                if let Some(parent) = elements.last_mut() {
+                    parent.has_child_elements = true;
+                }
+                flush_text(&mut output, &mut pending, depth, elements.last_mut());
                 write_tag(&mut output, depth, &event, true);
             }
             Ok(Event::End(event)) => {
-                flush_text(
-                    &mut output,
-                    &mut pending,
-                    depth,
-                    preserve_space.last().copied().unwrap_or(false),
-                );
-                preserve_space.pop();
+                flush_text(&mut output, &mut pending, depth, elements.last_mut());
+                if let Some(element) = elements.pop() {
+                    if element.has_child_elements
+                        && !element.has_non_whitespace_text
+                        && !element.preserve_space
+                    {
+                        formatting_whitespace.extend(element.whitespace_ranges);
+                    }
+                }
                 depth = depth.saturating_sub(1);
                 push_indent(&mut output, depth);
                 output.push_str("</");
@@ -368,31 +377,21 @@ pub fn canonical_xml(bytes: &[u8]) -> io::Result<String> {
                 output.push_str(">\n");
             }
             Ok(Event::Text(event)) => append_pending(&mut pending, event.as_ref())?,
-            Ok(Event::CData(event)) => append_pending(&mut pending, event.as_ref())?,
+            Ok(Event::CData(event)) => append_cdata(&mut pending, event.as_ref())?,
             Ok(Event::GeneralRef(event)) => {
                 append_pending(&mut pending, "&")?;
                 append_pending(&mut pending, event.as_ref())?;
                 append_pending(&mut pending, ";")?;
             }
             Ok(Event::Comment(event)) => {
-                flush_text(
-                    &mut output,
-                    &mut pending,
-                    depth,
-                    preserve_space.last().copied().unwrap_or(false),
-                );
+                flush_text(&mut output, &mut pending, depth, elements.last_mut());
                 push_indent(&mut output, depth);
                 output.push_str("<!--");
                 output.push_str(event.as_ref().trim());
                 output.push_str("-->\n");
             }
             Ok(Event::PI(event)) => {
-                flush_text(
-                    &mut output,
-                    &mut pending,
-                    depth,
-                    preserve_space.last().copied().unwrap_or(false),
-                );
+                flush_text(&mut output, &mut pending, depth, elements.last_mut());
                 push_indent(&mut output, depth);
                 output.push_str("<?");
                 output.push_str(event.as_ref());
@@ -410,12 +409,11 @@ pub fn canonical_xml(bytes: &[u8]) -> io::Result<String> {
             ));
         }
     }
-    flush_text(
-        &mut output,
-        &mut pending,
-        depth,
-        preserve_space.last().copied().unwrap_or(false),
-    );
+    flush_text(&mut output, &mut pending, depth, elements.last_mut());
+    formatting_whitespace.sort_unstable_by_key(|(start, _)| std::cmp::Reverse(*start));
+    for (start, end) in formatting_whitespace {
+        output.replace_range(start..end, "");
+    }
     if output.len() > MAX_XML_PREVIEW_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -434,6 +432,31 @@ fn append_pending(pending: &mut String, text: &str) -> io::Result<()> {
     }
     pending.push_str(text);
     Ok(())
+}
+
+// ponytail: schema-less heuristic treats whitespace-only text in child-bearing,
+// text-free elements as formatting; use schema content models for exact handling.
+#[derive(Default)]
+struct ElementContext {
+    preserve_space: bool,
+    has_child_elements: bool,
+    has_non_whitespace_text: bool,
+    whitespace_ranges: Vec<(usize, usize)>,
+}
+
+fn append_cdata(pending: &mut String, text: &str) -> io::Result<()> {
+    let mut start = 0;
+    for (index, character) in text.char_indices() {
+        let escaped = match character {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            _ => continue,
+        };
+        append_pending(pending, &text[start..index])?;
+        append_pending(pending, escaped)?;
+        start = index + character.len_utf8();
+    }
+    append_pending(pending, &text[start..])
 }
 
 fn xml_space_preserved(event: &BytesStart<'_>, inherited: bool) -> bool {
@@ -477,17 +500,34 @@ fn write_tag(output: &mut String, depth: usize, event: &BytesStart<'_>, empty: b
     output.push_str(if empty { "/>\n" } else { ">\n" });
 }
 
-fn flush_text(output: &mut String, pending: &mut String, depth: usize, preserve_space: bool) {
-    // ponytail: line-break-only whitespace is treated as formatting; use schema-aware rules if mixed-content XML needs exact handling.
-    let formatting_whitespace = pending.chars().all(char::is_whitespace)
-        && (pending.contains('\n') || pending.contains('\r'));
-    if pending.is_empty() || (formatting_whitespace && !preserve_space) {
+fn flush_text(
+    output: &mut String,
+    pending: &mut String,
+    depth: usize,
+    mut element: Option<&mut ElementContext>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let whitespace_only = pending.chars().all(char::is_whitespace);
+    if whitespace_only && element.is_none() {
         pending.clear();
         return;
     }
+    if !whitespace_only {
+        if let Some(element) = element.as_deref_mut() {
+            element.has_non_whitespace_text = true;
+        }
+    }
+    let start = output.len();
     push_indent(output, depth);
     output.push_str(pending);
     output.push('\n');
+    if whitespace_only {
+        if let Some(element) = element {
+            element.whitespace_ranges.push((start, output.len()));
+        }
+    }
     pending.clear();
 }
 
@@ -615,7 +655,28 @@ mod tests {
     }
 
     #[test]
+    fn canonical_xml_keeps_cdata_as_text_not_markup() {
+        let cdata = canonical_xml(b"<root><![CDATA[<x/>]]></root>").unwrap();
+        let escaped_text = canonical_xml(b"<root>&lt;x/></root>").unwrap();
+        let child_element = canonical_xml(b"<root><x/></root>").unwrap();
+        assert_eq!(cdata, escaped_text);
+        assert_ne!(cdata, child_element);
+    }
+
+    #[test]
     fn canonical_xml_preserves_significant_text_whitespace() {
+        let whitespace_leaf = canonical_xml(b"<t>\n</t>").unwrap();
+        let empty_leaf = canonical_xml(b"<t></t>").unwrap();
+        assert_ne!(whitespace_leaf, empty_leaf);
+
+        let formatted = canonical_xml(b"<root> \t<a/>\n\t<b/> \t</root>").unwrap();
+        let compact = canonical_xml(b"<root><a/><b/></root>").unwrap();
+        assert_eq!(formatted, compact);
+
+        let leading_mixed_space = canonical_xml(b"<root> <b/>text</root>").unwrap();
+        let no_leading_mixed_space = canonical_xml(b"<root><b/>text</root>").unwrap();
+        assert_ne!(leading_mixed_space, no_leading_mixed_space);
+
         let single_space = canonical_xml(b"<root><t>hello world</t></root>").unwrap();
         let repeated_space = canonical_xml(b"<root><t>hello  world</t></root>").unwrap();
         assert_ne!(single_space, repeated_space);
