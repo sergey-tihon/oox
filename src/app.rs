@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use edtui::{EditorState, Lines};
+use edtui::{EditorState, Lines, RowIndex};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use tui_tree_widget::{TreeItem, TreeState};
 
@@ -53,6 +53,10 @@ pub struct App {
     pub editor_state: EditorState,
     pub image_state: Option<StatefulProtocol>,
     pub preview_kind: PreviewKind,
+    /// The part whose content the preview currently shows. The tree selection
+    /// can move on without reloading the preview, so relationship references in
+    /// the editor must be resolved against this path, not the selection.
+    previewed_path: Option<String>,
     picker: Picker,
     pub current_widget: CurrentWidget,
     /// Message rendered in the content pane when no editor/image/summary is shown.
@@ -155,6 +159,7 @@ impl App {
             editor_state: EditorState::default(),
             image_state: None,
             preview_kind: PreviewKind::Empty,
+            previewed_path: None,
             picker,
             current_widget: CurrentWidget::Tree,
             content_message: Some("Loading package…".to_string()),
@@ -249,6 +254,7 @@ impl App {
                             self.editor_state = EditorState::default();
                             self.image_state = None;
                             self.preview_kind = PreviewKind::Empty;
+                            self.previewed_path = None;
                             self.install_tree();
                             self.document_summary = summary.view;
                             self.loading = false;
@@ -282,6 +288,7 @@ impl App {
                         Ok(Preview::Editor { kind, text }) => {
                             self.preview_kind = kind;
                             self.editor_state = EditorState::new(Lines::from(text.as_str()));
+                            self.previewed_path = Some(selected_path);
                             self.content_message = None;
                         }
                         Ok(Preview::Image(image)) => {
@@ -682,6 +689,87 @@ impl App {
         } else {
             self.summary_scroll = self.summary_scroll.saturating_add(amount as u16);
         }
+    }
+
+    /// Jump to the relationship target referenced by the token under the editor
+    /// cursor, recording the jump in the navigation history. Returns `false`
+    /// when the cursor is not on a relationship reference, so callers can fall
+    /// back to normal key handling.
+    pub fn follow_relationship_at_cursor(&mut self) -> io::Result<bool> {
+        let Some(relationship) = self.relationship_at_cursor() else {
+            return Ok(false);
+        };
+        if relationship.target_mode == TargetMode::External {
+            self.status_message = Some(format!("External target: {}", relationship.target));
+            return Ok(true);
+        }
+        let Some(target) = relationship.resolved_target.clone() else {
+            self.status_message = Some(format!("Relationship {} has no target", relationship.id));
+            return Ok(true);
+        };
+        if !self.index().parts.contains_key(&target) && !self.is_directory(&target) {
+            self.status_message = Some(format!("Relationship target is missing: {target}"));
+            return Ok(true);
+        }
+        // An applied filter could hide the destination, which would make the
+        // jump look like it did nothing.
+        self.cancel_any_search();
+        self.select_path(&target);
+        self.load_selected_file_content()?;
+        Ok(true)
+    }
+
+    /// The relationship referenced by the token under the editor cursor. Only an
+    /// XML preview can reference relationships, and only `r:*` attribute values
+    /// are treated as references.
+    fn relationship_at_cursor(&self) -> Option<Relationship> {
+        if self.preview_kind != PreviewKind::Xml {
+            return None;
+        }
+        let previewed = self.previewed_path.as_deref()?;
+        let index = self.index();
+        let relationships = index.outgoing.get(previewed)?;
+        let chars = self
+            .editor_state
+            .lines
+            .get(RowIndex::new(self.editor_state.cursor.row))?;
+        let column = self.editor_state.cursor.col;
+
+        for relationship_index in relationships {
+            let relationship = &index.relationships[*relationship_index];
+            if relationship.id.is_empty() {
+                continue;
+            }
+            let needle: Vec<char> = format!("\"{}\"", relationship.id).chars().collect();
+            let width = needle.len();
+            for value_quote in 0..chars.len().saturating_sub(width - 1) {
+                // `="value"` rules out the same text in element content.
+                if value_quote == 0 || chars[value_quote - 1] != '=' {
+                    continue;
+                }
+                if chars[value_quote..value_quote + width] != needle[..] {
+                    continue;
+                }
+                // The token spans the attribute name too, so the cursor on
+                // either side of `=` follows the reference.
+                let mut token_start = value_quote - 1;
+                while token_start > 0
+                    && matches!(
+                        chars[token_start - 1],
+                        'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | ':' | '.' | '-'
+                    )
+                {
+                    token_start -= 1;
+                }
+                if chars[token_start] != 'r' || chars.get(token_start + 1) != Some(&':') {
+                    continue;
+                }
+                if column >= token_start && column < value_quote + width {
+                    return Some(relationship.clone());
+                }
+            }
+        }
+        None
     }
 
     pub fn activate_summary_link(&mut self, line: usize, column: usize) -> io::Result<bool> {
@@ -1131,6 +1219,7 @@ impl App {
         self.image_state = None;
         self.editor_state = EditorState::default();
         self.preview_kind = PreviewKind::Empty;
+        self.previewed_path = None;
         self.summary_visible = false;
         self.summary_scroll = 0;
         self.status_message = None;
@@ -1762,6 +1851,68 @@ mod tests {
             Some("/ppt/slideLayouts/slideLayout1.xml")
         );
 
+        Ok(())
+    }
+
+    /// Place the editor cursor on the first occurrence of `needle`.
+    fn put_cursor_on(app: &mut App, needle: &str) -> bool {
+        for (row, line) in app.editor_state.lines.to_vecs().iter().enumerate() {
+            let text: String = line.iter().collect();
+            if let Some(byte_offset) = text.find(needle) {
+                let column = text[..byte_offset].chars().count();
+                app.editor_state.cursor = edtui::Index2::new(row, column);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Issue #14 acceptance: an `r:embed="rIdN"` token in slide XML opens the
+    /// referenced image part, `Alt-Left` returns to the slide, and an external
+    /// hyperlink reference is reported in the status bar instead of followed.
+    #[test]
+    fn relationship_references_jump_to_their_targets() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        let selected = |app: &App| app.tree_state.selected().last().cloned();
+        app.select_path("/ppt/slides/slide2.xml");
+        app.load_selected_file_content()?;
+        preview_loaded(&mut app);
+        assert_eq!(app.preview_kind, PreviewKind::Xml);
+
+        // Ordinary XML at the cursor is not a reference.
+        app.editor_state.cursor = edtui::Index2::new(0, 0);
+        assert!(!app.follow_relationship_at_cursor()?);
+        assert!(app.status_message.is_none());
+
+        assert!(put_cursor_on(&mut app, "\"rId2\""), "slide embeds rId2");
+        assert!(app.follow_relationship_at_cursor()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/media/image1.gif"));
+        assert!(app.image_state.is_some());
+
+        assert!(app.navigate_back()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide2.xml"));
+
+        assert!(put_cursor_on(&mut app, "r:id=\"rId3\""));
+        assert!(app.follow_relationship_at_cursor()?);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("https://chunyu.site/neovim/"))
+        );
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide2.xml"));
+
+        // The tree selection may move on without reloading the preview; tokens
+        // must still resolve against the part shown in the editor, not the
+        // selection. slide1 (the selection) has no rId2, so a selection-based
+        // lookup would fail to jump at all.
+        app.tree_state
+            .select(vec!["/ppt/slides/slide1.xml".to_string()]);
+        assert!(put_cursor_on(&mut app, "r:embed=\"rId2\""));
+        assert!(app.follow_relationship_at_cursor()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/media/image1.gif"));
         Ok(())
     }
 

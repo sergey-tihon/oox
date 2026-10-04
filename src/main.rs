@@ -363,7 +363,21 @@ fn run_app(
             if ui::content_area_contains(terminal_area, app, mouse.column, mouse.row) {
                 if app.is_package_loaded() {
                     app.current_widget = CurrentWidget::TextArea;
+                    // edtui only maps a click to the cursor when it lands in the
+                    // text area; a border/gutter/status-line click leaves the
+                    // cursor untouched and must not follow a stale reference.
+                    let follows_reference =
+                        matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                            && ui::content_text_area_contains(
+                                terminal_area,
+                                app,
+                                mouse.column,
+                                mouse.row,
+                            );
                     editor_handler.on_event(event, &mut app.editor_state);
+                    if follows_reference {
+                        app.follow_relationship_at_cursor()?;
+                    }
                 }
                 continue;
             }
@@ -498,6 +512,15 @@ fn run_app(
             if actions.contains(&Action::NavigateForward) {
                 if app.is_package_loaded() {
                     app.navigate_forward()?;
+                }
+                continue;
+            }
+            if app.current_widget == CurrentWidget::TextArea
+                && actions.contains(&Action::FollowRelationship)
+            {
+                if !app.follow_relationship_at_cursor()? {
+                    app.status_message =
+                        Some("No relationship reference under the cursor".to_string());
                 }
                 continue;
             }

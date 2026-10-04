@@ -285,6 +285,26 @@ pub fn content_area_contains(area: Rect, app: &App, x: u16, y: u16) -> bool {
     LayoutSnapshot::contains(LayoutSnapshot::new(area, app.details_visible).content, x, y)
 }
 
+/// Whether the point is inside the editor's text area: the content pane minus
+/// its border, its status line (always the last row), and the line-number
+/// gutter. edtui only maps mouse clicks to cursor positions inside this area,
+/// so cursor-based actions (following a relationship reference) must ignore
+/// clicks outside it; otherwise a border click reuses the stale cursor.
+pub fn content_text_area_contains(area: Rect, app: &App, x: u16, y: u16) -> bool {
+    let mut text = LayoutSnapshot::new(area, app.details_visible).content_inner;
+    text.height = text.height.saturating_sub(1);
+    // Keep the gutter in sync with the editor render below and edtui's
+    // `line_number_width` (digits + 1); hex previews hide line numbers.
+    let gutter = if app.preview_kind == PreviewKind::Hex {
+        0
+    } else {
+        app.editor_state.lines.len().max(1).to_string().len() as u16 + 1
+    };
+    text.x = text.x.saturating_add(gutter);
+    text.width = text.width.saturating_sub(gutter);
+    LayoutSnapshot::contains(text, x, y)
+}
+
 pub fn summary_line_at(area: Rect, app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
     if !app.summary_visible {
         return None;
