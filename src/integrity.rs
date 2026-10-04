@@ -109,6 +109,9 @@ fn check_relationships(index: &PackageIndex, issues: &mut Vec<Diagnostic>) {
 }
 
 fn check_content_types(index: &PackageIndex, issues: &mut Vec<Diagnostic>) {
+    // `.rels` parts are exempt from the reachability rule, not from this one: a
+    // manifest without a `rels` default leaves them untyped, which is exactly
+    // the corruption worth reporting.
     for part in index.parts.values() {
         if part.kind == PartKind::Directory || is_reserved_part(&part.path) {
             continue;
@@ -337,6 +340,25 @@ mod tests {
             ("[trash]/0000.dat", "x"),
         ]);
         assert!(index.integrity.is_empty(), "{:?}", messages(&index));
+    }
+
+    #[test]
+    fn relationship_parts_are_still_required_to_have_a_content_type() {
+        // `.rels` parts are exempt from reachability, not from the content-type
+        // rule: a manifest without a `rels` default leaves them untyped.
+        let content_types = CONTENT_TYPES.replace(
+            "  <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n",
+            "",
+        );
+        let index = package(&[
+            ("[Content_Types].xml", &content_types),
+            ("_rels/.rels", ROOT_RELS),
+            ("ppt/presentation.xml", "<p/>"),
+        ]);
+        assert_eq!(
+            part_of(&index, "no content type").as_deref(),
+            Some("/_rels/.rels")
+        );
     }
 
     #[test]

@@ -909,19 +909,28 @@ impl App {
             });
             return false;
         }
-        self.status_message = None;
 
-        let current = self.tree_state.selected().last().cloned();
-        let position = current
-            .as_ref()
-            .and_then(|selected| paths.iter().position(|path| path == selected));
-        let next = match (position, reverse) {
-            (Some(0), true) | (None, true) => paths.len() - 1,
-            (Some(index), true) => index - 1,
-            (Some(index), false) => (index + 1) % paths.len(),
-            (None, false) => 0,
+        // Jump relative to the current position rather than to the ends of the
+        // issue list, so a part sitting between two issues moves to the nearer
+        // one in either direction.
+        let current = self
+            .tree_state
+            .selected()
+            .last()
+            .cloned()
+            .unwrap_or_default();
+        let index = if reverse {
+            let after = paths.partition_point(|path| path.as_str() < current.as_str());
+            (after + paths.len() - 1) % paths.len()
+        } else {
+            paths.partition_point(|path| path.as_str() <= current.as_str()) % paths.len()
         };
-        self.select_path(&paths[next].clone());
+
+        // An applied search filter could hide the destination, and a jump that
+        // selects an invisible item is useless.
+        self.cancel_any_search();
+        self.status_message = None;
+        self.select_path(&paths[index].clone());
         true
     }
 
@@ -1814,9 +1823,12 @@ mod tests {
                 "ppt/_rels/presentation.xml.rels",
                 r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../p.xml"/>
 </Relationships>"#,
             ),
             ("ppt/notes.txt", "notes"),
+            ("ppt/p.xml", "<p/>"),
+            ("ppt/aaa.txt", "aaa"),
         ];
         for (entry, content) in entries {
             writer
@@ -1853,7 +1865,7 @@ mod tests {
         assert_eq!(app.status_message, None);
         assert_eq!(
             app.tree_state.selected().last().map(String::as_str),
-            Some("/ppt/notes.txt")
+            Some("/ppt/aaa.txt")
         );
 
         // The issue list in the metadata panel links to the offending part.
@@ -1886,6 +1898,57 @@ mod tests {
         assert_eq!(
             super::tree_label("presentation.xml", "/ppt/other.xml", &issue_parts),
             "presentation.xml"
+        );
+
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// Issue navigation must be directional from any tree position, not just
+    /// from one of the list ends, and must not leave the destination hidden
+    /// behind an applied search filter.
+    #[test]
+    fn issue_jumps_are_directional_and_clear_the_search_filter() -> io::Result<()> {
+        let path = write_test_package("integrity-direction.pptx")?;
+        let mut app = test_app(&path.to_string_lossy())?;
+        fn selected(app: &App) -> String {
+            app.tree_state
+                .selected()
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        // `/ppt/p.xml` has no issue and sorts between two that do.
+        assert!(app.index().parts.contains_key("/ppt/p.xml"));
+        app.select_path("/ppt/p.xml");
+        assert!(app.next_integrity_issue(false));
+        assert_eq!(selected(&app), "/ppt/presentation.xml");
+
+        app.select_path("/ppt/p.xml");
+        assert!(app.next_integrity_issue(true));
+        assert_eq!(selected(&app), "/ppt/notes.txt");
+
+        // Wrap around at the ends.
+        app.select_path("/ppt/presentation.xml");
+        assert!(app.next_integrity_issue(false));
+        assert_eq!(selected(&app), "/ppt/aaa.txt");
+        app.select_path("/ppt/aaa.txt");
+        assert!(app.next_integrity_issue(true));
+        assert_eq!(selected(&app), "/ppt/presentation.xml");
+
+        // A filter that hides the next issue is dropped so the jump is visible.
+        app.start_search();
+        for character in "aaa.txt".chars() {
+            app.search_input_char(character);
+        }
+        app.finish_search();
+        assert!(app.tree_filter_active());
+        assert!(app.next_integrity_issue(false));
+        assert!(!app.tree_filter_active());
+        assert_eq!(selected(&app), "/ppt/notes.txt");
+        assert!(
+            flatten_identifiers(app.visible_tree_items()).contains(&"/ppt/notes.txt".to_string())
         );
 
         std::fs::remove_file(&path)?;
