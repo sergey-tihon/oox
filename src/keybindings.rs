@@ -1,6 +1,9 @@
 use std::{fs, io, path::Path};
 
-use crossterm_keybind::{DisplayFormat, KeyBind, KeyBindTrait};
+use crossterm_keybind::{
+    DisplayFormat, KeyBind, KeyBindTrait,
+    event::{KeyCode, KeyEvent, KeyModifiers},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, KeyBind)]
 pub enum Action {
@@ -299,6 +302,60 @@ pub fn key_hint(action: Action) -> String {
     action.key_bindings_display_with_format(&DisplayFormat::Abbreviation)
 }
 
+/// Whether edtui's Emacs keymap acts on `key` while the content pane has focus.
+///
+/// Emacs mode is modeless, so the editor owns typing (every plain or shifted
+/// character, and Tab) plus the chords below; an app action bound to one of
+/// them would steal it from the editor. Everything else, including a
+/// user-configured chord such as `Alt+S`, is free for the app. edtui exposes no
+/// way to query its keymap, so this mirrors `emacs_keybindings` in edtui
+/// 0.11.7 and must be revisited when edtui is upgraded.
+pub fn emacs_editor_owns(key: &KeyEvent) -> bool {
+    let modifiers = key.modifiers;
+    match key.code {
+        KeyCode::Char(_) if modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT => {
+            true
+        }
+        KeyCode::Char(character) if modifiers == KeyModifiers::CONTROL => matches!(
+            character.to_ascii_lowercase(),
+            'a' | 'b'
+                | 'd'
+                | 'e'
+                | 'f'
+                | 'g'
+                | 'h'
+                | 'j'
+                | 'k'
+                | 'n'
+                | 'o'
+                | 'p'
+                | 'r'
+                | 's'
+                | 'u'
+                | 'v'
+                | 'y'
+        ),
+        KeyCode::Char(character) if modifiers == KeyModifiers::ALT => {
+            matches!(character, '<' | '>' | 'b' | 'd' | 'e' | 'f' | 'u' | 'v')
+        }
+        KeyCode::Left | KeyCode::Right if modifiers == KeyModifiers::CONTROL => true,
+        KeyCode::Backspace if modifiers == KeyModifiers::ALT => true,
+        KeyCode::Tab
+        | KeyCode::Enter
+        | KeyCode::Backspace
+        | KeyCode::Delete
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown => modifiers == KeyModifiers::NONE,
+        _ => false,
+    }
+}
+
 pub fn generate(path: &Path) -> io::Result<()> {
     if path.exists() {
         return Err(io::Error::new(
@@ -322,7 +379,7 @@ pub fn generate(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Action;
+    use super::{Action, emacs_editor_owns};
     use crossterm_keybind::{
         KeyBindTrait,
         event::{KeyCode, KeyEvent, KeyModifiers},
@@ -387,5 +444,48 @@ mod tests {
                 "{event:?} must revert"
             );
         }
+    }
+
+    /// In the Emacs content pane the editor keeps typing and its own chords,
+    /// while any other binding stays usable for app actions such as saving.
+    #[test]
+    fn emacs_pane_leaves_only_editor_chords_to_the_editor() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        // Owned by the editor: Ctrl+S is its search, and typing is typing.
+        assert!(emacs_editor_owns(&key(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(emacs_editor_owns(&key(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        )));
+        assert!(emacs_editor_owns(&key(
+            KeyCode::Char('S'),
+            KeyModifiers::SHIFT
+        )));
+        assert!(emacs_editor_owns(&key(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(emacs_editor_owns(&key(
+            KeyCode::Left,
+            KeyModifiers::CONTROL
+        )));
+        assert!(emacs_editor_owns(&key(
+            KeyCode::Backspace,
+            KeyModifiers::ALT
+        )));
+        // Free for the app: the default F2 and chords edtui does not bind.
+        assert!(!emacs_editor_owns(&key(KeyCode::F(2), KeyModifiers::NONE)));
+        assert!(!emacs_editor_owns(&key(
+            KeyCode::Char('s'),
+            KeyModifiers::ALT
+        )));
+        assert!(!emacs_editor_owns(&key(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )));
+        assert!(!emacs_editor_owns(&key(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL
+        )));
     }
 }

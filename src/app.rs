@@ -66,24 +66,57 @@ enum Confirmation {
 }
 
 /// Where an editor cursor was before its buffer was replaced, so a reload does
-/// not throw the user back to the top of the file. The row/column are clamped to
-/// the new buffer when they are put back.
+/// not throw the user back to the top of the file or out of insert mode.
+#[derive(Clone, Copy, Debug)]
+struct CursorSpot {
+    cursor: edtui::Index2,
+    viewport: (usize, usize),
+    mode: edtui::EditorMode,
+}
+
+impl CursorSpot {
+    fn of(state: &EditorState) -> Self {
+        Self {
+            cursor: state.cursor,
+            viewport: state.viewport_offset(),
+            mode: state.mode,
+        }
+    }
+}
+
+/// The part to select once a saved package is re-indexed, and where its cursor was.
 #[derive(Clone, Debug)]
 struct Reselect {
     path: String,
-    cursor: edtui::Index2,
-    viewport: (usize, usize),
+    spot: CursorSpot,
 }
 
-/// Put a cursor and viewport back after the buffer was replaced, clamped to what
-/// the new buffer actually contains.
-fn place_cursor(state: &mut EditorState, cursor: edtui::Index2, viewport: (usize, usize)) {
-    let row = cursor.row.min(state.lines.len().saturating_sub(1));
-    let col = cursor
-        .col
-        .min(state.lines.len_col(row).unwrap_or(0).saturating_sub(1));
-    state.cursor = edtui::Index2::new(row, col);
-    state.set_viewport_offset(viewport.0, viewport.1);
+/// Put a cursor, viewport and mode back after the buffer was replaced, clamped
+/// to the new buffer with edtui's bounds for that mode: insert mode may sit one
+/// past the last column (and on the row after the last line), normal mode may
+/// not. Visual and search mode fall back to normal, because their selection and
+/// query are not carried over and restoring the bare mode would be inconsistent.
+fn place_cursor(state: &mut EditorState, spot: CursorSpot) {
+    let insert = spot.mode == edtui::EditorMode::Insert;
+    let last_row = if insert {
+        state.lines.len()
+    } else {
+        state.lines.len().saturating_sub(1)
+    };
+    let row = spot.cursor.row.min(last_row);
+    let columns = state.lines.len_col(row).unwrap_or(0);
+    let last_col = if insert {
+        columns
+    } else {
+        columns.saturating_sub(1)
+    };
+    state.mode = if insert {
+        edtui::EditorMode::Insert
+    } else {
+        edtui::EditorMode::Normal
+    };
+    state.cursor = edtui::Index2::new(row, spot.cursor.col.min(last_col));
+    state.set_viewport_offset(spot.viewport.0, spot.viewport.1);
 }
 
 /// A part written to disk for the external editor, together with the text that
@@ -777,11 +810,7 @@ impl App {
                             self.editor_state = EditorState::new(lines.clone());
                             if let Some(reselect) = restore {
                                 if reselect.path == selected_path {
-                                    place_cursor(
-                                        &mut self.editor_state,
-                                        reselect.cursor,
-                                        reselect.viewport,
-                                    );
+                                    place_cursor(&mut self.editor_state, reselect.spot);
                                 }
                             }
                             self.editor_baseline = Some(lines);
@@ -2395,8 +2424,7 @@ impl App {
         // the user on the line they were editing.
         let reselect = self.previewed_path.take().map(|part| Reselect {
             path: part,
-            cursor: self.editor_state.cursor,
-            viewport: self.editor_state.viewport_offset(),
+            spot: CursorSpot::of(&self.editor_state),
         });
         // Saving is refused in compare mode, so the comparison is not in play.
         self.file_path = path.to_string_lossy().to_string();
@@ -2510,10 +2538,9 @@ impl App {
         match pick_up_external(written, bytes) {
             Ok(None) => self.status_message = Some("No changes from the external editor".into()),
             Ok(Some(text)) => {
-                let cursor = self.editor_state.cursor;
-                let viewport = self.editor_state.viewport_offset();
+                let spot = CursorSpot::of(&self.editor_state);
                 self.editor_state = EditorState::new(Lines::from(text.as_str()));
-                place_cursor(&mut self.editor_state, cursor, viewport);
+                place_cursor(&mut self.editor_state, spot);
                 self.refresh_editor_dirty();
                 self.status_message = Some(format!(
                     "{} edited externally — save to keep it",
@@ -2558,10 +2585,9 @@ impl App {
         self.pending_confirmation = None;
         if on_screen {
             if let Some(baseline) = self.editor_baseline.as_ref() {
-                let cursor = self.editor_state.cursor;
-                let viewport = self.editor_state.viewport_offset();
+                let spot = CursorSpot::of(&self.editor_state);
                 self.editor_state = EditorState::new(baseline.clone());
-                place_cursor(&mut self.editor_state, cursor, viewport);
+                place_cursor(&mut self.editor_state, spot);
             }
             self.editor_dirty = false;
         } else {
@@ -2937,7 +2963,7 @@ fn create_tree_level(
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingExport, lines_to_text, pick_up_external};
+    use super::{CursorSpot, PendingExport, lines_to_text, pick_up_external, place_cursor};
     use crate::compare::PartStatus;
     use crate::preview::PreviewKind;
     use crate::{App, worker::Worker};
@@ -4502,6 +4528,98 @@ mod tests {
 
         std::fs::remove_file(&target)?;
         Ok(())
+    }
+
+    /// Insert mode may sit one past the last character; a save from there must
+    /// leave the cursor at the end of the line and the editor still in insert
+    /// mode, rather than pulling it back one column into normal mode.
+    #[test]
+    fn an_insert_mode_cursor_at_end_of_line_survives_a_save() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        let loaded = edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+        app.editor_state.lines = edtui::Lines::from(format!("{loaded}<!-- x -->"));
+        app.refresh_editor_dirty();
+        let end_of_row = app.editor_state.lines.len_col(3).expect("row 3 exists");
+        app.editor_state.mode = edtui::EditorMode::Insert;
+        app.editor_state.cursor = edtui::Index2::new(3, end_of_row);
+
+        let target = temp_save_path("insert-cursor.pptx");
+        let _ = std::fs::remove_file(&target);
+        app.submit_save(target.clone(), true)?;
+        pump_until(&mut app, |app| {
+            !app.save_pending && !app.loading && !app.preview_pending
+        });
+        assert_eq!(app.editor_state.mode, edtui::EditorMode::Insert);
+        assert_eq!(app.editor_state.cursor, edtui::Index2::new(3, end_of_row));
+
+        std::fs::remove_file(&target)?;
+        Ok(())
+    }
+
+    /// The external-editor path replaces the buffer in place, so it must keep
+    /// the same insert-mode end-of-line position as a package reload does.
+    #[test]
+    fn an_insert_mode_cursor_survives_an_external_edit() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>typed</a>")?;
+        let written = lines_to_text(&app.editor_state.lines);
+        let end_of_line = app.editor_state.lines.len_col(0).expect("one line");
+        app.editor_state.mode = edtui::EditorMode::Insert;
+        app.editor_state.cursor = edtui::Index2::new(0, end_of_line);
+
+        app.apply_external_edit(&written, b"<a>external edit</a>", true);
+
+        assert_eq!(app.editor_state.mode, edtui::EditorMode::Insert);
+        assert_eq!(app.editor_state.cursor, edtui::Index2::new(0, end_of_line));
+        assert_eq!(
+            lines_to_text(&app.editor_state.lines),
+            "<a>external edit</a>"
+        );
+        Ok(())
+    }
+
+    /// The bounds a restored cursor is clamped to depend on the mode it is
+    /// restored into.
+    #[test]
+    fn restored_cursor_uses_the_bounds_of_its_mode() {
+        let spot = |row, col, mode| CursorSpot {
+            cursor: edtui::Index2::new(row, col),
+            viewport: (0, 0),
+            mode,
+        };
+        let fresh = || edtui::EditorState::new(edtui::Lines::from("abc\nde"));
+
+        // Insert mode keeps the position after the last character.
+        let mut state = fresh();
+        place_cursor(&mut state, spot(0, 3, edtui::EditorMode::Insert));
+        assert_eq!(state.mode, edtui::EditorMode::Insert);
+        assert_eq!(state.cursor, edtui::Index2::new(0, 3));
+
+        // Normal mode must sit on a character.
+        let mut state = fresh();
+        place_cursor(&mut state, spot(0, 3, edtui::EditorMode::Normal));
+        assert_eq!(state.mode, edtui::EditorMode::Normal);
+        assert_eq!(state.cursor, edtui::Index2::new(0, 2));
+
+        // A position beyond a shorter buffer is clamped per mode.
+        let mut state = fresh();
+        place_cursor(&mut state, spot(9, 9, edtui::EditorMode::Normal));
+        assert_eq!(state.cursor, edtui::Index2::new(1, 1));
+        let mut state = fresh();
+        place_cursor(&mut state, spot(1, 9, edtui::EditorMode::Insert));
+        assert_eq!(state.cursor, edtui::Index2::new(1, 2));
+
+        // Insert mode also permits the virtual row after the final line.
+        let mut state = fresh();
+        place_cursor(&mut state, spot(2, 0, edtui::EditorMode::Insert));
+        assert_eq!(state.mode, edtui::EditorMode::Insert);
+        assert_eq!(state.cursor, edtui::Index2::new(2, 0));
+
+        // Visual mode has no selection to come back to, so it lands in normal.
+        let mut state = fresh();
+        place_cursor(&mut state, spot(0, 1, edtui::EditorMode::Visual));
+        assert_eq!(state.mode, edtui::EditorMode::Normal);
+        assert_eq!(state.cursor, edtui::Index2::new(0, 1));
     }
 
     /// Copying a part with unsaved edits copies what is on screen, not the bytes

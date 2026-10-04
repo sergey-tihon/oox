@@ -604,13 +604,15 @@ fn run_app(
                 continue;
             }
 
-            // Ctrl+S reaches edtui's search in Emacs mode, so F2 is the only
-            // save key there; Vim mode has no such binding.
+            // In Emacs mode the editor owns typing and its own chords (Ctrl+S is
+            // search there), so only those are left to it; any other configured
+            // save binding, such as F2 or a custom Alt+S, still saves. Vim mode
+            // has no conflicting save chord.
             let can_save = match app.current_widget {
                 CurrentWidget::Tree | CurrentWidget::Details => true,
                 CurrentWidget::TextArea => match editor_mode {
                     keybindings::EditorMode::Vim => true,
-                    keybindings::EditorMode::Emacs => matches!(key.code, KeyCode::F(_)),
+                    keybindings::EditorMode::Emacs => !keybindings::emacs_editor_owns(key),
                 },
             };
             if actions.contains(&Action::SavePackage) && can_save && app.is_package_loaded() {
