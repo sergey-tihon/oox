@@ -9,7 +9,10 @@ use std::{
 };
 
 use image::{DynamicImage, ImageReader, Limits};
-use quick_xml::{Reader, Writer, events::Event};
+use quick_xml::{
+    Reader, Writer,
+    events::{BytesText, Event},
+};
 
 use crate::package::{image_format, is_image_name, is_xml_content_type, is_xml_name};
 
@@ -29,7 +32,13 @@ pub enum PreviewKind {
 
 #[derive(Debug)]
 pub enum Preview {
-    Editor { kind: PreviewKind, text: String },
+    Editor {
+        kind: PreviewKind,
+        text: String,
+        /// Whether the pane's text can be edited and written back to the
+        /// package. Only text that was valid UTF-8 on the way in qualifies.
+        editable: bool,
+    },
     Image(DynamicImage),
     Info(String),
     Error(String),
@@ -106,11 +115,18 @@ pub(crate) fn build_preview(
     }
 
     if is_xml_name(path) || content_type.is_some_and(is_xml_content_type) {
-        let text = String::from_utf8_lossy(bytes);
-        return match pretty_print_xml(&text) {
+        // Lossy decoding keeps a non-UTF-8 part previewable, but its text no
+        // longer round-trips, so such a part is read-only.
+        let lossy = String::from_utf8_lossy(bytes);
+        let (text, editable) = match std::str::from_utf8(bytes) {
+            Ok(text) => (text.strip_prefix('\u{feff}').unwrap_or(text), true),
+            Err(_) => (lossy.as_ref(), false),
+        };
+        return match pretty_print_xml(text) {
             Ok(formatted) => Preview::Editor {
                 kind: PreviewKind::Xml,
                 text: formatted,
+                editable,
             },
             Err(error) => Preview::Error(format!("XML preview failed: {error}")),
         };
@@ -130,6 +146,7 @@ pub(crate) fn build_preview(
         return Preview::Editor {
             kind: PreviewKind::Json,
             text: formatted,
+            editable: true,
         };
     }
 
@@ -167,6 +184,7 @@ pub(crate) fn build_preview(
         return Preview::Editor {
             kind: PreviewKind::Hex,
             text: format_hex_preview(bytes),
+            editable: false,
         };
     }
 
@@ -174,6 +192,7 @@ pub(crate) fn build_preview(
         return Preview::Editor {
             kind: PreviewKind::PlainText,
             text,
+            editable: true,
         };
     }
 
@@ -186,6 +205,12 @@ pub(crate) fn build_preview(
     ))
 }
 
+/// Format XML for display and for editing.
+///
+/// The formatter may only add whitespace between two tags. Everything else is
+/// written back exactly as it appeared, because the result is what gets saved
+/// into the package: an entity reference moved onto its own line, or a line
+/// break inserted into `<w:t></w:t>`, silently changes element text.
 pub fn pretty_print_xml(xml: &str) -> io::Result<String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
@@ -197,17 +222,78 @@ pub fn pretty_print_xml(xml: &str) -> io::Result<String> {
     );
     let mut writer = Writer::new_with_indent(&mut output, b' ', 2);
     let mut buffer = Vec::new();
+    // Whether the last event was a start tag whose end tag has not been written
+    // yet. The indenting writer would put a line break between `<a>` and `</a>`.
+    let mut open_tag = false;
 
     loop {
-        match reader.read_event_into(&mut buffer) {
+        let event = match reader.read_event_into(&mut buffer) {
             Ok(Event::Eof) => break,
-            Ok(event) => writer.write_event(event).map_err(io::Error::other)?,
+            Ok(event) => event,
             Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        };
+        match event {
+            // An entity reference is text. The writer treats it as markup and
+            // would break the line before it when it starts an element.
+            Event::GeneralRef(reference) => {
+                write_xml_text(&mut writer, &format!("&{};", reference.into_inner()))?;
+                open_tag = false;
+            }
+            Event::End(end) => {
+                if open_tag {
+                    // An empty text event writes nothing but tells the writer not
+                    // to break the line before this end tag.
+                    write_xml_text(&mut writer, "")?;
+                }
+                writer
+                    .write_event(Event::End(end))
+                    .map_err(io::Error::other)?;
+                open_tag = false;
+            }
+            event => {
+                open_tag = matches!(event, Event::Start(_));
+                writer.write_event(event).map_err(io::Error::other)?;
+            }
         }
         buffer.clear();
     }
 
     output.into_string()
+}
+
+/// Write already-escaped text as an element text event.
+fn write_xml_text(writer: &mut Writer<&mut LimitedWriter>, text: &str) -> io::Result<()> {
+    writer
+        .write_event(Event::Text(BytesText::from_escaped(text)))
+        .map_err(io::Error::other)
+}
+
+/// Best-effort well-formedness check for an edited part. Returns the first
+/// problem found; a save is never blocked by it.
+pub fn xml_well_formed(xml: &str) -> Result<(), String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut depth: i64 = 0;
+    let mut buffer = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(_)) => depth += 1,
+            Ok(Event::End(_)) => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err("end tag without a matching start tag".to_string());
+                }
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        buffer.clear();
+    }
+    if depth > 0 {
+        return Err(format!("{depth} element(s) left open"));
+    }
+    Ok(())
 }
 
 fn pretty_print_json(value: &serde_json::Value) -> io::Result<String> {
@@ -355,6 +441,52 @@ mod tests {
         assert!(pretty_print_xml("<root><item></root>").is_err());
     }
 
+    /// A part is saved in exactly the form this formatter produces, so text that
+    /// used to move onto its own line would really change the document.
+    #[test]
+    fn formatting_keeps_entity_references_and_empty_tags_inline() {
+        let formatted =
+            pretty_print_xml(r#"<a><t>&amp;</t><t></t><t>A &amp; B</t><u><v>&#65;</v></u></a>"#)
+                .unwrap();
+        assert!(formatted.contains("<t>&amp;</t>"), "{formatted}");
+        assert!(formatted.contains("<t></t>"), "{formatted}");
+        assert!(formatted.contains("<t>A &amp; B</t>"), "{formatted}");
+        assert!(formatted.contains("<v>&#65;</v>"), "{formatted}");
+    }
+
+    #[test]
+    fn formatting_is_idempotent() {
+        let source = r#"<?xml version="1.0" encoding="UTF-8"?><p:sld xmlns:p="p"><p:sp><a:p><a:r><a:t>Hi</a:t></a:r></a:p></p:sp></p:sld>"#;
+        let once = pretty_print_xml(source).unwrap();
+        assert_eq!(once, pretty_print_xml(&once).unwrap());
+    }
+
+    #[test]
+    fn well_formedness_check_reports_structural_problems() {
+        assert!(xml_well_formed("<a><b/></a>").is_ok());
+        assert!(xml_well_formed("<a><b></a>").is_err());
+        assert!(xml_well_formed("<a>").is_err());
+        assert!(xml_well_formed("</a>").is_err());
+    }
+
+    #[test]
+    fn non_utf8_xml_is_read_only() {
+        let preview = build_preview("ppt/slides/slide1.xml", None, 8, 6, b"<a>\xff</a>");
+        assert!(matches!(
+            preview,
+            Preview::Editor {
+                editable: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn xml_preview_is_editable() {
+        let preview = build_preview("ppt/slides/slide1.xml", None, 13, 6, b"<a><t>hi</t></a>");
+        assert!(matches!(preview, Preview::Editor { editable: true, .. }));
+    }
+
     #[test]
     fn xml_preview_rejects_indentation_amplification() {
         let depth = MAX_XML_PREVIEW_BYTES / 1024;
@@ -381,7 +513,7 @@ mod tests {
             br#"{"answer":42}"#,
         );
         match json {
-            Preview::Editor { kind, text } => {
+            Preview::Editor { kind, text, .. } => {
                 assert_eq!(kind, PreviewKind::Json);
                 assert!(text.contains("  \"answer\": 42"));
             }
@@ -398,11 +530,30 @@ mod tests {
         ));
     }
 
+    /// The preview is the editable text, so reformatting must not reorder keys or
+    /// rewrite number literals: an edit would otherwise commit those changes.
+    #[test]
+    fn json_preview_keeps_key_order_and_literals() {
+        let json = build_preview("x.json", None, 0, 0, br#"{"b":1,"a":1.10}"#);
+        match json {
+            Preview::Editor { text, .. } => {
+                let b = text.find("\"b\"").expect("key b must survive");
+                let a = text.find("\"a\"").expect("key a must survive");
+                assert!(b < a, "key order must be preserved: {text}");
+                assert!(
+                    text.contains("1.10"),
+                    "number literals must be kept: {text}"
+                );
+            }
+            other => panic!("expected JSON editor preview, got {other:?}"),
+        }
+    }
+
     #[test]
     fn preview_factory_formats_hex_and_binary_information() {
         let hex = build_preview("payload.bin", None, 3, 5, &[0, 1, b'A']);
         match hex {
-            Preview::Editor { kind, text } => {
+            Preview::Editor { kind, text, .. } => {
                 assert_eq!(kind, PreviewKind::Hex);
                 assert!(text.contains("00000000"));
                 assert!(text.contains("00 01 41"));

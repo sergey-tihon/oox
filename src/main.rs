@@ -179,6 +179,54 @@ fn external_command() -> Option<String> {
     })
 }
 
+/// The editor for the round-trip edit. `$VISUAL` wins because it means "the
+/// editor for interactive use"; `$PAGER` is deliberately not a candidate.
+/// A GUI editor needs its wait flag (`code --wait`), as with git.
+fn editor_command() -> Option<String> {
+    ["VISUAL", "EDITOR"].iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+/// Hand the part's buffer to the external editor and take the text back. The
+/// package is written only by the ordinary save, so quitting the editor without
+/// saving leaves the document alone.
+fn run_external_edit(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    app: &mut App,
+) -> io::Result<()> {
+    let Some(requested) = app.take_external_edit_request() else {
+        return Ok(());
+    };
+    // The request is consumed first: a missing editor must not leave it pending,
+    // which would make the event loop retry it on every iteration.
+    let Some(editor) = editor_command() else {
+        app.status_message = Some("No $VISUAL or $EDITOR is set".to_string());
+        return Ok(());
+    };
+    // Failing to write the snapshot is recoverable; it must not end the session.
+    let pending = match app.begin_external_edit() {
+        Ok(pending) => pending,
+        Err(error) => {
+            app.status_message = Some(format!("Could not prepare the external edit: {error}"));
+            return Ok(());
+        }
+    };
+    let path = pending.temp.path().to_path_buf();
+    // The snapshot deletes itself when `pending` drops at the end of this scope.
+    let status = with_terminal_suspended(terminal, || run_external(&editor, &path))?;
+    match std::fs::read(&path) {
+        Ok(bytes) => app.apply_external_edit(&pending.written, &bytes, status.success()),
+        Err(error) => {
+            app.status_message = Some(format!("Could not read the edited part: {error}"));
+        }
+    }
+    debug_log(format!("external edit of {requested} finished"));
+    Ok(())
+}
+
 /// Run the configured command against `path`, returning its exit status.
 #[cfg(unix)]
 fn run_external(command: &str, path: &Path) -> io::Result<std::process::ExitStatus> {
@@ -318,6 +366,11 @@ fn run_app(
         if app.poll_worker() {
             redraw = true;
         }
+        // The requested part has to be on screen before the editor can take over.
+        if app.external_edit_ready() {
+            redraw = true;
+            run_external_edit(terminal, app)?;
+        }
         if let Some(export) = app.take_pending_export() {
             redraw = true;
             apply_export(terminal, app, export)?;
@@ -335,6 +388,11 @@ fn run_app(
         debug_log(format!("event={event:?}"));
 
         if let Event::Mouse(mouse) = &event {
+            // Any-motion tracking fires while the pointer merely moves; that is
+            // not the user answering a confirmation, so only real gestures disarm.
+            if !matches!(mouse.kind, MouseEventKind::Moved) {
+                app.disarm_confirmation();
+            }
             if app.show_help {
                 continue;
             }
@@ -365,7 +423,7 @@ fn run_app(
             }
 
             if ui::content_area_contains(terminal_area, app, mouse.column, mouse.row) {
-                if app.is_package_loaded() {
+                if app.is_package_loaded() && !app.is_saving() {
                     app.current_widget = CurrentWidget::TextArea;
                     // edtui only maps a click to the cursor when it lands in the
                     // text area; a border/gutter/status-line click leaves the
@@ -379,6 +437,7 @@ fn run_app(
                                 mouse.row,
                             );
                     editor_handler.on_event(event, &mut app.editor_state);
+                    app.refresh_editor_dirty();
                     if follows_reference {
                         app.follow_relationship_at_cursor()?;
                     }
@@ -425,6 +484,14 @@ fn run_app(
             }
 
             let actions = dispatched_actions.as_deref().unwrap_or(&[]);
+            // Any key other than the confirmation's own action cancels a pending
+            // "discard edits?" question, so a later keystroke cannot trip it.
+            if !actions.contains(&Action::Quit)
+                && !actions.contains(&Action::QuitEditor)
+                && !actions.contains(&Action::RevertPart)
+            {
+                app.disarm_confirmation();
+            }
             debug_log(format!(
                 "key={:?} modifiers={:?} actions={actions:?} focus={:?} editor_mode={:?} help={} search={}",
                 key.code,
@@ -504,6 +571,53 @@ fn run_app(
                         app.export_input_char(character);
                     }
                 }
+                continue;
+            }
+
+            if app.save_active {
+                if actions.contains(&Action::Cancel) {
+                    app.cancel_save();
+                } else if actions.contains(&Action::Confirm) {
+                    debug_log(format!("confirming save path={:?}", app.save_query));
+                    app.confirm_save()?;
+                } else if actions.contains(&Action::Backspace) {
+                    app.save_backspace();
+                } else if let KeyCode::Char(character) = key.code {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                        app.save_input_char(character);
+                    }
+                }
+                continue;
+            }
+
+            // Ctrl+S reaches edtui's search in Emacs mode, so F2 is the only
+            // save key there; Vim mode has no such binding.
+            let can_save = match app.current_widget {
+                CurrentWidget::Tree | CurrentWidget::Details => true,
+                CurrentWidget::TextArea => match editor_mode {
+                    keybindings::EditorMode::Vim => true,
+                    keybindings::EditorMode::Emacs => matches!(key.code, KeyCode::F(_)),
+                },
+            };
+            if actions.contains(&Action::SavePackage) && can_save && app.is_package_loaded() {
+                debug_log("opening the save prompt");
+                app.start_save();
+                continue;
+            }
+
+            // Plain `O` is not usable: uppercase keys are already taken by the
+            // tree bindings and Vim's `O` in the editor. F4 is the editor key
+            // everywhere, and Ctrl+E outside the editor.
+            let can_edit_externally = match app.current_widget {
+                CurrentWidget::Tree | CurrentWidget::Details => true,
+                CurrentWidget::TextArea => matches!(key.code, KeyCode::F(_)),
+            };
+            if actions.contains(&Action::EditPartExternally)
+                && can_edit_externally
+                && app.is_package_loaded()
+            {
+                debug_log("requesting external edit");
+                app.request_external_edit()?;
                 continue;
             }
 
@@ -591,7 +705,10 @@ fn run_app(
                 },
             };
             if can_quit {
-                return Ok(());
+                if app.request_quit() {
+                    return Ok(());
+                }
+                continue;
             }
 
             let can_switch = match app.current_widget {
@@ -608,7 +725,7 @@ fn run_app(
             }
         }
 
-        if !app.is_package_loaded() {
+        if !app.is_package_loaded() || app.is_saving() {
             continue;
         }
 
@@ -667,6 +784,8 @@ fn run_app(
                         app.open_selected_externally()?;
                     } else if actions.contains(&Action::CopyPartContent) {
                         app.copy_selected_content()?;
+                    } else if actions.contains(&Action::RevertPart) {
+                        app.request_revert();
                     } else if actions.contains(&Action::Cancel)
                         && (!app.search_query.is_empty() || app.has_content_search_query())
                     {
@@ -706,11 +825,16 @@ fn run_app(
                         app.open_selected_externally()?;
                     } else if actions.contains(&Action::CopyPartContent) {
                         app.copy_selected_content()?;
+                    } else if actions.contains(&Action::RevertPart) {
+                        app.request_revert();
                     }
                 }
             }
             CurrentWidget::TextArea => {
                 editor_handler.on_event(event, &mut app.editor_state);
+                // The buffer decides whether the part counts as edited, so the
+                // tree marker and title are refreshed here rather than per frame.
+                app.refresh_editor_dirty();
             }
         }
     }

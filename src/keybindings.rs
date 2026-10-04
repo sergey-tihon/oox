@@ -1,6 +1,6 @@
 use std::{fs, io, path::Path};
 
-use crossterm_keybind::{KeyBind, KeyBindTrait};
+use crossterm_keybind::{DisplayFormat, KeyBind, KeyBindTrait};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, KeyBind)]
 pub enum Action {
@@ -85,6 +85,15 @@ pub enum Action {
     /// Copy the pretty-printed part content to the clipboard (OSC 52).
     #[keybindings["y"]]
     CopyPartContent,
+    /// Save the edited parts back to a package file (a new file by default).
+    #[keybindings["Control+s", "F2"]]
+    SavePackage,
+    /// Hand the selected part to `$VISUAL`/`$EDITOR` and take the text back.
+    #[keybindings["Control+e", "F4"]]
+    EditPartExternally,
+    /// Discard the unsaved edits of the selected part.
+    #[keybindings["R", "Shift+R", "Shift+r"]]
+    RevertPart,
     /// Select the next search result.
     #[keybindings["n"]]
     NextMatch,
@@ -247,6 +256,22 @@ pub fn help_sections() -> Vec<(&'static str, Vec<HelpRow>)> {
             ],
         ),
         (
+            "Editing",
+            vec![
+                HelpRow::Text("The content pane is editable for XML, text and JSON parts"),
+                HelpRow::Binding(Action::SavePackage, "Save edited parts to a new package"),
+                HelpRow::Binding(
+                    Action::EditPartExternally,
+                    "Edit in $VISUAL / $EDITOR, then return",
+                ),
+                HelpRow::Binding(
+                    Action::RevertPart,
+                    "Discard unsaved edits of the part (press twice)",
+                ),
+                HelpRow::Text("●             Part with unsaved edits"),
+            ],
+        ),
+        (
             "Export",
             vec![
                 HelpRow::Binding(Action::ExtractPart, "Extract part to a file"),
@@ -265,6 +290,13 @@ pub fn help_sections() -> Vec<(&'static str, Vec<HelpRow>)> {
             ],
         ),
     ]
+}
+
+/// The configured key(s) for an action, for messages that tell the user which
+/// key to press. Empty when bindings have not been initialized, so it is safe to
+/// call from tests and from any code path that runs before startup.
+pub fn key_hint(action: Action) -> String {
+    action.key_bindings_display_with_format(&DisplayFormat::Abbreviation)
 }
 
 pub fn generate(path: &Path) -> io::Result<()> {
@@ -296,9 +328,18 @@ mod tests {
         event::{KeyCode, KeyEvent, KeyModifiers},
     };
 
+    /// The bindings are a process-wide table that is filled exactly once, as at
+    /// startup; a second `init_and_load` would drop the default aliases.
+    fn init_bindings() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            Action::init_and_load(None::<crossterm_keybind::toml::Value>).unwrap();
+        });
+    }
+
     #[test]
     fn shift_modified_uppercase_key_is_supported() {
-        Action::init_and_load(None::<crossterm_keybind::toml::Value>).unwrap();
+        init_bindings();
         let event = KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT);
         let actions = Action::dispatch(&event);
         assert!(actions.contains(&Action::ExpandAll));
@@ -312,5 +353,39 @@ mod tests {
 
         let extract = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
         assert!(Action::dispatch(&extract).contains(&Action::ExtractPart));
+    }
+
+    /// Ctrl+S reaches the editor in Vim mode, and F2/F4 are the fallbacks that
+    /// edtui never consumes.
+    #[test]
+    fn save_and_external_edit_keys_are_dispatched() {
+        init_bindings();
+        let save = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(Action::dispatch(&save).contains(&Action::SavePackage));
+        let f2 = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+        assert!(Action::dispatch(&f2).contains(&Action::SavePackage));
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert!(Action::dispatch(&ctrl_e).contains(&Action::EditPartExternally));
+        let f4 = KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE);
+        assert!(Action::dispatch(&f4).contains(&Action::EditPartExternally));
+        // The tree keeps `e` and `s` for its own actions.
+        let e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(Action::dispatch(&e).contains(&Action::ToggleSelected));
+    }
+
+    /// `R` is the revert key in both its raw and shift-modified spellings.
+    #[test]
+    fn revert_key_is_dispatched() {
+        init_bindings();
+        for event in [
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::SHIFT),
+        ] {
+            assert!(
+                Action::dispatch(&event).contains(&Action::RevertPart),
+                "{event:?} must revert"
+            );
+        }
     }
 }

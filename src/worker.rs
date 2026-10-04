@@ -1,6 +1,6 @@
 //! Bounded background package work. UI state is never shared with this worker.
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs::{File, OpenOptions},
     io::{self, Write as _},
     path::{Path, PathBuf},
@@ -15,7 +15,7 @@ use std::{
 
 use crate::{
     compare::{self, Comparison},
-    package::{Diagnostic, MAX_ENTRY_BYTES, Package, PackageIndex, PartInfo, PartKind},
+    package::{self, Diagnostic, MAX_ENTRY_BYTES, Package, PackageIndex, PartInfo, PartKind},
     preview::{Preview, PreviewKind, build_preview},
     summary::{DetailsView, build_document_summary},
 };
@@ -62,6 +62,15 @@ pub enum Job {
         part: Box<PartInfo>,
         index: Arc<PackageIndex>,
         mode: ExportMode,
+    },
+    /// Write a new package with the listed parts replaced, then re-index it for
+    /// the UI. `edits` maps package paths to their new contents.
+    SavePackage {
+        request_id: u64,
+        package_path: PathBuf,
+        target: PathBuf,
+        index: Arc<PackageIndex>,
+        edits: Vec<(String, Vec<u8>)>,
     },
 }
 
@@ -144,6 +153,13 @@ pub enum ResultMessage {
     Exported {
         request_id: u64,
         outcome: Result<ExportOutcome, String>,
+    },
+    Saved {
+        request_id: u64,
+        path: PathBuf,
+        /// The write outcome. Well-formedness warnings are shown before the
+        /// write, so a success carries no payload.
+        result: Result<(), String>,
     },
 }
 
@@ -241,7 +257,7 @@ impl Job {
     /// moved past, so a newer request makes it obsolete. Exports have side
     /// effects (files, clipboard) and must run exactly once.
     fn is_replaceable(&self) -> bool {
-        !matches!(self, Job::ExportPart { .. })
+        !matches!(self, Job::ExportPart { .. } | Job::SavePackage { .. })
     }
 }
 
@@ -390,6 +406,27 @@ impl Worker {
                             ResultMessage::Exported {
                                 request_id,
                                 outcome,
+                            }
+                        }
+                        Job::SavePackage {
+                            request_id,
+                            package_path,
+                            target,
+                            index,
+                            edits,
+                        } => {
+                            let result = save_package(
+                                &mut archive_cache,
+                                &package_path,
+                                &target,
+                                &index,
+                                edits,
+                            )
+                            .map_err(|error| error.to_string());
+                            ResultMessage::Saved {
+                                request_id,
+                                path: target.clone(),
+                                result,
                             }
                         }
                     };
@@ -554,6 +591,7 @@ fn diff_part(
         return Ok(Preview::Editor {
             kind: PreviewKind::Diff,
             text: format!("No differences in {part_path}\n"),
+            editable: false,
         });
     }
     let (archive_a, archive_b) = cached_archives(cache, package_a, package_b)?;
@@ -668,9 +706,82 @@ fn write_new_file(path: &Path, bytes: &[u8], owner_only: bool) -> io::Result<()>
     options.open(path)?.write_all(bytes)
 }
 
+/// Rewrite the package with the edited parts replaced.
+///
+/// The new package is built in a sibling temporary file and renamed over the
+/// target, so a failure part-way through leaves the original untouched.
+fn save_package(
+    cache: &mut ArchiveCache,
+    package_path: &Path,
+    target: &Path,
+    index: &PackageIndex,
+    edits: Vec<(String, Vec<u8>)>,
+) -> io::Result<()> {
+    let replacements: BTreeMap<String, Vec<u8>> = edits.into_iter().collect();
+
+    let directory = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let base = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("package");
+    let (temp, file) = create_temp_file(&directory, base)?;
+
+    let mut writer = zip::ZipWriter::new(file);
+    {
+        let source = cached_archive(cache, package_path)?;
+        package::write_edited(source, &mut writer, index, &replacements)?;
+    }
+    writer.finish()?.sync_all()?;
+
+    // Re-open the result before it replaces anything, so a truncated write is
+    // caught while the original is still intact.
+    zip::ZipArchive::new(File::open(temp.path())?)?;
+    // The temporary file is owner-only while it is written. The final file takes
+    // the permissions of the file it replaces, or of the package it came from
+    // when the target is new, so an edit never narrows a shared document.
+    let template = std::fs::metadata(target).or_else(|_| std::fs::metadata(package_path));
+    if let Ok(template) = template {
+        std::fs::set_permissions(temp.path(), template.permissions())?;
+    }
+    // The cached handles are stale after the rename, and on Windows a read
+    // handle would block it. `temp` deletes its file if anything fails here.
+    cache.retain(|(cached, _)| cached != target && cached != package_path);
+    std::fs::rename(temp.path(), target)?;
+    Ok(())
+}
+
+/// A fresh, empty, owner-only file next to `target`. `create_new` refuses to
+/// follow a symlink or reuse an existing file, so a predictable name in a
+/// shared directory cannot be turned into a write the user did not intend.
+fn create_temp_file(directory: &Path, base: &str) -> io::Result<(TempPart, File)> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    for attempt in 0..100 {
+        let candidate = directory.join(format!(".{base}.oox-{}-{attempt}.tmp", std::process::id()));
+        match options.open(&candidate) {
+            Ok(file) => return Ok((TempPart(candidate), file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a temporary save file",
+    ))
+}
+
 /// Temporary files keep the part's file name so editors and pagers can pick a
 /// syntax mode from the extension.
-fn write_temp_file(archive_name: &str, bytes: &[u8]) -> io::Result<TempPart> {
+pub(crate) fn write_temp_file(archive_name: &str, bytes: &[u8]) -> io::Result<TempPart> {
     let base = Path::new(archive_name)
         .file_name()
         .and_then(|name| name.to_str())

@@ -1,7 +1,7 @@
 //! Canonical OOXML package metadata and bounded archive access.
 use std::{
     collections::BTreeMap,
-    io::{self, Read, Seek},
+    io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,6 +11,7 @@ use quick_xml::{
     Reader,
     events::{BytesStart, Event},
 };
+use zip::{CompressionMethod, write::SimpleFileOptions};
 
 pub const MAX_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
@@ -307,6 +308,70 @@ impl PackageIndex {
                 .keys()
                 .any(|child| child.starts_with(&format!("{path}/")))
     }
+}
+
+/// Copy `source` into `writer`, replacing the listed parts by `edits` (keyed by
+/// package path).
+///
+/// Entry order is the source order and untouched entries are copied as raw
+/// compressed bytes, so a part that was not edited comes back byte-identical.
+/// An edited entry keeps its compression method, timestamp, and permissions, so
+/// only its contents change.
+pub fn write_edited<R: Read + Seek, W: Write + Seek>(
+    source: &mut zip::ZipArchive<R>,
+    writer: &mut zip::ZipWriter<W>,
+    index: &PackageIndex,
+    edits: &BTreeMap<String, Vec<u8>>,
+) -> io::Result<()> {
+    // Package paths are normalized; the archive wants the original entry names.
+    let mut replacements: BTreeMap<String, &[u8]> = BTreeMap::new();
+    for (path, bytes) in edits {
+        let part = index.parts.get(path).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("part not found: {path}"))
+        })?;
+        replacements.insert(part.archive_name.clone(), bytes.as_slice());
+    }
+
+    let comment = source.comment().to_vec();
+    if !comment.is_empty() {
+        writer
+            .set_raw_comment(comment.into_boxed_slice())
+            .map_err(io::Error::other)?;
+    }
+
+    for entry_index in 0..source.len() {
+        let entry = source.by_index_raw(entry_index).map_err(io::Error::other)?;
+        let name = entry.name().to_string();
+        let Some(bytes) = replacements.remove(&name) else {
+            writer.raw_copy_file(entry).map_err(io::Error::other)?;
+            continue;
+        };
+        // Anything already compressed stays compressed; stored entries stay
+        // stored rather than being silently re-encoded.
+        let method = if entry.compression() == CompressionMethod::Stored {
+            CompressionMethod::Stored
+        } else {
+            CompressionMethod::Deflated
+        };
+        let mut options = SimpleFileOptions::default().compression_method(method);
+        if let Some(modified) = entry.last_modified() {
+            options = options.last_modified_time(modified);
+        }
+        if let Some(mode) = entry.unix_mode() {
+            options = options.unix_permissions(mode);
+        }
+        writer.start_file(name, options).map_err(io::Error::other)?;
+        writer.write_all(bytes)?;
+    }
+    // A replacement whose archive entry was never seen would be reported as a
+    // successful save while silently keeping the old bytes.
+    if let Some(name) = replacements.keys().next() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("archive entry not found: {name}"),
+        ));
+    }
+    Ok(())
 }
 
 /// A package owns the canonical source path and immutable metadata snapshot.

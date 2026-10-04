@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
 
@@ -14,6 +14,7 @@ use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use tui_tree_widget::{TreeItem, TreeState};
 
 use crate::compare::{Comparison, PartStatus};
+use crate::keybindings::{Action, key_hint};
 use crate::package::{
     Diagnostic, DiagnosticSeverity, Package, PackageIndex, PartInfo, PartKind, Relationship,
     TargetMode, is_image_name, is_xml_name,
@@ -29,6 +30,10 @@ use crate::worker::{
 const MAX_NAVIGATION_HISTORY: usize = 256;
 const MAX_CONTENT_SEARCH_QUERY_CHARS: usize = 256;
 const MAX_EXPORT_PATH_CHARS: usize = 1024;
+/// A save path is typed in the same prompt, so it shares the same bound.
+const MAX_SAVE_PATH_CHARS: usize = MAX_EXPORT_PATH_CHARS;
+/// Tree marker for a part with unsaved edits.
+const EDIT_MARKER: &str = "●";
 /// Integrity issues rendered in the metadata panel; the rest are summarized.
 const MAX_INTEGRITY_LINES: usize = 50;
 /// Rows scanned in each direction when locating the start tag around the editor
@@ -41,6 +46,51 @@ pub enum PendingExport {
     Extracted(PathBuf),
     OpenTemp(TempPart),
     Clipboard(String),
+}
+
+/// A part the user edited but did not save, set aside while another part is on
+/// screen. Keeping the whole editor state preserves the cursor and undo history.
+struct EditedPart {
+    state: EditorState,
+    baseline: Lines,
+    kind: PreviewKind,
+}
+
+/// A destructive action waiting for a deliberate second press. Held as one
+/// value so any unrelated key (or a real mouse button, but not plain motion)
+/// disarms the pending question.
+#[derive(Clone, Debug, PartialEq)]
+enum Confirmation {
+    Quit,
+    Revert(String),
+}
+
+/// Where an editor cursor was before its buffer was replaced, so a reload does
+/// not throw the user back to the top of the file. The row/column are clamped to
+/// the new buffer when they are put back.
+#[derive(Clone, Debug)]
+struct Reselect {
+    path: String,
+    cursor: edtui::Index2,
+    viewport: (usize, usize),
+}
+
+/// Put a cursor and viewport back after the buffer was replaced, clamped to what
+/// the new buffer actually contains.
+fn place_cursor(state: &mut EditorState, cursor: edtui::Index2, viewport: (usize, usize)) {
+    let row = cursor.row.min(state.lines.len().saturating_sub(1));
+    let col = cursor
+        .col
+        .min(state.lines.len_col(row).unwrap_or(0).saturating_sub(1));
+    state.cursor = edtui::Index2::new(row, col);
+    state.set_viewport_offset(viewport.0, viewport.1);
+}
+
+/// A part written to disk for the external editor, together with the text that
+/// was written so the round trip can tell whether anything changed.
+pub struct ExternalEdit {
+    pub temp: TempPart,
+    pub written: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -66,6 +116,16 @@ pub struct App {
     /// Open/closed tree state from before the filter, restored when it clears.
     opened_before_search: Option<Vec<Vec<String>>>,
     pub editor_state: EditorState,
+    /// The text the part had when it was loaded: an edited buffer differs from
+    /// it. `None` while the pane shows something other than an editable preview.
+    editor_baseline: Option<Lines>,
+    /// Whether the pane's text can be written back into the package.
+    editor_editable: bool,
+    /// Cached `editor_state != editor_baseline`, refreshed after editor input so
+    /// the tree, title, and status bar do not re-diff the buffer on every frame.
+    editor_dirty: bool,
+    /// Unsaved edits for parts that are not on screen, keyed by package path.
+    edits: BTreeMap<String, EditedPart>,
     pub image_state: Option<StatefulProtocol>,
     pub preview_kind: PreviewKind,
     /// The part whose content the preview currently shows. The tree selection
@@ -119,9 +179,63 @@ pub struct App {
     export_request_id: u64,
     export_pending: bool,
     pending_export: Option<PendingExport>,
+    pub save_active: bool,
+    pub save_query: String,
+    /// A target the user typed that already exists; a second confirm overwrites.
+    save_confirm: Option<String>,
+    /// Advisory formatter verdicts for the pending save, shown in the prompt.
+    save_warnings: Vec<String>,
+    save_request_id: u64,
+    save_pending: bool,
+    /// The last path this session wrote, so saving again does not re-ask about
+    /// overwriting its own output.
+    last_saved: Option<PathBuf>,
+    /// Part to select once a saved package has been re-indexed, with the cursor to
+    /// put back once its buffer has been read.
+    pending_reselect: Option<Reselect>,
+    /// A cursor to restore when the next editor preview lands, set when the part
+    /// was re-selected by `pending_reselect`.
+    pending_cursor: Option<Reselect>,
+    /// Save feedback, re-applied once the saved package has been re-indexed. The
+    /// reload resets the status bar, which would otherwise swallow the message.
+    post_load_message: Option<String>,
+    /// Set while the external editor should be launched for this part.
+    external_edit_request: Option<String>,
+    /// A destructive action that discarded unsaved edits must be asked for twice.
+    pending_confirmation: Option<Confirmation>,
     /// One-line feedback for work that has no other visible surface (export
     /// results). Rendered in the status bar and cleared on the next selection.
     pub status_message: Option<String>,
+}
+
+/// The editor buffer as text. `Jagged` joins rows with a newline and keeps a
+/// trailing newline, so a round trip through the editor changes nothing.
+fn lines_to_text(lines: &Lines) -> String {
+    lines.to_string()
+}
+
+/// Decide what an external editor round trip means: `Ok(None)` when nothing
+/// changed, `Ok(Some(text))` for a new buffer, `Err` when the file cannot be
+/// used. Changes are detected by content, so a `:q` or a re-save is a no-op.
+fn pick_up_external(written: &str, bytes: &[u8]) -> io::Result<Option<String>> {
+    if bytes.len() > crate::preview::MAX_XML_PREVIEW_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the edited file is too large",
+        ));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not valid UTF-8"))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    // Editors are free to append the newline the file was missing.
+    let trimmed = text
+        .strip_suffix('\n')
+        .map(|text| text.strip_suffix('\r').unwrap_or(text))
+        .unwrap_or(text);
+    if text == written || trimmed == written {
+        return Ok(None);
+    }
+    Ok(Some(text.replace("\r\n", "\n")))
 }
 
 fn part_kind_label(kind: &PartKind) -> &'static str {
@@ -484,6 +598,10 @@ impl App {
             filtered_tree_items: None,
             opened_before_search: None,
             editor_state: EditorState::default(),
+            editor_baseline: None,
+            editor_editable: false,
+            editor_dirty: false,
+            edits: BTreeMap::new(),
             image_state: None,
             preview_kind: PreviewKind::Empty,
             previewed_path: None,
@@ -527,6 +645,18 @@ impl App {
             export_request_id: 0,
             export_pending: false,
             pending_export: None,
+            save_active: false,
+            save_query: String::new(),
+            save_confirm: None,
+            save_warnings: Vec::new(),
+            save_request_id: 0,
+            save_pending: false,
+            last_saved: None,
+            pending_reselect: None,
+            pending_cursor: None,
+            post_load_message: None,
+            external_edit_request: None,
+            pending_confirmation: None,
             status_message: None,
         };
         app.worker.submit(match app.compare_path.clone() {
@@ -625,10 +755,30 @@ impl App {
                     }) {
                         continue;
                     }
+                    // A cursor restore is only valid for the part it was taken
+                    // from; any other preview just drops it.
+                    let restore = self.pending_cursor.take();
                     match preview {
-                        Ok(Preview::Editor { kind, text }) => {
+                        Ok(Preview::Editor {
+                            kind,
+                            text,
+                            editable,
+                        }) => {
                             self.preview_kind = kind;
-                            self.editor_state = EditorState::new(Lines::from(text.as_str()));
+                            let lines = Lines::from(text.as_str());
+                            self.editor_state = EditorState::new(lines.clone());
+                            if let Some(reselect) = restore {
+                                if reselect.path == selected_path {
+                                    place_cursor(
+                                        &mut self.editor_state,
+                                        reselect.cursor,
+                                        reselect.viewport,
+                                    );
+                                }
+                            }
+                            self.editor_baseline = Some(lines);
+                            self.editor_editable = editable;
+                            self.editor_dirty = false;
                             self.previewed_path = Some(selected_path);
                             self.content_message = None;
                         }
@@ -636,10 +786,12 @@ impl App {
                             self.preview_kind = PreviewKind::Image;
                             self.image_state = Some(self.picker.new_resize_protocol(image));
                             self.content_message = None;
+                            self.forget_external_edit(&selected_path);
                         }
                         Ok(Preview::Info(message)) => {
                             self.preview_kind = PreviewKind::Info;
                             self.content_message = Some(message);
+                            self.forget_external_edit(&selected_path);
                         }
                         Ok(Preview::Error(message)) => {
                             self.preview_kind = PreviewKind::Error;
@@ -647,10 +799,12 @@ impl App {
                                 "Could not preview {}: {message}",
                                 selected_path.trim_start_matches('/')
                             ));
+                            self.forget_external_edit(&selected_path);
                         }
                         Err(error) => {
                             self.preview_kind = PreviewKind::Error;
                             self.content_message = Some(format!("Could not preview: {error}"));
+                            self.forget_external_edit(&selected_path);
                         }
                     }
                 }
@@ -710,6 +864,22 @@ impl App {
                         }
                     }
                 }
+                ResultMessage::Saved {
+                    request_id,
+                    path,
+                    result,
+                } => {
+                    if request_id != self.save_request_id {
+                        continue;
+                    }
+                    self.save_pending = false;
+                    match result {
+                        Ok(()) => self.after_save(path),
+                        Err(error) => {
+                            self.status_message = Some(format!("Save failed: {error}"));
+                        }
+                    }
+                }
             }
         }
         // Watchdog: explicit in-flight flags instead of inspecting message text.
@@ -717,12 +887,14 @@ impl App {
             && (self.loading
                 || self.preview_pending
                 || self.content_search_pending
-                || self.export_pending)
+                || self.export_pending
+                || self.save_pending)
         {
             self.loading = false;
             self.preview_pending = false;
             self.content_search_pending = false;
             self.export_pending = false;
+            self.save_pending = false;
             let message = "Package worker exited before completing the request".to_string();
             self.worker_error = Some(message.clone());
             self.content_message = Some(message);
@@ -744,6 +916,12 @@ impl App {
         self.compare = compare;
         self.details_generation = self.details_generation.wrapping_add(1);
         self.editor_state = EditorState::default();
+        self.editor_baseline = None;
+        self.editor_editable = false;
+        self.editor_dirty = false;
+        // A freshly opened package replaces the edits of the previous one; the
+        // only reload that keeps them is a save, which clears them beforehand.
+        self.edits.clear();
         self.image_state = None;
         self.preview_kind = PreviewKind::Empty;
         self.previewed_path = None;
@@ -758,6 +936,17 @@ impl App {
         } else {
             "Select a package part or press Enter to preview content".to_string()
         });
+        // After a save the saved part is shown again, now from the new package.
+        if let Some(reselect) = self.pending_reselect.take() {
+            if self.index().parts.contains_key(&reselect.path) {
+                self.select_path(&reselect.path);
+                self.pending_cursor = Some(reselect);
+                let _ = self.load_selected_file_content();
+            }
+        }
+        if let Some(message) = self.post_load_message.take() {
+            self.status_message = Some(message);
+        }
     }
 
     fn fail_load(&mut self, error: String) {
@@ -801,7 +990,12 @@ impl App {
         self.summary_visible = true;
         self.summary_scroll = 0;
         self.image_state = None;
+        // The buffer is set aside rather than discarded, so an unsaved edit
+        // survives a detour through the summary view.
+        self.stash_current_edit();
         self.editor_state = EditorState::default();
+        self.editor_baseline = None;
+        self.editor_editable = false;
         self.preview_kind = PreviewKind::Summary;
         self.content_message = None;
         Ok(())
@@ -1522,6 +1716,26 @@ impl App {
     }
 
     pub fn selection_status(&self) -> String {
+        if self.save_active {
+            let mut prompt = format!("Save to: {}_ | ", self.save_query);
+            match self.save_confirm.as_deref() {
+                Some(target) => {
+                    prompt.push_str(&format!("{target} exists — Enter overwrite, Esc cancel"))
+                }
+                None => prompt.push_str("Enter save, Esc cancel"),
+            }
+            if let Some(first) = self.save_warnings.first() {
+                let extra = self.save_warnings.len().saturating_sub(1);
+                prompt.push_str(&format!(" | warning: {first}"));
+                if extra > 0 {
+                    prompt.push_str(&format!(" (+{extra} more)"));
+                }
+            }
+            if let Some(message) = self.status_message.as_deref() {
+                prompt.push_str(&format!(" | {message}"));
+            }
+            return prompt;
+        }
         if self.export_active {
             return format!(
                 "Extract to: {}_ | Enter save, Esc cancel",
@@ -1589,6 +1803,13 @@ impl App {
     /// Export feedback has no other visible surface. Appending it last keeps it
     /// visible even when no tree item is selected.
     fn with_status_message(&self, mut status: String) -> String {
+        if self.has_unsaved_edits() {
+            status.push_str(&format!(
+                " | {} unsaved edit(s), {} to save",
+                self.unsaved_edit_count(),
+                key_hint(Action::SavePackage)
+            ));
+        }
         if let Some(message) = self.status_message.as_deref() {
             status.push_str(" | ");
             status.push_str(message);
@@ -1643,11 +1864,16 @@ impl App {
     }
 
     fn load_selected_file_content_inner(&mut self, record_history: bool) -> io::Result<()> {
+        // Set the current buffer aside before it is replaced.
+        self.stash_current_edit();
         // Reset the previous view before loading anything new. This prevents a
         // previously selected XML file or image from remaining visible when a
         // directory or unsupported package part is selected.
         self.image_state = None;
         self.editor_state = EditorState::default();
+        self.editor_baseline = None;
+        self.editor_editable = false;
+        self.editor_dirty = false;
         self.preview_kind = PreviewKind::Empty;
         self.previewed_path = None;
         self.summary_visible = false;
@@ -1661,6 +1887,16 @@ impl App {
         };
         if record_history {
             self.record_navigation(&selected);
+        }
+        // A pending external edit belongs to one part; moving on abandons it
+        // rather than launching the editor when the part is opened again later.
+        if self.external_edit_request.as_deref() != Some(selected.as_str()) {
+            self.external_edit_request = None;
+        }
+        // A part that already has unsaved edits keeps them: reloading would
+        // silently throw the user's work away.
+        if self.restore_edit(&selected) {
+            return Ok(());
         }
 
         let display_name = selected.trim_start_matches('/').to_string();
@@ -1782,12 +2018,44 @@ impl App {
 
     /// Write the selected part to a temporary file and hand it to `$PAGER`/`$EDITOR`.
     pub fn open_selected_externally(&mut self) -> io::Result<()> {
+        if let Some(text) = self.unsaved_text_of_selected() {
+            let Some(part) = self.selected_exportable_part() else {
+                self.status_message = Some("Select a package part to export".to_string());
+                return Ok(());
+            };
+            match crate::worker::write_temp_file(&part.archive_name, text.as_bytes()) {
+                Ok(temp) => {
+                    self.pending_export = Some(PendingExport::OpenTemp(temp));
+                }
+                Err(error) => {
+                    self.status_message = Some(format!("Export failed: {error}"));
+                }
+            }
+            return Ok(());
+        }
         self.submit_export(ExportMode::OpenTemp)
     }
 
     /// Copy the pretty-printed preview text of the selected part as OSC 52.
     pub fn copy_selected_content(&mut self) -> io::Result<()> {
+        if let Some(text) = self.unsaved_text_of_selected() {
+            self.pending_export = Some(PendingExport::Clipboard(text));
+            return Ok(());
+        }
         self.submit_export(ExportMode::Clipboard)
+    }
+
+    /// The unsaved buffer of the selected part, when there is one. Copy and the
+    /// external viewer must see what the user is looking at, not the bytes still
+    /// on disk.
+    fn unsaved_text_of_selected(&self) -> Option<String> {
+        let selected = self.tree_state.selected().last()?;
+        if self.previewed_path.as_deref() == Some(selected.as_str()) && self.editor_dirty {
+            return Some(lines_to_text(&self.editor_state.lines));
+        }
+        self.edits
+            .get(selected)
+            .map(|edited| lines_to_text(&edited.state.lines))
     }
 
     /// Hand a finished export to the event loop, which owns the terminal.
@@ -1826,7 +2094,531 @@ impl App {
         Ok(())
     }
 
+    // -- Editable content pane -------------------------------------------------
+
+    /// Whether the pane's text can be written back into the package.
+    pub fn editor_editable(&self) -> bool {
+        self.editor_editable
+    }
+
+    /// Whether the pane shows an unsaved change.
+    pub fn editor_is_dirty(&self) -> bool {
+        self.editor_dirty
+    }
+
+    /// Parts with unsaved edits, counting the buffer on screen.
+    pub fn unsaved_edit_count(&self) -> usize {
+        self.edits.len() + usize::from(self.editor_dirty)
+    }
+
+    pub fn has_unsaved_edits(&self) -> bool {
+        self.unsaved_edit_count() > 0
+    }
+
+    /// Re-diff the buffer against its baseline. Called after editor input, which
+    /// is the only thing that can change the verdict.
+    pub fn refresh_editor_dirty(&mut self) {
+        let dirty = match (&self.previewed_path, &self.editor_baseline) {
+            (Some(_), Some(baseline)) => {
+                self.editor_editable && self.editor_state.lines != *baseline
+            }
+            _ => false,
+        };
+        if dirty != self.editor_dirty {
+            self.editor_dirty = dirty;
+            self.refresh_tree_labels();
+        }
+    }
+
+    /// Set the buffer of the part on screen aside before the pane is replaced,
+    /// so an unsaved edit is not lost when the selection moves on.
+    fn stash_current_edit(&mut self) {
+        let Some(path) = self.previewed_path.take() else {
+            return;
+        };
+        let Some(baseline) = self.editor_baseline.take() else {
+            return;
+        };
+        let was_dirty = std::mem::replace(&mut self.editor_dirty, false);
+        if !self.editor_editable || self.editor_state.lines == baseline {
+            if was_dirty || self.edits.remove(&path).is_some() {
+                self.refresh_tree_labels();
+            }
+            return;
+        }
+        self.edits.insert(
+            path,
+            EditedPart {
+                state: std::mem::take(&mut self.editor_state),
+                baseline,
+                kind: self.preview_kind,
+            },
+        );
+        // The part is now marked from `edits` rather than from the buffer.
+        self.refresh_tree_labels();
+    }
+
+    /// Bring back the buffer of a part that was edited before, instead of
+    /// reloading (and discarding) the version on disk.
+    fn restore_edit(&mut self, path: &str) -> bool {
+        let Some(edited) = self.edits.remove(path) else {
+            return false;
+        };
+        self.editor_state = edited.state;
+        self.editor_baseline = Some(edited.baseline);
+        self.editor_editable = true;
+        self.preview_kind = edited.kind;
+        self.previewed_path = Some(path.to_string());
+        self.content_message = None;
+        self.editor_dirty = true;
+        true
+    }
+
+    /// A save in flight owns the buffers; editor input would be lost when the
+    /// written package is reloaded, so the event loop is frozen until it lands.
+    pub fn is_saving(&self) -> bool {
+        self.save_pending
+    }
+
+    /// Every unsaved edit, ready for the save job: the parts set aside plus the
+    /// buffer on screen when it differs from what was loaded.
+    fn collect_edits(&self) -> Vec<(String, Vec<u8>)> {
+        let mut edits: BTreeMap<String, Vec<u8>> = self
+            .edits
+            .iter()
+            .map(|(path, edited)| {
+                (
+                    path.clone(),
+                    lines_to_text(&edited.state.lines).into_bytes(),
+                )
+            })
+            .collect();
+        if let (Some(path), Some(baseline)) =
+            (self.previewed_path.as_ref(), self.editor_baseline.as_ref())
+        {
+            if self.editor_editable && self.editor_state.lines != *baseline {
+                edits.insert(
+                    path.clone(),
+                    lines_to_text(&self.editor_state.lines).into_bytes(),
+                );
+            }
+        }
+        edits.into_iter().collect()
+    }
+
+    /// Open the save prompt for the unsaved edits, pre-filled with the default
+    /// target so the common case is Enter only.
+    pub fn start_save(&mut self) {
+        if self.save_pending {
+            self.status_message = Some("Save in progress".to_string());
+            return;
+        }
+        if !self.is_package_loaded() {
+            self.status_message = Some("Package is still loading".to_string());
+            return;
+        }
+        if self.compare.is_some() {
+            self.status_message = Some("Editing is unavailable in compare mode".to_string());
+            return;
+        }
+        if !self.has_unsaved_edits() {
+            self.status_message = Some("No edits to save".to_string());
+            return;
+        }
+        self.save_warnings = self.edit_warnings(&self.collect_edits());
+        self.save_query = self.default_save_target();
+        self.save_confirm = None;
+        self.save_active = true;
+        self.status_message = None;
+    }
+
+    /// Advisory well-formedness verdicts for the parts about to be written. They
+    /// are collected before the write so the prompt can show them while the user
+    /// can still back out.
+    fn edit_warnings(&self, edits: &[(String, Vec<u8>)]) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for (path, bytes) in edits {
+            let is_xml = self
+                .index()
+                .parts
+                .get(path)
+                .is_some_and(|part| part.kind == PartKind::Xml);
+            if !is_xml {
+                continue;
+            }
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                if let Err(problem) = crate::preview::xml_well_formed(text) {
+                    warnings.push(format!(
+                        "{} is not well-formed XML ({problem})",
+                        path.trim_start_matches('/')
+                    ));
+                }
+            }
+        }
+        warnings
+    }
+
+    pub fn save_input_char(&mut self, character: char) {
+        if self.save_query.chars().count() >= MAX_SAVE_PATH_CHARS {
+            return;
+        }
+        // Editing the path invalidates both the overwrite confirmation and any
+        // message about the previous one.
+        self.save_confirm = None;
+        self.status_message = None;
+        self.save_query.push(character);
+    }
+
+    pub fn save_backspace(&mut self) {
+        self.save_confirm = None;
+        self.status_message = None;
+        self.save_query.pop();
+    }
+
+    pub fn cancel_save(&mut self) {
+        self.save_active = false;
+        self.save_query.clear();
+        self.save_confirm = None;
+        self.save_warnings.clear();
+        self.status_message = None;
+    }
+
+    /// Confirm the target. A path that already exists but was not written by
+    /// this session is asked about a second time, and never overwritten silently.
+    pub fn confirm_save(&mut self) -> io::Result<()> {
+        let target = self.save_query.trim().to_string();
+        if target.is_empty() {
+            self.status_message = Some("Save path is empty".to_string());
+            return Ok(());
+        }
+        let target_path = PathBuf::from(&target);
+        // A directory target can never be written, so say so in the prompt
+        // instead of failing the write after the fact.
+        if target_path.is_dir() {
+            self.status_message = Some(format!("{target} is a directory"));
+            return Ok(());
+        }
+        let written_here = self.last_saved.as_deref() == Some(Path::new(&target));
+        if target_path.exists() && !written_here && self.save_confirm.as_deref() != Some(&target) {
+            // The prompt itself renders the confirmation, so no status message.
+            self.save_confirm = Some(target.clone());
+            return Ok(());
+        }
+        self.save_active = false;
+        self.save_query.clear();
+        self.save_confirm = None;
+        self.save_warnings.clear();
+        self.submit_save(target_path)
+    }
+
+    fn submit_save(&mut self, target: PathBuf) -> io::Result<()> {
+        let Some(package) = self.package.as_ref() else {
+            self.status_message = Some("Package is still loading".to_string());
+            return Ok(());
+        };
+        let package_source = package.source.clone();
+        let index = Arc::clone(&package.index);
+        let edits = self.collect_edits();
+        if edits.is_empty() {
+            self.status_message = Some("No edits to save".to_string());
+            return Ok(());
+        }
+        self.save_request_id = self.save_request_id.wrapping_add(1);
+        let request_id = self.save_request_id;
+        if let Err(error) = self.worker.submit(Job::SavePackage {
+            request_id,
+            package_path: package_source,
+            target,
+            index,
+            edits,
+        }) {
+            self.save_pending = false;
+            self.status_message = Some(format!("Save failed: {error}"));
+            return Ok(());
+        }
+        self.save_pending = true;
+        self.status_message = Some("Saving…".to_string());
+        Ok(())
+    }
+
+    /// Default target: the last path written this session, otherwise
+    /// `<stem>.edited.<ext>` next to the file that was opened.
+    fn default_save_target(&self) -> String {
+        if let Some(path) = self.last_saved.as_ref() {
+            return path.to_string_lossy().to_string();
+        }
+        let source = Path::new(&self.file_path);
+        let stem = source
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("package");
+        let extension = source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("zip");
+        let name = format!("{stem}.edited.{extension}");
+        match source
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            Some(directory) => directory.join(name).to_string_lossy().to_string(),
+            None => name,
+        }
+    }
+
+    /// Install a saved package: the edits are now on disk, so they are dropped
+    /// and the package is re-indexed through the worker.
+    fn after_save(&mut self, path: PathBuf) {
+        self.edits.clear();
+        self.editor_baseline = None;
+        self.editor_editable = false;
+        self.editor_dirty = false;
+        self.last_saved = Some(path.clone());
+        // The reload re-selects the saved part; carrying the cursor over keeps
+        // the user on the line they were editing.
+        let reselect = self.previewed_path.take().map(|part| Reselect {
+            path: part,
+            cursor: self.editor_state.cursor,
+            viewport: self.editor_state.viewport_offset(),
+        });
+        // Saving is refused in compare mode, so the comparison is not in play.
+        self.file_path = path.to_string_lossy().to_string();
+        self.open_request_id = self.open_request_id.wrapping_add(1);
+        self.loading = true;
+        self.pending_reselect = reselect;
+        let request = Job::Open {
+            request_id: self.open_request_id,
+            path: path.clone(),
+        };
+        if let Err(error) = self.worker.submit(request) {
+            self.loading = false;
+            self.status_message = Some(format!(
+                "Saved {}, but reloading it failed: {error}",
+                path.display()
+            ));
+            return;
+        }
+        let message = format!("Saved {}", path.display());
+        self.post_load_message = Some(message.clone());
+        self.status_message = Some(message);
+    }
+
+    // -- External editor --------------------------------------------------------
+
+    /// Ask for the selected part to be edited in `$VISUAL`/`$EDITOR`. The event
+    /// loop launches the editor once the part's buffer is on screen.
+    pub fn request_external_edit(&mut self) -> io::Result<()> {
+        if self.save_pending {
+            self.status_message = Some("Save in progress".to_string());
+            return Ok(());
+        }
+        if !self.is_package_loaded() {
+            self.status_message = Some("Package is still loading".to_string());
+            return Ok(());
+        }
+        if self.compare.is_some() {
+            self.status_message = Some("Editing is unavailable in compare mode".to_string());
+            return Ok(());
+        }
+        let Some(selected) = self.tree_state.selected().last().cloned() else {
+            self.status_message = Some("Select a package part to edit".to_string());
+            return Ok(());
+        };
+        // A directory has no bytes to hand over; without this the request would
+        // stay pending forever, because no preview can ever match it.
+        if self.selected_exportable_part().is_none() {
+            self.status_message = Some("Select a package part to edit".to_string());
+            return Ok(());
+        }
+        self.external_edit_request = Some(selected.clone());
+        if self.previewed_path.as_deref() != Some(selected.as_str()) {
+            self.load_selected_file_content()?;
+        }
+        Ok(())
+    }
+
+    /// Whether the requested part is on screen and ready to be handed over.
+    pub fn external_edit_ready(&self) -> bool {
+        match self.external_edit_request.as_deref() {
+            Some(path) => self.previewed_path.as_deref() == Some(path),
+            None => false,
+        }
+    }
+
+    pub fn take_external_edit_request(&mut self) -> Option<String> {
+        let path = self.external_edit_request.take()?;
+        if !self.editor_editable {
+            self.status_message = Some("This part is read-only".to_string());
+            return None;
+        }
+        Some(path)
+    }
+
+    /// Forget a pending request for a part that turned out not to be editable.
+    fn forget_external_edit(&mut self, path: &str) {
+        if self.external_edit_request.as_deref() == Some(path) {
+            self.external_edit_request = None;
+            self.status_message = Some("This part cannot be edited".to_string());
+        }
+    }
+
+    /// Write the current buffer to a temporary file named after the part, so the
+    /// editor picks the right syntax mode.
+    pub fn begin_external_edit(&mut self) -> io::Result<ExternalEdit> {
+        let text = lines_to_text(&self.editor_state.lines);
+        let archive_name = self
+            .previewed_path
+            .as_deref()
+            .and_then(|path| self.index().parts.get(path))
+            .map(|part| part.archive_name.clone())
+            .unwrap_or_else(|| "part.xml".to_string());
+        let temp = crate::worker::write_temp_file(&archive_name, text.as_bytes())?;
+        Ok(ExternalEdit {
+            temp,
+            written: text,
+        })
+    }
+
+    /// Take the edited text back into the buffer. An external edit is just
+    /// another way to change the same unsaved buffer, so it still needs an
+    /// explicit save to reach the package.
+    pub fn apply_external_edit(&mut self, written: &str, bytes: &[u8], success: bool) {
+        if !success {
+            self.status_message = Some("Editor exited with an error; changes ignored".to_string());
+            return;
+        }
+        if self.previewed_path.is_none() || !self.editor_editable {
+            return;
+        }
+        match pick_up_external(written, bytes) {
+            Ok(None) => self.status_message = Some("No changes from the external editor".into()),
+            Ok(Some(text)) => {
+                let cursor = self.editor_state.cursor;
+                let viewport = self.editor_state.viewport_offset();
+                self.editor_state = EditorState::new(Lines::from(text.as_str()));
+                place_cursor(&mut self.editor_state, cursor, viewport);
+                self.refresh_editor_dirty();
+                self.status_message = Some(format!(
+                    "{} edited externally — save to keep it",
+                    self.previewed_path
+                        .as_deref()
+                        .unwrap_or_default()
+                        .trim_start_matches('/')
+                ));
+            }
+            Err(error) => {
+                self.status_message = Some(format!("External edit ignored: {error}"));
+            }
+        }
+    }
+
+    /// Discard the unsaved edits of the selected part. Destructive, so it asks
+    /// for a second press like the quit guard does.
+    pub fn request_revert(&mut self) {
+        if self.save_pending {
+            self.status_message = Some("Save in progress".to_string());
+            return;
+        }
+        let Some(selected) = self.tree_state.selected().last().cloned() else {
+            self.status_message = Some("Select a package part to revert".to_string());
+            return;
+        };
+        let display = selected.trim_start_matches('/').to_string();
+        let on_screen =
+            self.previewed_path.as_deref() == Some(selected.as_str()) && self.editor_dirty;
+        if !on_screen && !self.edits.contains_key(&selected) {
+            self.status_message = Some(format!("No unsaved edits in {display}"));
+            return;
+        }
+        if self.pending_confirmation != Some(Confirmation::Revert(selected.clone())) {
+            self.pending_confirmation = Some(Confirmation::Revert(selected));
+            self.status_message = Some(format!(
+                "Press {} again to discard unsaved edits in {display}",
+                key_hint(Action::RevertPart)
+            ));
+            return;
+        }
+        self.pending_confirmation = None;
+        if on_screen {
+            if let Some(baseline) = self.editor_baseline.as_ref() {
+                let cursor = self.editor_state.cursor;
+                let viewport = self.editor_state.viewport_offset();
+                self.editor_state = EditorState::new(baseline.clone());
+                place_cursor(&mut self.editor_state, cursor, viewport);
+            }
+            self.editor_dirty = false;
+        } else {
+            self.edits.remove(&selected);
+        }
+        self.refresh_tree_labels();
+        self.status_message = Some(format!("Reverted {display}"));
+    }
+
+    // -- Quit guard -------------------------------------------------------------
+
+    /// Quitting with unsaved edits must be asked for twice.
+    pub fn request_quit(&mut self) -> bool {
+        if matches!(self.pending_confirmation, Some(Confirmation::Quit))
+            || !self.has_unsaved_edits()
+        {
+            return true;
+        }
+        self.pending_confirmation = Some(Confirmation::Quit);
+        self.status_message = Some(format!(
+            "{} unsaved edit(s) — save with {}, quit again to discard",
+            self.unsaved_edit_count(),
+            key_hint(Action::SavePackage)
+        ));
+        false
+    }
+
+    /// Any other key cancels a pending confirmation, so it cannot be tripped by
+    /// a later, unrelated keystroke.
+    pub fn disarm_confirmation(&mut self) {
+        if self.pending_confirmation.take().is_some() {
+            self.status_message = None;
+        }
+    }
+
     fn install_tree(&mut self) {
+        self.filtered_tree_items = None;
+        self.opened_before_search = None;
+        match self.build_tree_items() {
+            Ok(tree_items) => self.tree_items = tree_items,
+            Err(error) => {
+                self.tree_items.clear();
+                self.worker_error = Some(format!("Could not build package tree: {error}"));
+            }
+        }
+    }
+
+    /// Rebuild the labels after the set of edited parts changed. The live path
+    /// filter and the tree's open/closed state are kept, so marking a part does
+    /// not throw the user out of a search.
+    fn refresh_tree_labels(&mut self) {
+        if self.tree_items.is_empty() {
+            return;
+        }
+        let Ok(tree_items) = self.build_tree_items() else {
+            return;
+        };
+        self.tree_items = tree_items;
+        if !self.search_query.is_empty() {
+            let query = self.search_query.to_ascii_lowercase();
+            match filter_tree(&self.tree_items, &query) {
+                Ok(items) => {
+                    for path in collect_open_paths(&items) {
+                        self.tree_state.open(path);
+                    }
+                    self.filtered_tree_items = Some(items);
+                }
+                Err(_) => self.filtered_tree_items = None,
+            }
+        }
+        self.tree_state.scroll_selected_into_view();
+    }
+
+    fn build_tree_items(&self) -> io::Result<Vec<TreeItem<'static, String>>> {
         // A sorted, de-duplicated union: in compare mode the tree must show
         // added and removed parts, not just the primary package's parts.
         let mut paths: BTreeSet<&String> = self.index().parts.keys().collect();
@@ -1847,28 +2639,29 @@ impl App {
             .filter(|path| !path.is_empty())
             .map(str::to_string)
             .collect();
-        // Parts with an integrity issue or a comparison difference are marked
-        // in the tree so they can be spotted without reading the metadata panel.
+        // Parts with an integrity issue, a comparison difference, or unsaved
+        // edits are marked in the tree so they can be spotted without reading
+        // the metadata panel.
         let markers = self.tree_markers();
-        self.filtered_tree_items = None;
-        self.opened_before_search = None;
-        match create_tree(&paths, &markers) {
-            Ok(tree_items) => self.tree_items = tree_items,
-            Err(error) => {
-                self.tree_items.clear();
-                self.worker_error = Some(format!("Could not build package tree: {error}"));
-            }
-        }
+        create_tree(&paths, &markers)
     }
 
-    /// Suffix markers appended to tree labels: integrity warnings and, in
-    /// compare mode, the part status. Ancestors of a differing part get a `*`
-    /// so a collapsed directory still advertises the change.
+    /// Suffix markers appended to tree labels: integrity warnings, unsaved
+    /// edits, and, in compare mode, the part status. Ancestors of a differing
+    /// part get a `*` so a collapsed directory still advertises the change.
     fn tree_markers(&self) -> HashMap<String, String> {
         let mut markers: HashMap<String, String> = HashMap::new();
         for issue in &self.index().integrity {
             if let Some(part) = issue.part.as_deref() {
                 add_marker(&mut markers, part, "⚠");
+            }
+        }
+        for path in self.edits.keys() {
+            add_marker(&mut markers, path, EDIT_MARKER);
+        }
+        if self.editor_dirty {
+            if let Some(path) = self.previewed_path.as_deref() {
+                add_marker(&mut markers, path, EDIT_MARKER);
             }
         }
         let Some(compare) = self.compare.as_ref() else {
@@ -2057,7 +2850,7 @@ fn styled_tree_label(
             Some(Color::LightGreen)
         } else if has("-") {
             Some(Color::LightRed)
-        } else if has("~") || has("⚠") {
+        } else if has("~") || has("⚠") || has(EDIT_MARKER) {
             Some(Color::Yellow)
         } else {
             None
@@ -2127,12 +2920,12 @@ fn create_tree_level(
 
 #[cfg(test)]
 mod tests {
-    use super::PendingExport;
+    use super::{PendingExport, lines_to_text, pick_up_external};
     use crate::compare::PartStatus;
-    use crate::preview::PreviewKind;
+    use crate::preview::{MAX_XML_PREVIEW_BYTES, PreviewKind};
     use crate::{App, worker::Worker};
     use ratatui_image::picker::Picker;
-    use std::{io, sync::Arc, time::Duration};
+    use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
     /// Pump the worker until `done` holds, with a generous timeout. Tests run the
     /// real worker thread; they only avoid fixed sleeps.
@@ -3257,6 +4050,463 @@ mod tests {
 
         std::fs::remove_file(&before)?;
         std::fs::remove_file(&after)?;
+        Ok(())
+    }
+
+    // -- Editing and saving ----------------------------------------------------
+
+    /// Open a part and replace its buffer with `text`, the way editor input
+    /// would. Returns the text that was loaded.
+    fn edit_part(app: &mut App, path: &str, text: &str) -> io::Result<String> {
+        app.tree_state.select(vec![path.to_string()]);
+        app.load_selected_file_content()?;
+        preview_loaded(app);
+        let loaded = lines_to_text(&app.editor_state.lines);
+        app.editor_state.lines = edtui::Lines::from(text);
+        app.refresh_editor_dirty();
+        Ok(loaded)
+    }
+
+    fn temp_save_path(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("oox-save-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("create temporary save directory");
+        directory.join(name)
+    }
+
+    #[test]
+    fn external_editor_changes_are_read_by_content() {
+        assert_eq!(pick_up_external("a\n", b"a\n").unwrap(), None);
+        // An editor that appends the missing final newline is not a change.
+        assert_eq!(pick_up_external("a", b"a\n").unwrap(), None);
+        assert_eq!(pick_up_external("a", b"a\r\n").unwrap(), None);
+        // A real change is taken over, with Windows line endings normalized.
+        assert_eq!(
+            pick_up_external("a", b"a\r\nb\r\n").unwrap(),
+            Some("a\nb\n".to_string())
+        );
+        assert_eq!(pick_up_external("a", b"b").unwrap(), Some("b".to_string()));
+        assert!(pick_up_external("a", b"\xff").is_err());
+        assert!(pick_up_external("a", &vec![b'x'; MAX_XML_PREVIEW_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn external_edit_replaces_the_buffer_and_marks_the_part() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        let loaded = edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>typed</a>")?;
+        assert!(app.editor_is_dirty());
+
+        // A change is taken into the same unsaved buffer, so it still needs a save.
+        let changed = "<a>from the editor</a>";
+        app.apply_external_edit("<a>typed</a>", changed.as_bytes(), true);
+        assert!(app.editor_is_dirty());
+        assert_eq!(lines_to_text(&app.editor_state.lines), changed);
+
+        // An unchanged file is a no-op.
+        app.apply_external_edit(changed, changed.as_bytes(), true);
+        assert!(app.editor_is_dirty());
+        assert_eq!(lines_to_text(&app.editor_state.lines), changed);
+
+        // An aborted editor (`:cq`) discards whatever it left behind.
+        app.apply_external_edit(changed, b"<a>aborted</a>", false);
+        assert_eq!(lines_to_text(&app.editor_state.lines), changed);
+
+        // The baseline is untouched, so undo back to the original clears the part.
+        app.apply_external_edit(changed, loaded.as_bytes(), true);
+        assert!(!app.editor_is_dirty());
+        assert!(!app.has_unsaved_edits());
+        Ok(())
+    }
+
+    #[test]
+    fn unsaved_edits_survive_navigation() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+        assert_eq!(app.unsaved_edit_count(), 1);
+        // The marker the tree labels are built from.
+        assert!(app.tree_markers().contains_key("/ppt/slides/slide1.xml"));
+
+        // Another part shows its own text, and the edit is still counted.
+        app.tree_state
+            .select(vec!["/[Content_Types].xml".to_string()]);
+        app.load_selected_file_content()?;
+        preview_loaded(&mut app);
+        assert!(!app.editor_is_dirty());
+        assert_eq!(app.unsaved_edit_count(), 1);
+        assert!(!lines_to_text(&app.editor_state.lines).contains("edited"));
+        assert!(app.tree_markers().contains_key("/ppt/slides/slide1.xml"));
+
+        // Coming back restores the buffer instead of reloading from disk.
+        app.tree_state
+            .select(vec!["/ppt/slides/slide1.xml".to_string()]);
+        app.load_selected_file_content()?;
+        assert!(app.editor_is_dirty());
+        assert_eq!(lines_to_text(&app.editor_state.lines), "<a>edited</a>");
+
+        // The summary view is a detour, not a discard.
+        app.toggle_summary()?;
+        assert_eq!(app.unsaved_edit_count(), 1);
+        app.toggle_summary()?;
+        assert_eq!(lines_to_text(&app.editor_state.lines), "<a>edited</a>");
+        Ok(())
+    }
+
+    #[test]
+    fn quitting_with_unsaved_edits_is_asked_twice() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        // Nothing to lose: the first quit goes through.
+        assert!(app.request_quit());
+        app.disarm_confirmation();
+
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+        assert!(!app.request_quit());
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("unsaved edit"))
+        );
+        // Any other key cancels the confirmation, so it cannot be tripped later.
+        app.disarm_confirmation();
+        assert!(!app.request_quit());
+        // The confirmation is a deliberate second press.
+        assert!(app.request_quit());
+        Ok(())
+    }
+
+    #[test]
+    fn no_edits_means_nothing_to_save() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        app.tree_state
+            .select(vec!["/ppt/slides/slide1.xml".to_string()]);
+        app.load_selected_file_content()?;
+        preview_loaded(&mut app);
+        app.start_save();
+        assert!(!app.save_active);
+        assert_eq!(app.status_message.as_deref(), Some("No edits to save"));
+        Ok(())
+    }
+
+    /// The acceptance path from the issue: edit a slide, save a new package, and
+    /// check that it opens with the change and that nothing else moved.
+    #[test]
+    fn saving_writes_the_edit_and_leaves_other_parts_byte_identical() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        let loaded = edit_part(
+            &mut app,
+            "/ppt/slides/slide1.xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<p:sld><a:t>EDITED TUI</a:t></p:sld>",
+        )?;
+        assert!(loaded.contains("OOXML") || loaded.contains("p:sld"));
+
+        let target = temp_save_path("out.pptx");
+        let _ = std::fs::remove_file(&target);
+        app.submit_save(target.clone())?;
+        pump_until(&mut app, |app| !app.save_pending);
+        // The saved package is re-indexed through the worker and the part is
+        // shown again, so the tree, diagnostics and summary all describe it.
+        pump_until(&mut app, |app| {
+            !app.loading && !app.preview_pending && app.previewed_path.is_some()
+        });
+        assert!(!app.has_unsaved_edits());
+        assert_eq!(app.file_path, target.to_string_lossy());
+        assert_eq!(
+            app.previewed_path.as_deref(),
+            Some("/ppt/slides/slide1.xml")
+        );
+        // Saving again writes the same file rather than stacking `.edited`.
+        assert_eq!(app.default_save_target(), target.to_string_lossy());
+
+        use std::io::Read as _;
+        let mut original = zip::ZipArchive::new(std::fs::File::open("data/sample.pptx")?)?;
+        let mut saved = zip::ZipArchive::new(std::fs::File::open(&target)?)?;
+        assert_eq!(original.len(), saved.len());
+        for index in 0..original.len() {
+            let mut before = original.by_index(index)?;
+            let mut after = saved.by_index(index)?;
+            assert_eq!(before.name(), after.name(), "entry order is preserved");
+            let mut before_bytes = Vec::new();
+            before.read_to_end(&mut before_bytes)?;
+            let mut after_bytes = Vec::new();
+            after.read_to_end(&mut after_bytes)?;
+            if before.name() == "ppt/slides/slide1.xml" {
+                assert_ne!(before_bytes, after_bytes);
+                assert_eq!(before.compression(), after.compression());
+                assert!(String::from_utf8_lossy(&after_bytes).contains("EDITED TUI"));
+            } else {
+                assert_eq!(before.compression(), after.compression());
+                assert_eq!(
+                    before_bytes,
+                    after_bytes,
+                    "{} must be untouched",
+                    before.name()
+                );
+            }
+        }
+
+        std::fs::remove_file(&target)?;
+        Ok(())
+    }
+
+    /// A request that could not be served must not fire later, when the same
+    /// part happens to be opened again.
+    #[test]
+    fn an_abandoned_external_edit_request_is_forgotten() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        app.tree_state
+            .select(vec!["/ppt/slides/slide1.xml".to_string()]);
+        app.load_selected_file_content()?;
+        preview_loaded(&mut app);
+        // Ask for a part, then move to another one before it can be handed over.
+        app.tree_state
+            .select(vec!["/ppt/presentation.xml".to_string()]);
+        app.request_external_edit()?;
+        preview_loaded(&mut app);
+        assert!(app.external_edit_ready());
+        app.tree_state
+            .select(vec!["/ppt/slides/slide1.xml".to_string()]);
+        app.load_selected_file_content()?;
+        preview_loaded(&mut app);
+        assert!(!app.external_edit_ready());
+        assert!(app.take_external_edit_request().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn external_edit_snapshot_keeps_the_part_name() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>snapshot</a>")?;
+        let pending = app.begin_external_edit()?;
+        // The editor picks its syntax mode from the extension.
+        let name = pending
+            .temp
+            .path()
+            .file_name()
+            .expect("snapshot has a file name")
+            .to_string_lossy()
+            .to_string();
+        assert!(name.ends_with("slide1.xml"), "{name}");
+        assert_eq!(
+            std::fs::read_to_string(pending.temp.path())?,
+            pending.written
+        );
+        assert_eq!(pending.written, "<a>snapshot</a>");
+        Ok(())
+    }
+
+    #[test]
+    fn an_existing_target_is_never_overwritten_without_a_second_confirm() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        // The source file itself is the dangerous target.
+        let victim = temp_save_path("existing.pptx");
+        std::fs::copy("data/sample.pptx", &victim)?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+
+        app.save_query = victim.to_string_lossy().to_string();
+        app.save_active = true;
+        app.confirm_save()?;
+        // Still prompting, and the file on disk is untouched.
+        assert!(app.save_active);
+        assert!(!app.save_pending);
+        assert_eq!(
+            std::fs::read("data/sample.pptx")?,
+            std::fs::read(&victim)?,
+            "the target must not be written before the confirmation"
+        );
+        // The prompt itself carries the question; the status bar is not used for
+        // it, because the save prompt replaces the whole status line.
+        assert!(
+            app.selection_status().contains("exists"),
+            "prompt did not ask: {}",
+            app.selection_status()
+        );
+
+        // The second confirm goes ahead.
+        app.confirm_save()?;
+        assert!(!app.save_active);
+        pump_until(&mut app, |app| !app.save_pending);
+        pump_until(&mut app, |app| !app.loading);
+        assert_ne!(std::fs::read("data/sample.pptx")?, std::fs::read(&victim)?);
+
+        std::fs::remove_file(&victim)?;
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_xml_still_saves_with_a_warning() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<p:sld><a:t>unclosed")?;
+
+        // The verdict is advisory and is shown before the write, while the user
+        // can still back out.
+        app.start_save();
+        assert!(
+            app.selection_status().contains("not well-formed"),
+            "prompt did not warn: {}",
+            app.selection_status()
+        );
+
+        let target = temp_save_path("broken.pptx");
+        let _ = std::fs::remove_file(&target);
+        app.save_query = target.to_string_lossy().to_string();
+        app.confirm_save()?;
+        pump_until(&mut app, |app| !app.save_pending);
+        pump_until(&mut app, |app| !app.loading);
+        assert!(target.exists(), "the user's text must not be trapped");
+
+        std::fs::remove_file(&target)?;
+        Ok(())
+    }
+
+    /// A save owns the buffers until it lands: editor input typed meanwhile would
+    /// be thrown away by the reload, so every mutating entry point is refused.
+    #[test]
+    fn a_save_in_flight_blocks_further_edits() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+
+        let target = temp_save_path("locked.pptx");
+        let _ = std::fs::remove_file(&target);
+        app.submit_save(target.clone())?;
+        // Without pumping, so the job is still in flight.
+        assert!(app.is_saving());
+
+        app.start_save();
+        assert!(!app.save_active, "a second prompt must not open");
+        assert_eq!(app.status_message.as_deref(), Some("Save in progress"));
+
+        app.request_revert();
+        assert_eq!(app.status_message.as_deref(), Some("Save in progress"),);
+        assert_eq!(app.unsaved_edit_count(), 1, "the edit must survive");
+
+        app.request_external_edit()?;
+        assert_eq!(app.status_message.as_deref(), Some("Save in progress"),);
+
+        pump_until(&mut app, |app| !app.save_pending);
+        pump_until(&mut app, |app| !app.loading);
+        assert!(target.exists());
+        std::fs::remove_file(&target)?;
+        Ok(())
+    }
+
+    /// `R` discards the unsaved edits of the selected part, but only after a
+    /// second press, and it works for a stashed edit as well as the one on screen.
+    #[test]
+    fn revert_discards_the_edits_of_the_part_on_screen() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        let loaded = edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+
+        app.request_revert();
+        assert!(app.editor_is_dirty(), "one press must not discard anything");
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("again")),
+            "the first press must ask for a second one"
+        );
+
+        app.request_revert();
+        assert!(!app.editor_is_dirty());
+        assert_eq!(lines_to_text(&app.editor_state.lines), loaded);
+        assert!(!app.has_unsaved_edits());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Reverted ppt/slides/slide1.xml")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn revert_discards_a_stashed_edit() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+        // Move away, which sets the edit aside, then come back to select it.
+        app.tree_state
+            .select(vec!["/[Content_Types].xml".to_string()]);
+        app.load_selected_file_content()?;
+        preview_loaded(&mut app);
+        app.tree_state
+            .select(vec!["/ppt/slides/slide1.xml".to_string()]);
+        assert_eq!(app.unsaved_edit_count(), 1);
+
+        app.request_revert();
+        app.request_revert();
+        assert!(!app.has_unsaved_edits(), "the stashed edit must be gone");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Reverted ppt/slides/slide1.xml")
+        );
+
+        // Reverting a part with nothing to discard says so instead of arming.
+        app.request_revert();
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("No unsaved edits in ppt/slides/slide1.xml")
+        );
+        Ok(())
+    }
+
+    /// The reload after a save must not throw the cursor back to the top of the
+    /// file the user was editing.
+    #[test]
+    fn cursor_survives_a_save() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        let loaded = edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+        // Enough lines that row 3 exists after the reload too.
+        app.editor_state.lines = edtui::Lines::from(format!("{loaded}<!-- x -->"));
+        app.refresh_editor_dirty();
+        app.editor_state.cursor = edtui::Index2::new(3, 2);
+
+        let target = temp_save_path("cursor.pptx");
+        let _ = std::fs::remove_file(&target);
+        app.submit_save(target.clone())?;
+        pump_until(&mut app, |app| {
+            !app.save_pending && !app.loading && !app.preview_pending
+        });
+        assert_eq!(
+            app.previewed_path.as_deref(),
+            Some("/ppt/slides/slide1.xml")
+        );
+        assert_eq!(app.editor_state.cursor, edtui::Index2::new(3, 2));
+
+        std::fs::remove_file(&target)?;
+        Ok(())
+    }
+
+    /// Copying a part with unsaved edits copies what is on screen, not the bytes
+    /// that are still on disk.
+    #[test]
+    fn copy_uses_the_unsaved_buffer() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>buffer</a>")?;
+        app.copy_selected_content()?;
+        match app.take_pending_export() {
+            Some(PendingExport::Clipboard(text)) => assert_eq!(text, "<a>buffer</a>"),
+            _ => panic!("expected the buffer text on the clipboard"),
+        }
+        Ok(())
+    }
+
+    /// A new target must not be written owner-only just because the temporary
+    /// file it is built from is.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_target_inherits_the_source_permissions() -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+
+        let target = temp_save_path("perm.pptx");
+        let _ = std::fs::remove_file(&target);
+        app.submit_save(target.clone())?;
+        pump_until(&mut app, |app| !app.save_pending);
+
+        let written = std::fs::metadata(&target)?.permissions().mode() & 0o777;
+        let source = std::fs::metadata("data/sample.pptx")?.permissions().mode() & 0o777;
+        assert_eq!(
+            written, source,
+            "the new file must match the package it came from"
+        );
+
+        std::fs::remove_file(&target)?;
         Ok(())
     }
 }
