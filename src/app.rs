@@ -150,20 +150,39 @@ fn push_detail_line(text: &mut String, line: &str) -> usize {
     line_number
 }
 
+/// Whether `character` is the `>` that ends a start tag, tracking whether a quoted
+/// attribute value is in effect. XML only treats the quote character that opened a
+/// value as its delimiter, so a literal `>`, `<`, or the other quote character
+/// inside a value is ordinary text rather than a tag boundary.
+fn ends_tag(quote: &mut Option<char>, character: char) -> bool {
+    match *quote {
+        Some(active) => {
+            if character == active {
+                *quote = None;
+            }
+            false
+        }
+        None => match character {
+            '"' | '\'' => {
+                *quote = Some(character);
+                false
+            }
+            '>' => true,
+            _ => false,
+        },
+    }
+}
+
 /// The start tag enclosing `(row, column)` exactly as the preview renders it,
 /// plus the cursor's offset within it. A start tag can span several preview rows:
 /// `pretty_print_xml` forwards the raw tag bytes, and XML allows a newline
 /// between an attribute name, `=`, and its value.
-///
-/// A `>` inside an earlier attribute value ends the tag early, so a reference
-/// after it is not followed; OOXML relationship attributes never contain one.
 fn enclosing_start_tag(lines: &Lines, row: usize, column: usize) -> Option<(Vec<char>, usize)> {
     let row_chars = |index: usize| lines.get(RowIndex::new(index));
-    // A start tag holds no raw `<`, so scanning back from the cursor reaches its
-    // opening `<` before any earlier tag's `>`. Reaching a `>` first means the
-    // cursor is in element text, not in an attribute.
+    // A literal `<` inside a value has to be escaped, so the nearest one before the
+    // cursor opens the tag the cursor may be in.
     let mut open = None;
-    for index in (row.saturating_sub(MAX_TAG_ROWS)..=row).rev() {
+    'open: for index in (row.saturating_sub(MAX_TAG_ROWS)..=row).rev() {
         let Some(chars) = row_chars(index) else {
             break;
         };
@@ -173,21 +192,18 @@ fn enclosing_start_tag(lines: &Lines, row: usize, column: usize) -> Option<(Vec<
             chars.len()
         };
         for position in (0..end).rev() {
-            match chars[position] {
-                '<' => open = Some((index, position)),
-                '>' => return None,
-                _ => continue,
+            if chars[position] == '<' {
+                open = Some((index, position));
+                break 'open;
             }
-            break;
-        }
-        if open.is_some() {
-            break;
         }
     }
     let (open_row, open_column) = open?;
 
     // Collect the tag up to the `>` that closes it, remembering where the cursor
-    // falls inside it.
+    // falls inside it. Quote tracking starts right after the `<`, where it is
+    // unambiguous, and carries across rows because a value may span them.
+    let mut quote = None;
     let mut tag = Vec::new();
     let mut cursor_offset = None;
     'tag: for index in open_row..=open_row.saturating_add(MAX_TAG_ROWS) {
@@ -195,16 +211,14 @@ fn enclosing_start_tag(lines: &Lines, row: usize, column: usize) -> Option<(Vec<
             break;
         };
         let from = if index == open_row { open_column } else { 0 };
-        let end = chars[from..]
-            .iter()
-            .position(|character| *character == '>')
-            .map_or(chars.len(), |at| from + at);
-        if index == row && column <= end {
-            cursor_offset = Some(tag.len() + column.saturating_sub(from));
-        }
-        tag.extend_from_slice(&chars[from..end]);
-        if end < chars.len() {
-            break 'tag;
+        for (position, character) in chars.iter().enumerate().skip(from) {
+            if index == row && position == column {
+                cursor_offset = Some(tag.len());
+            }
+            if ends_tag(&mut quote, *character) {
+                break 'tag;
+            }
+            tag.push(*character);
         }
     }
 
@@ -212,6 +226,8 @@ fn enclosing_start_tag(lines: &Lines, row: usize, column: usize) -> Option<(Vec<
     if tag.starts_with(&['<', '!']) || tag.starts_with(&['<', '?']) {
         return None;
     }
+    // A cursor that the scan passed without recording sits after the tag that the
+    // nearest `<` opened, so it is in element text rather than in an attribute.
     Some((tag, cursor_offset?))
 }
 
@@ -2037,7 +2053,7 @@ mod tests {
             ("ppt/presentation.xml", "<p:presentation/>"),
             (
                 "ppt/slides/slide1.xml",
-                "<p:sld xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><a:blip r:embed='rId10'/><a:blip\n    r:id\n    =\n    \"rId11\"/><a:blip r:link=\"rId12\"/><a:blip r:id=\"rId13\"/><a:t>see r:id=\"rId10\" here</a:t></p:sld>",
+                "<p:sld xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><a:blip r:embed='rId10'/><a:blip\n    r:id\n    =\n    \"rId11\"/><a:blip r:link=\"rId12\"/><a:blip r:id=\"rId13\"/><a:blip descr=\"A > B and it's fine\" r:embed=\"rId14\"/><a:t>see r:id=\"rId10\" here</a:t></p:sld>",
             ),
             (
                 "ppt/slides/_rels/slide1.xml.rels",
@@ -2046,6 +2062,7 @@ mod tests {
   <Relationship Id="rId11" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slide3.xml"/>
   <Relationship Id="rId12" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target=".."/>
   <Relationship Id="rId13" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="missing.xml"/>
+  <Relationship Id="rId14" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="../presentation.xml"/>
 </Relationships>"#,
             ),
             ("ppt/slides/slide2.xml", "<p:sld/>"),
@@ -2123,6 +2140,16 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("missing.xml"))
         );
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide1.xml"));
+
+        // `descr="A > B and it's fine"` precedes the reference: a `>` and the
+        // other quote character inside a value are literal, not tag boundaries.
+        assert!(put_cursor_on(&mut app, "r:embed=\"rId14\""));
+        assert!(app.follow_relationship_at_cursor()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/presentation.xml"));
+        assert!(app.navigate_back()?);
+        preview_loaded(&mut app);
         assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide1.xml"));
 
         // `<a:t>see r:id="rId10" here</a:t>` only looks like an attribute: it is
