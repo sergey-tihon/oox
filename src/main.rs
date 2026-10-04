@@ -23,6 +23,7 @@ use ratatui_image::picker::Picker;
 use worker::Worker;
 
 mod app;
+mod compare;
 mod integrity;
 mod keybindings;
 mod layout;
@@ -35,9 +36,9 @@ mod worker;
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// OOXML document to inspect
-    #[arg(value_name = "FILE")]
-    file: PathBuf,
+    /// OOXML document to inspect, optionally with a second document to compare against
+    #[arg(value_name = "FILE", num_args = 1..=2, required = true)]
+    files: Vec<PathBuf>,
     /// Keybinding and editor configuration file
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -62,7 +63,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let editor_mode = keybindings::load(config_path.as_deref())?;
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     let worker = Worker::start()?;
-    let mut app = App::new_loading(cli.file.to_string_lossy().into_owned(), picker, worker)?;
+    let mut files = cli.files.into_iter();
+    let file = files.next().ok_or("missing FILE argument")?;
+    let compare = files.next();
+    let mut app = App::new_loading(file.to_string_lossy().into_owned(), compare, picker, worker)?;
 
     let stderr = io::stderr();
     let backend = CrosstermBackend::new(stderr);
@@ -624,13 +628,17 @@ fn run_app(
                         app.tree_state.select_first();
                     } else if actions.contains(&Action::Last) {
                         app.tree_state.select_last();
+                    } else if actions.contains(&Action::ToggleUnchangedParts) {
+                        app.toggle_unchanged_parts()?;
+                    } else if actions.contains(&Action::ExpandAll) {
+                        app.expand_all();
+                    } else if actions.contains(&Action::ToggleSelected) {
+                        app.tree_state.toggle_selected();
                     } else if actions.contains(&Action::OpenContent) {
                         app.tree_state.toggle_selected();
                         app.load_selected_file_content()?;
                     } else if actions.contains(&Action::ShowMetadata) {
                         app.toggle_details();
-                    } else if actions.contains(&Action::ExpandAll) {
-                        app.expand_all();
                     } else if actions.contains(&Action::CollapseAll) {
                         app.collapse_all();
                     } else if actions.contains(&Action::StartSearch) {

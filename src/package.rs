@@ -74,6 +74,9 @@ pub struct PartInfo {
     pub content_type: Option<String>,
     pub size: u64,
     pub compressed_size: u64,
+    /// CRC32 of the uncompressed bytes from the ZIP central directory. Lets
+    /// package comparison skip decompressing parts that are byte-identical.
+    pub crc32: u32,
     pub kind: PartKind,
 }
 
@@ -126,6 +129,7 @@ impl PackageIndex {
             let archive_name = entry.name().to_string();
             let size = entry.size();
             let compressed_size = entry.compressed_size();
+            let crc32 = entry.crc32();
             total = total.saturating_add(size);
             if let Err(error) = check_archive_limits(entry_count, total) {
                 index.record(Diagnostic::error("index", None, error.to_string()));
@@ -185,6 +189,7 @@ impl PackageIndex {
                     content_type: None,
                     size,
                     compressed_size,
+                    crc32,
                     kind,
                 },
             );

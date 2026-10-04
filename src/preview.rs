@@ -20,6 +20,7 @@ pub enum PreviewKind {
     PlainText,
     Json,
     Hex,
+    Diff,
     Image,
     Summary,
     Info,

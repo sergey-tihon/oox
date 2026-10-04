@@ -56,7 +56,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         .style(Style::default());
 
     let title = Paragraph::new(Text::styled(
-        format!("File path: {}", app.file_path),
+        match app.compare_path.as_deref() {
+            Some(compare) => format!("Compare: {}  ⇄  {}", app.file_path, compare.display()),
+            None => format!("File path: {}", app.file_path),
+        },
         Style::default().fg(accent_color),
     ))
     .block(title_block);
@@ -68,14 +71,37 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     let left_sections = [snapshot.tree, snapshot.details.unwrap_or(snapshot.tree)];
 
     // Tree widget
-    let tree_title = if app.tree_filter_active() {
+    let tree_title = if app.compare.is_some() {
+        if app.tree_filter_active() {
+            "[1] Diff (filtered)"
+        } else {
+            "[1] Diff"
+        }
+    } else if app.tree_filter_active() {
         "[1] Document Inspector (filtered)"
     } else {
         "[1] Document Inspector"
     };
+    let tree_hint = if app.compare.is_some() {
+        Line::from(vec![
+            Span::styled("+add", Style::default().fg(Color::LightGreen)),
+            Span::raw(" "),
+            Span::styled("~mod", Style::default().fg(Color::Yellow)),
+            Span::raw(" "),
+            Span::styled("-del", Style::default().fg(Color::LightRed)),
+            Span::raw(if app.hide_unchanged_parts {
+                " [u]all [?]"
+            } else {
+                " [u]diff [?]"
+            }),
+        ])
+        .right_aligned()
+    } else {
+        Line::from("[?] Help").right_aligned()
+    };
     let tree_block = Block::bordered()
         .title(tree_title)
-        .title_top(Line::from("[?] Help").right_aligned())
+        .title_top(tree_hint)
         .border_style(if app.current_widget == CurrentWidget::Tree {
             active_style
         } else {
@@ -231,6 +257,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         let syntax_highlighter = match app.preview_kind {
             PreviewKind::Xml => SyntaxHighlighter::new("dracula", "xml").ok(),
             PreviewKind::Json => SyntaxHighlighter::new("dracula", "json").ok(),
+            PreviewKind::Diff => SyntaxHighlighter::new("dracula", "diff").ok(),
             _ => None,
         };
         let line_numbers = if app.preview_kind == PreviewKind::Hex {
@@ -371,6 +398,7 @@ fn content_title(kind: PreviewKind) -> &'static str {
         PreviewKind::Xml => "XML content (read-only)",
         PreviewKind::PlainText => "Text content (read-only)",
         PreviewKind::Json => "JSON preview (read-only)",
+        PreviewKind::Diff => "Part diff (read-only)",
         PreviewKind::Hex => "Hex dump",
         PreviewKind::Image => "Image preview",
         PreviewKind::Summary => "Document summary",
@@ -401,4 +429,16 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
             Constraint::Percentage((100 - width) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use edtui::SyntaxHighlighter;
+
+    /// The diff preview relies on the bundled syntax set shipping a `diff`
+    /// grammar; if it ever does not, the preview still works without colours.
+    #[test]
+    fn diff_syntax_is_available() {
+        assert!(SyntaxHighlighter::new("dracula", "diff").is_ok());
+    }
 }
