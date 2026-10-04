@@ -107,6 +107,8 @@ pub struct PackageIndex {
     pub incoming: BTreeMap<String, Vec<usize>>,
     pub warnings: Vec<String>,
     pub diagnostics: Vec<Diagnostic>,
+    /// OPC structural problems found by [`crate::integrity::check`].
+    pub integrity: Vec<Diagnostic>,
     pub source: Option<PathBuf>,
     content_types: ContentTypes,
 }
@@ -264,6 +266,7 @@ impl PackageIndex {
                     .push(relationship_index);
             }
         }
+        index.integrity = crate::integrity::check(&index);
         Ok(index)
     }
 
@@ -490,7 +493,11 @@ fn required_xml_attribute(
 fn local_name(name: &str) -> &str {
     name.rsplit(':').next().unwrap_or(name)
 }
-fn relationship_source(path: &str) -> Option<String> {
+/// Maps a `.rels` part path (without a leading slash) to the part it describes.
+/// `None` means the name is not a relationship part, even when it ends in
+/// `.rels`; [`crate::integrity`] relies on this to tell implicit parts apart
+/// from ordinary ones.
+pub(crate) fn relationship_source(path: &str) -> Option<String> {
     if path == "_rels/.rels" {
         return Some("/".into());
     }
@@ -500,9 +507,19 @@ fn relationship_source(path: &str) -> Option<String> {
             .map(|s| format!("/{}", normalize_package_path(s)));
     }
     let (directory, name) = path.rsplit_once("/_rels/")?;
-    Some(format!("/{directory}/{}", name.strip_suffix(".rels")?))
+    let name = name.strip_suffix(".rels")?;
+    // A nested `foo/_rels/.rels` names no source part and is not a valid
+    // relationship part.
+    (!name.is_empty()).then(|| format!("/{directory}/{name}"))
 }
 fn resolve_relationship_target(source: &str, target: &str) -> Option<String> {
+    // A target is a URI reference, so only the part URI is resolved: a fragment
+    // (`part.xml#section`) or a bare `#fragment` referring to the source itself
+    // is not part of the part name.
+    let target = target.split('#').next().unwrap_or_default();
+    if target.is_empty() {
+        return Some(source.to_string());
+    }
     let combined = if target.starts_with('/') {
         target.to_string()
     } else {
@@ -592,6 +609,25 @@ mod tests {
     #[test]
     fn normalizes_traversal_and_separators() {
         assert_eq!(normalize_package_path(r"/a\\b/../c"), "a/c");
+    }
+
+    #[test]
+    fn relationship_source_rejects_names_without_a_source_part() {
+        assert_eq!(relationship_source("foo/_rels/.rels"), None);
+        assert_eq!(relationship_source("custom/data.rels"), None);
+    }
+
+    #[test]
+    fn relationship_targets_drop_uri_fragments() {
+        assert_eq!(
+            resolve_relationship_target("/ppt/presentation.xml", "slides/slide1.xml#section")
+                .as_deref(),
+            Some("/ppt/slides/slide1.xml")
+        );
+        assert_eq!(
+            resolve_relationship_target("/ppt/presentation.xml", "#fragment").as_deref(),
+            Some("/ppt/presentation.xml")
+        );
     }
 
     #[test]

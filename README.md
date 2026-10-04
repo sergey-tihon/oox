@@ -11,6 +11,7 @@ A terminal user interface for inspecting Office Open XML (OOXML) documents such 
 - **Content search** — Grep package-part contents in the background and filter the tree to matching parts.
 - **Export parts** — Extract a part to a file, open it in `$PAGER`/`$EDITOR`, or copy its pretty-printed content to the clipboard (OSC 52).
 - **Document summaries** — Press `s` to inspect slide, paragraph, heading, table, sheet, cell, and formula summaries for PowerPoint, Word, and Excel packages; linked part paths navigate back to the tree.
+- **Package integrity** — Phase-1 OPC checks (dangling relationship targets, parts without a content type, orphan parts, duplicate relationship ids, missing required parts) are listed in the metadata panel, marked with `⚠` in the tree, and reachable with `i`/`I`.
 - **Vim-like navigation** — Move through files with `j`/`k` and the editor with Vim bindings.
 
 ## Tech Stack
@@ -68,6 +69,7 @@ oox --version
 | `/`       | Search and live-filter package paths          |
 | `Ctrl-f`  | Search part contents in the background       |
 | `n` / `N` | Select the next / previous search match     |
+| `i` / `I` | Jump to the next / previous part with a package issue |
 | `Esc`     | Cancel search / clear the applied filter    |
 | `Enter`   | Toggle directory / preview file content     |
 | `1` / `2` / `3` | Focus tree / metadata / content panels  |
@@ -87,6 +89,8 @@ Package metadata uses one canonical normalized path model. ZIP entries with trav
 Archive indexing, document summaries, and selected-part preview work run on a bounded background worker after the loading screen is entered. Messages contain owned package metadata/preview payloads; request IDs and selected canonical paths discard stale results. The UI remains the sole owner of editor state and creates ratatui image protocols on the UI thread. Loading and malformed/limited-part failures are shown in the status area rather than panicking. Terminal mode is restored on normal exits and unwinding errors on a best-effort basis.
 
 The initial package is not indexed synchronously: the tree and summary appear when the worker finishes, and tree/content actions are ignored while loading. Summary XML parser failures are retained as structured diagnostics in package metadata instead of displaying a partial summary; summary output and extracted item/text collections are bounded to prevent oversized documents from consuming unbounded memory.
+
+Phase-1 package integrity is structural only (no schema validation): internal relationship targets that do not resolve (URI fragments are ignored), parts with no content type, parts unreachable from `/_rels/.rels`, duplicate relationship ids within one `.rels` part, and missing required parts (`[Content_Types].xml`, root rels, the `officeDocument` main part). Explicitly external relationships are never dangling; relationship parts (`_rels/.rels` and `.../_rels/*.rels`) are exempt from the reachability rule because OPC resolves them implicitly rather than through relationships, but they still need a content type, so a manifest without a `rels` default is reported; OPC-reserved bracket names such as `[Content_Types].xml` and `[trash]` are exempt from both rules.
 
 ## Terminal image support
 

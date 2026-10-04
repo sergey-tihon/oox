@@ -85,6 +85,12 @@ pub enum Action {
     /// Select the previous search result.
     #[keybindings["N"]]
     PreviousMatch,
+    /// Jump to the next part with an integrity issue.
+    #[keybindings["i"]]
+    NextIssue,
+    /// Jump to the previous part with an integrity issue.
+    #[keybindings["I"]]
+    PreviousIssue,
     /// Cancel a transient mode or overlay.
     #[keybindings["Esc"]]
     Cancel,
@@ -210,6 +216,13 @@ pub fn help_sections() -> Vec<(&'static str, Vec<HelpRow>)> {
                 HelpRow::Binding(Action::NextMatch, "Next match / content match"),
                 HelpRow::Binding(Action::PreviousMatch, "Previous match"),
                 HelpRow::Binding(Action::Cancel, "Cancel search / clear filter"),
+            ],
+        ),
+        (
+            "Integrity",
+            vec![
+                HelpRow::Binding(Action::NextIssue, "Next part with a package issue"),
+                HelpRow::Binding(Action::PreviousIssue, "Previous part with a package issue"),
             ],
         ),
         (

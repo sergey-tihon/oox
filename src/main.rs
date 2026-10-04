@@ -23,6 +23,7 @@ use ratatui_image::picker::Picker;
 use worker::Worker;
 
 mod app;
+mod integrity;
 mod keybindings;
 mod layout;
 mod package;
@@ -625,6 +626,10 @@ fn run_app(
                         } else {
                             app.next_search_match(true);
                         }
+                    } else if actions.contains(&Action::NextIssue) {
+                        app.next_integrity_issue(false);
+                    } else if actions.contains(&Action::PreviousIssue) {
+                        app.next_integrity_issue(true);
                     } else if actions.contains(&Action::ExtractPart) {
                         app.start_extract();
                     } else if actions.contains(&Action::OpenPartExternally) {
@@ -660,6 +665,10 @@ fn run_app(
                         if !app.details_visible {
                             app.current_widget = CurrentWidget::Tree;
                         }
+                    } else if actions.contains(&Action::NextIssue) {
+                        app.next_integrity_issue(false);
+                    } else if actions.contains(&Action::PreviousIssue) {
+                        app.next_integrity_issue(true);
                     } else if actions.contains(&Action::ExtractPart) {
                         app.start_extract();
                     } else if actions.contains(&Action::OpenPartExternally) {

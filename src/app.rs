@@ -10,7 +10,8 @@ use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use tui_tree_widget::{TreeItem, TreeState};
 
 use crate::package::{
-    Package, PackageIndex, PartInfo, PartKind, Relationship, TargetMode, is_image_name, is_xml_name,
+    DiagnosticSeverity, Package, PackageIndex, PartInfo, PartKind, Relationship, TargetMode,
+    is_image_name, is_xml_name,
 };
 use crate::preview::{Preview, PreviewKind};
 use crate::summary::{DetailLink, DetailsView};
@@ -23,6 +24,8 @@ use crate::worker::{
 const MAX_NAVIGATION_HISTORY: usize = 256;
 const MAX_CONTENT_SEARCH_QUERY_CHARS: usize = 256;
 const MAX_EXPORT_PATH_CHARS: usize = 1024;
+/// Integrity issues rendered in the metadata panel; the rest are summarized.
+const MAX_INTEGRITY_LINES: usize = 50;
 
 /// Work an export produced that only the event loop can finish: running a
 /// command needs the terminal, and OSC 52 needs the backend's writer.
@@ -574,6 +577,39 @@ impl App {
             }
         }
 
+        let issues = &index.integrity;
+        if !issues.is_empty() {
+            push_detail_line(&mut text, "");
+            push_detail_line(
+                &mut text,
+                &format!("Integrity issues ({})  [i/I jump]", issues.len()),
+            );
+            for issue in issues.iter().take(MAX_INTEGRITY_LINES) {
+                let severity = match issue.severity {
+                    DiagnosticSeverity::Error => "error",
+                    DiagnosticSeverity::Warning => "warn",
+                };
+                let prefix = format!("  [{severity}] ");
+                let message = compact_text(&issue.message, 64);
+                let line_number = push_detail_line(&mut text, &format!("{prefix}{message}"));
+                if let Some(part) = issue.part.as_deref() {
+                    let start = prefix.chars().count();
+                    links.push(DetailLink {
+                        line: line_number,
+                        start,
+                        end: start + message.chars().count(),
+                        target: part.to_string(),
+                    });
+                }
+            }
+            if issues.len() > MAX_INTEGRITY_LINES {
+                push_detail_line(
+                    &mut text,
+                    &format!("  … {} more", issues.len() - MAX_INTEGRITY_LINES),
+                );
+            }
+        }
+
         DetailsView { text, links }
     }
 
@@ -631,6 +667,9 @@ impl App {
         if !self.index().parts.contains_key(&target) && !self.is_directory(&target) {
             return Ok(false);
         }
+        // An applied filter could hide the destination, so a link that selected
+        // an invisible item would look like it did nothing.
+        self.cancel_any_search();
         self.select_path(&target);
         self.details_scroll = 0;
         self.load_selected_file_content()?;
@@ -661,6 +700,7 @@ impl App {
         if !self.index().parts.contains_key(&target) && !self.is_directory(&target) {
             return Ok(false);
         }
+        self.cancel_any_search();
         self.summary_visible = false;
         self.summary_scroll = 0;
         self.select_path(&target);
@@ -849,6 +889,53 @@ impl App {
         } else if self.search_active || !self.search_query.is_empty() {
             self.cancel_search();
         }
+    }
+
+    /// Select the next part that has an integrity issue, wrapping around.
+    /// Returns `false` and reports why in the status bar when there is nothing
+    /// to jump to.
+    pub fn next_integrity_issue(&mut self, reverse: bool) -> bool {
+        let mut paths: Vec<String> = self
+            .index()
+            .integrity
+            .iter()
+            .filter_map(|issue| issue.part.clone())
+            .filter(|path| self.index().parts.contains_key(path))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() {
+            let total = self.index().integrity.len();
+            self.status_message = Some(if total == 0 {
+                "No package integrity issues".to_string()
+            } else {
+                format!("{total} package-level integrity issue(s); no part to jump to")
+            });
+            return false;
+        }
+
+        // Jump relative to the current position rather than to the ends of the
+        // issue list, so a part sitting between two issues moves to the nearer
+        // one in either direction.
+        let current = self
+            .tree_state
+            .selected()
+            .last()
+            .cloned()
+            .unwrap_or_default();
+        let index = if reverse {
+            let after = paths.partition_point(|path| path.as_str() < current.as_str());
+            (after + paths.len() - 1) % paths.len()
+        } else {
+            paths.partition_point(|path| path.as_str() <= current.as_str()) % paths.len()
+        };
+
+        // An applied search filter could hide the destination, and a jump that
+        // selects an invisible item is useless.
+        self.cancel_any_search();
+        self.status_message = None;
+        self.select_path(&paths[index].clone());
+        true
     }
 
     pub fn next_content_search_match(&mut self, reverse: bool) {
@@ -1203,9 +1290,17 @@ impl App {
             .filter(|path| !path.is_empty())
             .map(str::to_string)
             .collect();
+        // Parts with an integrity issue are marked in the tree so they can be
+        // spotted without reading the metadata panel.
+        let issue_parts: HashSet<String> = self
+            .index()
+            .integrity
+            .iter()
+            .filter_map(|issue| issue.part.clone())
+            .collect();
         self.filtered_tree_items = None;
         self.opened_before_search = None;
-        match create_tree(&paths) {
+        match create_tree(&paths, &issue_parts) {
             Ok(tree_items) => self.tree_items = tree_items,
             Err(error) => {
                 self.tree_items.clear();
@@ -1264,8 +1359,11 @@ impl App {
 
 /// Build tree items directly from sorted, normalized package paths (no leading
 /// slash) without an intermediate node structure.
-fn create_tree(paths: &[String]) -> io::Result<Vec<TreeItem<'static, String>>> {
-    create_tree_level("", paths, 0)
+fn create_tree(
+    paths: &[String],
+    issue_parts: &HashSet<String>,
+) -> io::Result<Vec<TreeItem<'static, String>>> {
+    create_tree_level("", paths, 0, issue_parts)
 }
 
 fn collect_open_paths(items: &[TreeItem<'static, String>]) -> Vec<Vec<String>> {
@@ -1354,6 +1452,16 @@ fn filter_tree_matches(
     Ok(result)
 }
 
+/// Tree labels for parts with an integrity issue carry a marker so they stand
+/// out without opening the metadata panel.
+fn tree_label(head: &str, identifier: &str, issue_parts: &HashSet<String>) -> String {
+    if issue_parts.contains(identifier) {
+        format!("{head} ⚠")
+    } else {
+        head.to_string()
+    }
+}
+
 /// `offset` is the byte length of the shared ancestor prefix including its
 /// trailing slash, so recursion never re-allocates path components. Paths are
 /// sorted, which groups a directory's children contiguously after it.
@@ -1361,6 +1469,7 @@ fn create_tree_level(
     parent: &str,
     paths: &[String],
     offset: usize,
+    issue_parts: &HashSet<String>,
 ) -> io::Result<Vec<TreeItem<'static, String>>> {
     let mut items = Vec::new();
     let mut index = 0;
@@ -1368,6 +1477,7 @@ fn create_tree_level(
         let rest = &paths[index][offset..];
         let head = rest.split('/').next().unwrap_or(rest);
         let identifier = format!("{parent}/{head}");
+        let label = tree_label(head, &identifier, issue_parts);
         // A directory entry itself ("head") sorts before its children
         // ("head/..."); consume it so leaf and branch merge into one node.
         if rest.len() == head.len() {
@@ -1380,13 +1490,11 @@ fn create_tree_level(
         }
         let children = &paths[children_start..index];
         if children.is_empty() {
-            items.push(TreeItem::new_leaf(identifier, head.to_string()));
+            items.push(TreeItem::new_leaf(identifier, label));
         } else {
             let child_offset = offset + head.len() + 1;
-            let children = create_tree_level(&identifier, children, child_offset)?;
-            items.push(
-                TreeItem::new(identifier, head.to_string(), children).map_err(io::Error::other)?,
-            );
+            let children = create_tree_level(&identifier, children, child_offset, issue_parts)?;
+            items.push(TreeItem::new(identifier, label, children).map_err(io::Error::other)?);
         }
     }
     Ok(items)
@@ -1676,6 +1784,203 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn jumping_to_issues_reports_when_there_are_none() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        assert!(app.index().integrity.is_empty());
+        assert!(!app.next_integrity_issue(false));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("No package integrity issues")
+        );
+        assert!(
+            app.selection_status()
+                .contains("No package integrity issues")
+        );
+        Ok(())
+    }
+
+    /// A package with a dangling relationship target and a part without a
+    /// content type. Returns its path so the caller can delete it afterwards.
+    fn write_test_package(name: &str) -> io::Result<std::path::PathBuf> {
+        use std::io::Write as _;
+
+        let path = std::env::temp_dir().join(format!("oox-test-{}-{name}", std::process::id()));
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&path)?);
+        let entries = [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+</Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>"#,
+            ),
+            ("ppt/presentation.xml", "<p:presentation/>"),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../p.xml"/>
+</Relationships>"#,
+            ),
+            ("ppt/notes.txt", "notes"),
+            ("ppt/p.xml", "<p/>"),
+            ("ppt/aaa.txt", "aaa"),
+        ];
+        for (entry, content) in entries {
+            writer
+                .start_file(entry, zip::write::SimpleFileOptions::default())
+                .map_err(io::Error::other)?;
+            writer.write_all(content.as_bytes())?;
+        }
+        writer.finish().map_err(io::Error::other)?;
+        Ok(path)
+    }
+
+    /// Acceptance for issue #12 phase 1: a dangling relationship target is
+    /// reported, marked in the tree, and reachable from the issue list.
+    #[test]
+    fn integrity_issues_mark_the_tree_and_are_navigable() -> io::Result<()> {
+        let path = write_test_package("integrity.pptx")?;
+        let mut app = test_app(&path.to_string_lossy())?;
+
+        let issues = &app.index().integrity;
+        assert!(issues.iter().any(|issue| {
+            issue.part.as_deref() == Some("/ppt/presentation.xml")
+                && issue.message.contains("/ppt/slides/slide1.xml")
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue.part.as_deref() == Some("/ppt/notes.txt")
+                && issue.message.contains("no content type")
+        }));
+
+        // `i` walks the offending parts and clears the stale status message.
+        app.tree_state
+            .select(vec!["/[Content_Types].xml".to_string()]);
+        app.status_message = Some("old".to_string());
+        assert!(app.next_integrity_issue(false));
+        assert_eq!(app.status_message, None);
+        assert_eq!(
+            app.tree_state.selected().last().map(String::as_str),
+            Some("/ppt/aaa.txt")
+        );
+
+        // The issue list in the metadata panel links to the offending part.
+        app.tree_state
+            .select(vec!["/[Content_Types].xml".to_string()]);
+        let link = app
+            .details_view()
+            .links
+            .iter()
+            .find(|link| link.target == "/ppt/presentation.xml")
+            .cloned()
+            .expect("the issue list should link to the offending part");
+        assert!(app.activate_detail_link(link.line, link.start)?);
+        assert_eq!(
+            app.tree_state.selected().last().map(String::as_str),
+            Some("/ppt/presentation.xml")
+        );
+        preview_loaded(&mut app);
+
+        let issue_parts: std::collections::HashSet<String> = app
+            .index()
+            .integrity
+            .iter()
+            .filter_map(|issue| issue.part.clone())
+            .collect();
+        assert_eq!(
+            super::tree_label("presentation.xml", "/ppt/presentation.xml", &issue_parts),
+            "presentation.xml ⚠"
+        );
+        assert_eq!(
+            super::tree_label("presentation.xml", "/ppt/other.xml", &issue_parts),
+            "presentation.xml"
+        );
+
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// Issue navigation must be directional from any tree position, not just
+    /// from one of the list ends, and must not leave the destination hidden
+    /// behind an applied search filter.
+    #[test]
+    fn issue_jumps_are_directional_and_clear_the_search_filter() -> io::Result<()> {
+        let path = write_test_package("integrity-direction.pptx")?;
+        let mut app = test_app(&path.to_string_lossy())?;
+        fn selected(app: &App) -> String {
+            app.tree_state
+                .selected()
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        // `/ppt/p.xml` has no issue and sorts between two that do.
+        assert!(app.index().parts.contains_key("/ppt/p.xml"));
+        app.select_path("/ppt/p.xml");
+        assert!(app.next_integrity_issue(false));
+        assert_eq!(selected(&app), "/ppt/presentation.xml");
+
+        app.select_path("/ppt/p.xml");
+        assert!(app.next_integrity_issue(true));
+        assert_eq!(selected(&app), "/ppt/notes.txt");
+
+        // Wrap around at the ends.
+        app.select_path("/ppt/presentation.xml");
+        assert!(app.next_integrity_issue(false));
+        assert_eq!(selected(&app), "/ppt/aaa.txt");
+        app.select_path("/ppt/aaa.txt");
+        assert!(app.next_integrity_issue(true));
+        assert_eq!(selected(&app), "/ppt/presentation.xml");
+
+        // A filter that hides the next issue is dropped so the jump is visible.
+        app.start_search();
+        for character in "aaa.txt".chars() {
+            app.search_input_char(character);
+        }
+        app.finish_search();
+        assert!(app.tree_filter_active());
+        assert!(app.next_integrity_issue(false));
+        assert!(!app.tree_filter_active());
+        assert_eq!(selected(&app), "/ppt/notes.txt");
+        assert!(
+            flatten_identifiers(app.visible_tree_items()).contains(&"/ppt/notes.txt".to_string())
+        );
+
+        // Activating a link does the same for its destination.
+        app.start_search();
+        for character in "aaa.txt".chars() {
+            app.search_input_char(character);
+        }
+        app.finish_search();
+        app.select_path("/ppt/aaa.txt");
+        let link = app
+            .details_view()
+            .links
+            .iter()
+            .find(|link| link.target == "/ppt/notes.txt")
+            .cloned()
+            .expect("the issue list should link to the other issue part");
+        assert!(app.activate_detail_link(link.line, link.start)?);
+        assert!(!app.tree_filter_active());
+        assert_eq!(selected(&app), "/ppt/notes.txt");
+        assert!(
+            flatten_identifiers(app.visible_tree_items()).contains(&"/ppt/notes.txt".to_string())
+        );
+        preview_loaded(&mut app);
+
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
     fn flatten_identifiers(items: &[tui_tree_widget::TreeItem<'static, String>]) -> Vec<String> {
         let mut result = Vec::new();
         for item in items {
@@ -1874,7 +2179,7 @@ mod tests {
         .iter()
         .map(|path| path.to_string())
         .collect();
-        let items = super::create_tree(&paths)?;
+        let items = super::create_tree(&paths, &Default::default())?;
         assert_eq!(items.len(), 2);
         let ppt = &items[1];
         assert_eq!(ppt.identifier(), "/ppt");
