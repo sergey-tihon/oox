@@ -155,11 +155,7 @@ fn apply_export(
             // The temp copy is a read-only snapshot; drop it on return.
             let _ = std::fs::remove_file(&path);
             app.status_message = Some(match result {
-                Ok(()) => format!(
-                    "Returned from {} for {}",
-                    external_command_label(),
-                    path.display()
-                ),
+                Ok(()) => format!("Returned from external viewer for {}", path.display()),
                 Err(error) => format!("Could not open external viewer: {error}"),
             });
         }
@@ -168,43 +164,60 @@ fn apply_export(
 }
 
 /// `$PAGER` first, then `$EDITOR`, then `$VISUAL`: inspecting is the common case,
-/// editing the read-only snapshot the rare one.
-fn external_command() -> Option<(String, Vec<String>)> {
-    let value = ["PAGER", "EDITOR", "VISUAL"].iter().find_map(|name| {
+/// editing the read-only snapshot the rare one. The value is the raw command
+/// string, including any options or quoted arguments.
+fn external_command() -> Option<String> {
+    ["PAGER", "EDITOR", "VISUAL"].iter().find_map(|name| {
         std::env::var(name)
             .ok()
             .filter(|value| !value.trim().is_empty())
-    })?;
-    let mut parts = value.split_whitespace();
-    let program = parts.next()?.to_string();
-    Some((program, parts.map(str::to_string).collect()))
+    })
 }
 
-fn external_command_label() -> String {
-    external_command()
-        .map(|(program, _)| program)
-        .unwrap_or_default()
+/// Run the configured command against `path`, returning its exit status.
+#[cfg(unix)]
+fn run_external(command: &str, path: &Path) -> io::Result<std::process::ExitStatus> {
+    // A shell keeps quoted arguments such as `nvim -c 'set readonly'` intact,
+    // while the part path is passed as a real positional argument ($1) so a path
+    // containing spaces or metacharacters cannot be reinterpreted by the shell.
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{command} \"$1\""))
+        .arg("sh")
+        .arg(path)
+        .status()
+}
+
+/// Fallback for platforms without `sh`: split on whitespace and pass the path
+/// as a separate argument.
+#[cfg(not(unix))]
+fn run_external(command: &str, path: &Path) -> io::Result<std::process::ExitStatus> {
+    let mut parts = command.split_whitespace();
+    let program = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty external command"))?;
+    std::process::Command::new(program)
+        .args(parts)
+        .arg(path)
+        .status()
 }
 
 fn open_external(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
     path: &Path,
 ) -> io::Result<()> {
-    let (program, args) = external_command().ok_or_else(|| {
+    let command = external_command().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "no $PAGER, $EDITOR, or $VISUAL is set",
         )
     })?;
     with_terminal_suspended(terminal, || {
-        let status = std::process::Command::new(&program)
-            .args(&args)
-            .arg(path)
-            .status()?;
+        let status = run_external(&command, path)?;
         if status.success() {
             Ok(())
         } else {
-            Err(io::Error::other(format!("{program} exited with {status}")))
+            Err(io::Error::other(format!("{command} exited with {status}")))
         }
     })
 }
@@ -664,7 +677,7 @@ fn run_app(
 }
 
 #[cfg(test)]
-mod clipboard_tests {
+mod tests {
     use super::{MAX_CLIPBOARD_BYTES, base64_encode, osc52_sequence};
 
     #[test]
@@ -681,5 +694,29 @@ mod clipboard_tests {
     fn oversized_clipboard_content_is_refused() {
         assert!(osc52_sequence(&"a".repeat(MAX_CLIPBOARD_BYTES + 1)).is_err());
         assert_eq!(osc52_sequence("hi").unwrap(), "\x1b]52;c;aGk=\x07");
+    }
+
+    /// The configured command may carry options and quoted arguments; a shell
+    /// must pass them through unchanged while the part path stays a single
+    /// argument.
+    #[cfg(unix)]
+    #[test]
+    fn external_command_preserves_quoted_arguments() {
+        let output =
+            std::env::temp_dir().join(format!("oox-test-external-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&output);
+
+        let status = super::run_external(
+            &format!("printf '<%s>' 'a b' > {}", output.display()),
+            std::path::Path::new("/tmp/part.xml"),
+        )
+        .expect("shell should run");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&output).expect("output should be written"),
+            "<a b></tmp/part.xml>"
+        );
+
+        let _ = std::fs::remove_file(&output);
     }
 }

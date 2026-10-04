@@ -93,6 +93,15 @@ pub struct App {
     pub status_message: Option<String>,
 }
 
+/// A superseded export result is dropped before it reaches the event loop, so
+/// this is the only chance to release resources it already created. Only
+/// `OpenTemp` owns any: a discarded result would otherwise leak its file.
+fn discard_stale_export(outcome: &Result<ExportOutcome, String>) {
+    if let Ok(ExportOutcome::TempFile(path)) = outcome {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn part_kind_label(kind: &PartKind) -> &'static str {
     match kind {
         PartKind::Xml => "XML",
@@ -338,6 +347,7 @@ impl App {
                     outcome,
                 } => {
                     if request_id != self.export_request_id {
+                        discard_stale_export(&outcome);
                         continue;
                     }
                     self.export_pending = false;
@@ -926,14 +936,13 @@ impl App {
             );
         }
         let Some(selected) = self.tree_state.selected().last() else {
-            if self.content_search_active {
-                return format!(
+            let status = if self.content_search_active {
+                format!(
                     "Content search: {}_ | {} matches | Enter finish, Esc cancel",
                     self.content_search_query,
                     self.content_search_matches.len()
-                );
-            }
-            return if self.search_active {
+                )
+            } else if self.search_active {
                 format!(
                     "Search: {}_ | {} matches | Enter select, Esc cancel",
                     self.search_query,
@@ -942,6 +951,7 @@ impl App {
             } else {
                 "No package part selected".to_string()
             };
+            return self.with_status_message(status);
         };
 
         let display_name = selected.trim_start_matches('/');
@@ -975,6 +985,12 @@ impl App {
                 self.search_query
             ));
         }
+        self.with_status_message(status)
+    }
+
+    /// Export feedback has no other visible surface. Appending it last keeps it
+    /// visible even when no tree item is selected.
+    fn with_status_message(&self, mut status: String) -> String {
         if let Some(message) = self.status_message.as_deref() {
             status.push_str(" | ");
             status.push_str(message);
@@ -1842,6 +1858,32 @@ mod tests {
             }
             _ => panic!("expected clipboard text"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn status_message_is_visible_without_a_selection() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        app.tree_state.select(Vec::new());
+        app.status_message = Some("Export failed: boom".to_string());
+        assert!(app.selection_status().contains("Export failed: boom"));
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_temp_export_is_removed() -> io::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "oox-test-stale-{}-{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"part bytes")?;
+
+        super::discard_stale_export(&Ok(crate::worker::ExportOutcome::TempFile(path.clone())));
+        assert!(!path.exists());
         Ok(())
     }
 
