@@ -210,10 +210,11 @@ fn append_comparison_side(text: &mut String, side: &str, index: &PackageIndex, s
     );
 }
 
-fn comparison_relationships(
-    index: &PackageIndex,
-    selected: &str,
-) -> BTreeMap<String, (String, Option<(usize, usize, String)>)> {
+type RelationshipLink = (usize, usize, String);
+type ComparisonRelationshipRow = (String, Option<RelationshipLink>);
+type ComparisonRelationshipRows = BTreeMap<String, ComparisonRelationshipRow>;
+
+fn comparison_relationships(index: &PackageIndex, selected: &str) -> ComparisonRelationshipRows {
     let mut rows = BTreeMap::new();
     for relationship_index in index.outgoing.get(selected).into_iter().flatten() {
         let relationship = &index.relationships[*relationship_index];
@@ -274,7 +275,7 @@ fn append_comparison_relationships(
 
     push_detail_line(text, "");
     push_detail_line(text, "Related parts  [= shared, A/B side-specific]");
-    let mut add_row = |side: &str, (display, link): &(String, Option<(usize, usize, String)>)| {
+    let mut add_row = |side: &str, (display, link): &ComparisonRelationshipRow| {
         let prefix = format!("  [{side}] ");
         let line_number = push_detail_line(text, &format!("{prefix}{display}"));
         if let Some((start, end, target)) = link {
