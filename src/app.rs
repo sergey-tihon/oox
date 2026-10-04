@@ -218,7 +218,10 @@ fn lines_to_text(lines: &Lines) -> String {
 /// changed, `Ok(Some(text))` for a new buffer, `Err` when the file cannot be
 /// used. Changes are detected by content, so a `:q` or a re-save is a no-op.
 fn pick_up_external(written: &str, bytes: &[u8]) -> io::Result<Option<String>> {
-    if bytes.len() > crate::preview::MAX_XML_PREVIEW_BYTES {
+    // The same bound the part was read under, so a text part that could be
+    // previewed can always be taken back. A tighter limit here would hand the
+    // editor a buffer and then silently refuse the unchanged file it returns.
+    if bytes.len() as u64 > crate::package::MAX_ENTRY_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "the edited file is too large",
@@ -227,15 +230,20 @@ fn pick_up_external(written: &str, bytes: &[u8]) -> io::Result<Option<String>> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not valid UTF-8"))?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    // Editors are free to append the newline the file was missing.
-    let trimmed = text
-        .strip_suffix('\n')
-        .map(|text| text.strip_suffix('\r').unwrap_or(text))
-        .unwrap_or(text);
-    if text == written || trimmed == written {
+    // Compare on normalized endings so a Windows round trip is not an edit.
+    let normalized = text.replace("\r\n", "\n");
+    let written_normalized = written.replace("\r\n", "\n");
+    // An editor is allowed to add the final newline the buffer was missing. The
+    // tolerance is one direction only: when the buffer already ended in `\n`, a
+    // second one is a real, added blank line and must be kept.
+    let trailing_tolerance = !written_normalized.ends_with('\n')
+        && normalized
+            .strip_suffix('\n')
+            .is_some_and(|trimmed| trimmed == written_normalized);
+    if normalized == written_normalized || trailing_tolerance {
         return Ok(None);
     }
-    Ok(Some(text.replace("\r\n", "\n")))
+    Ok(Some(normalized))
 }
 
 fn part_kind_label(kind: &PartKind) -> &'static str {
@@ -2299,7 +2307,11 @@ impl App {
             return Ok(());
         }
         let written_here = self.last_saved.as_deref() == Some(Path::new(&target));
-        if target_path.exists() && !written_here && self.save_confirm.as_deref() != Some(&target) {
+        // `exists()` follows symlinks, so a dangling one would slip past the
+        // confirmation and be replaced by the final rename. Any directory entry
+        // at the path, symlink included, has to be asked about.
+        let occupied = std::fs::symlink_metadata(&target_path).is_ok();
+        if occupied && !written_here && self.save_confirm.as_deref() != Some(&target) {
             // The prompt itself renders the confirmation, so no status message.
             self.save_confirm = Some(target.clone());
             return Ok(());
@@ -2922,7 +2934,7 @@ fn create_tree_level(
 mod tests {
     use super::{PendingExport, lines_to_text, pick_up_external};
     use crate::compare::PartStatus;
-    use crate::preview::{MAX_XML_PREVIEW_BYTES, PreviewKind};
+    use crate::preview::PreviewKind;
     use crate::{App, worker::Worker};
     use ratatui_image::picker::Picker;
     use std::{io, path::PathBuf, sync::Arc, time::Duration};
@@ -4075,6 +4087,7 @@ mod tests {
 
     #[test]
     fn external_editor_changes_are_read_by_content() {
+        use crate::package::MAX_ENTRY_BYTES;
         assert_eq!(pick_up_external("a\n", b"a\n").unwrap(), None);
         // An editor that appends the missing final newline is not a change.
         assert_eq!(pick_up_external("a", b"a\n").unwrap(), None);
@@ -4085,8 +4098,23 @@ mod tests {
             Some("a\nb\n".to_string())
         );
         assert_eq!(pick_up_external("a", b"b").unwrap(), Some("b".to_string()));
+        // A blank line added to a buffer that already ended in a newline is an
+        // edit, not the tolerated missing-newline fixup.
+        assert_eq!(
+            pick_up_external("a\n", b"a\n\n").unwrap(),
+            Some("a\n\n".to_string())
+        );
+        assert_eq!(
+            pick_up_external("a\n", b"a\nb\n").unwrap(),
+            Some("a\nb\n".to_string())
+        );
+        // Windows endings in the buffer are normalized before comparing, so an
+        // untouched round trip through a CRLF-normalizing editor is still a no-op.
+        assert_eq!(pick_up_external("a\r\nb", b"a\nb\n").unwrap(), None);
         assert!(pick_up_external("a", b"\xff").is_err());
-        assert!(pick_up_external("a", &vec![b'x'; MAX_XML_PREVIEW_BYTES + 1]).is_err());
+        // The bound matches the preview read limit, so any part that could be
+        // opened can also be taken back.
+        assert!(pick_up_external("a", &vec![b'x'; MAX_ENTRY_BYTES as usize + 1]).is_err());
     }
 
     #[test]
@@ -4485,6 +4513,37 @@ mod tests {
         Ok(())
     }
 
+    /// A save in flight owns `previewed_path`: navigation would move the buffer
+    /// into `edits` and make the reload reselect the wrong part. The event loop
+    /// drops input while `is_saving()`, so this pins the state the guard protects.
+    #[test]
+    fn navigation_would_break_the_reselect_so_input_is_frozen() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+
+        let target = temp_save_path("frozen.pptx");
+        let _ = std::fs::remove_file(&target);
+        app.submit_save(target.clone())?;
+        // The job is still in flight, and this is exactly what the loop checks
+        // before dispatching any event.
+        assert!(app.is_saving());
+
+        // The hazard the guard removes: moving on now would stash the buffer and
+        // clear the path the reload needs to reselect.
+        app.tree_state
+            .select(vec!["/[Content_Types].xml".to_string()]);
+        let _ = app.load_selected_file_content();
+        assert!(
+            app.previewed_path.is_none(),
+            "this is why input must be dropped while saving"
+        );
+
+        pump_until(&mut app, |app| !app.save_pending && !app.loading);
+        assert!(target.exists());
+        std::fs::remove_file(&target)?;
+        Ok(())
+    }
+
     /// A new target must not be written owner-only just because the temporary
     /// file it is built from is.
     #[cfg(unix)]
@@ -4504,6 +4563,43 @@ mod tests {
         assert_eq!(
             written, source,
             "the new file must match the package it came from"
+        );
+
+        std::fs::remove_file(&target)?;
+        Ok(())
+    }
+
+    /// A dangling symlink occupies the path but `exists()` reports false, so it
+    /// would otherwise be replaced without the second confirmation.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_still_asks_before_it_is_replaced() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+
+        let target = temp_save_path("dangling.pptx");
+        let _ = std::fs::remove_file(&target);
+        let missing = temp_save_path("does-not-exist.pptx");
+        let _ = std::fs::remove_file(&missing);
+        std::os::unix::fs::symlink(&missing, &target)?;
+        assert!(!target.exists(), "the symlink must dangle for this test");
+
+        app.save_query = target.to_string_lossy().to_string();
+        app.save_active = true;
+        app.confirm_save()?;
+        assert!(app.save_active, "the prompt must stay open");
+        assert!(
+            !app.save_pending,
+            "nothing may be written before confirming"
+        );
+        assert!(
+            app.selection_status().contains("exists"),
+            "prompt did not ask: {}",
+            app.selection_status()
+        );
+        assert!(
+            std::fs::symlink_metadata(&target)?.file_type().is_symlink(),
+            "the symlink must survive the refused write"
         );
 
         std::fs::remove_file(&target)?;

@@ -216,11 +216,17 @@ fn run_external_edit(
     };
     let path = pending.temp.path().to_path_buf();
     // The snapshot deletes itself when `pending` drops at the end of this scope.
-    let status = with_terminal_suspended(terminal, || run_external(&editor, &path))?;
-    match std::fs::read(&path) {
-        Ok(bytes) => app.apply_external_edit(&pending.written, &bytes, status.success()),
+    // A stale `$VISUAL`/`$EDITOR` must not take the session down with it, so the
+    // failure is reported the same way the external viewer reports it.
+    match with_terminal_suspended(terminal, || run_external(&editor, &path)) {
+        Ok(status) => match std::fs::read(&path) {
+            Ok(bytes) => app.apply_external_edit(&pending.written, &bytes, status.success()),
+            Err(error) => {
+                app.status_message = Some(format!("Could not read the edited part: {error}"));
+            }
+        },
         Err(error) => {
-            app.status_message = Some(format!("Could not read the edited part: {error}"));
+            app.status_message = Some(format!("Could not run the editor: {error}"));
         }
     }
     debug_log(format!("external edit of {requested} finished"));
@@ -387,6 +393,14 @@ fn run_app(
         redraw = true;
         debug_log(format!("event={event:?}"));
 
+        // A save in flight owns `previewed_path` and the buffers: navigation
+        // would move the edit into `edits` and make the reload reselect the
+        // wrong part, and quitting would detach a worker that is still writing.
+        // Poll and redraw above stay live so the result is still delivered.
+        if app.is_saving() {
+            continue;
+        }
+
         if let Event::Mouse(mouse) = &event {
             // Any-motion tracking fires while the pointer merely moves; that is
             // not the user answering a confirmation, so only real gestures disarm.
@@ -423,7 +437,7 @@ fn run_app(
             }
 
             if ui::content_area_contains(terminal_area, app, mouse.column, mouse.row) {
-                if app.is_package_loaded() && !app.is_saving() {
+                if app.is_package_loaded() {
                     app.current_widget = CurrentWidget::TextArea;
                     // edtui only maps a click to the cursor when it lands in the
                     // text area; a border/gutter/status-line click leaves the
@@ -725,7 +739,7 @@ fn run_app(
             }
         }
 
-        if !app.is_package_loaded() || app.is_saving() {
+        if !app.is_package_loaded() {
             continue;
         }
 

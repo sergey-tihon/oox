@@ -270,19 +270,47 @@ fn write_xml_text(writer: &mut Writer<&mut LimitedWriter>, text: &str) -> io::Re
 
 /// Best-effort well-formedness check for an edited part. Returns the first
 /// problem found; a save is never blocked by it.
+///
+/// Beyond tag balance this enforces the document-level rules a preview can
+/// plausibly break: exactly one top-level element and no character data outside
+/// it. Balanced fragments such as `<a/><b/>` are not XML documents, and a save
+/// prompt that claimed they were well formed would be lying.
 pub fn xml_well_formed(xml: &str) -> Result<(), String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
     let mut depth: i64 = 0;
+    let mut roots = 0usize;
     let mut buffer = Vec::new();
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Eof) => break,
-            Ok(Event::Start(_)) => depth += 1,
+            Ok(Event::Start(_)) => {
+                if depth == 0 {
+                    roots += 1;
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(_)) => {
+                if depth == 0 {
+                    roots += 1;
+                }
+            }
             Ok(Event::End(_)) => {
                 depth -= 1;
                 if depth < 0 {
                     return Err("end tag without a matching start tag".to_string());
+                }
+            }
+            Ok(Event::Text(text)) => {
+                // The raw content is what the parser saw; entities stay as-is,
+                // which is all a whitespace check needs.
+                if depth == 0 && !text.trim().is_empty() {
+                    return Err("character data outside the document element".to_string());
+                }
+            }
+            Ok(Event::CData(data)) => {
+                if depth == 0 && !data.trim().is_empty() {
+                    return Err("character data outside the document element".to_string());
                 }
             }
             Ok(_) => {}
@@ -293,7 +321,11 @@ pub fn xml_well_formed(xml: &str) -> Result<(), String> {
     if depth > 0 {
         return Err(format!("{depth} element(s) left open"));
     }
-    Ok(())
+    match roots {
+        0 => Err("the document has no root element".to_string()),
+        1 => Ok(()),
+        count => Err(format!("the document has {count} root elements")),
+    }
 }
 
 fn pretty_print_json(value: &serde_json::Value) -> io::Result<String> {
@@ -464,9 +496,20 @@ mod tests {
     #[test]
     fn well_formedness_check_reports_structural_problems() {
         assert!(xml_well_formed("<a><b/></a>").is_ok());
+        assert!(xml_well_formed("<a>text</a>").is_ok());
+        // A declaration and surrounding whitespace are not root elements.
+        assert!(xml_well_formed("<?xml version=\"1.0\"?>\n<a/>").is_ok());
         assert!(xml_well_formed("<a><b></a>").is_err());
         assert!(xml_well_formed("<a>").is_err());
         assert!(xml_well_formed("</a>").is_err());
+        // Balanced fragments are not documents: XML wants exactly one root.
+        assert!(xml_well_formed("<a/><b/>").is_err());
+        assert!(xml_well_formed("").is_err());
+        assert!(xml_well_formed("   ").is_err());
+        // Character data may not sit outside the document element.
+        assert!(xml_well_formed("text").is_err());
+        assert!(xml_well_formed("<a/>trailing").is_err());
+        assert!(xml_well_formed("<a/>\n  ").is_ok());
     }
 
     #[test]
