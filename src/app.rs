@@ -667,6 +667,9 @@ impl App {
         if !self.index().parts.contains_key(&target) && !self.is_directory(&target) {
             return Ok(false);
         }
+        // An applied filter could hide the destination, so a link that selected
+        // an invisible item would look like it did nothing.
+        self.cancel_any_search();
         self.select_path(&target);
         self.details_scroll = 0;
         self.load_selected_file_content()?;
@@ -697,6 +700,7 @@ impl App {
         if !self.index().parts.contains_key(&target) && !self.is_directory(&target) {
             return Ok(false);
         }
+        self.cancel_any_search();
         self.summary_visible = false;
         self.summary_scroll = 0;
         self.select_path(&target);
@@ -1950,6 +1954,28 @@ mod tests {
         assert!(
             flatten_identifiers(app.visible_tree_items()).contains(&"/ppt/notes.txt".to_string())
         );
+
+        // Activating a link does the same for its destination.
+        app.start_search();
+        for character in "aaa.txt".chars() {
+            app.search_input_char(character);
+        }
+        app.finish_search();
+        app.select_path("/ppt/aaa.txt");
+        let link = app
+            .details_view()
+            .links
+            .iter()
+            .find(|link| link.target == "/ppt/notes.txt")
+            .cloned()
+            .expect("the issue list should link to the other issue part");
+        assert!(app.activate_detail_link(link.line, link.start)?);
+        assert!(!app.tree_filter_active());
+        assert_eq!(selected(&app), "/ppt/notes.txt");
+        assert!(
+            flatten_identifiers(app.visible_tree_items()).contains(&"/ppt/notes.txt".to_string())
+        );
+        preview_loaded(&mut app);
 
         std::fs::remove_file(&path)?;
         Ok(())

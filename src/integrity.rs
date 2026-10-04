@@ -32,7 +32,7 @@ pub fn check(index: &PackageIndex) -> Vec<Diagnostic> {
         issues.push(Diagnostic::error(
             "integrity",
             Some(ROOT_RELS_PART.to_string()),
-            "root relationships declare no officeDocument part",
+            "root relationships point to no valid officeDocument part",
         ));
     }
 
@@ -179,9 +179,11 @@ fn check_orphans(index: &PackageIndex, issues: &mut Vec<Diagnostic>) {
 
 /// OPC reserves bracket-delimited names such as `[Content_Types].xml` and
 /// `[trash]`. They are not relationship targets and the content-type rules do
-/// not apply, so both checks skip them.
+/// not apply, so both checks skip them. A name with an unmatched bracket is an
+/// ordinary part and stays checked.
 fn is_reserved_part(path: &str) -> bool {
-    path.split('/').any(|component| component.starts_with('['))
+    path.split('/')
+        .any(|component| component.starts_with('[') && component.contains(']'))
 }
 
 /// The part a relationship problem belongs to: its source part, or the `.rels`
@@ -400,8 +402,60 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains("no officeDocument part")),
+                .any(|message| message.contains("no valid officeDocument part")),
             "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn fragmented_targets_resolve_to_their_part() {
+        let index = package(&[
+            ("[Content_Types].xml", CONTENT_TYPES),
+            ("_rels/.rels", ROOT_RELS),
+            ("ppt/presentation.xml", "<p/>"),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml#section"/>
+</Relationships>"#,
+            ),
+            ("ppt/slides/slide1.xml", "<s/>"),
+        ]);
+        assert!(index.integrity.is_empty(), "{:?}", messages(&index));
+    }
+
+    #[test]
+    fn nested_root_rels_parts_without_a_source_are_ordinary_parts() {
+        let index = package(&[
+            ("[Content_Types].xml", CONTENT_TYPES),
+            ("_rels/.rels", ROOT_RELS),
+            ("ppt/presentation.xml", "<p/>"),
+            (
+                "foo/_rels/.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#,
+            ),
+        ]);
+        assert_eq!(
+            part_of(&index, "not reachable").as_deref(),
+            Some("/foo/_rels/.rels")
+        );
+    }
+
+    #[test]
+    fn unmatched_brackets_do_not_exempt_a_part() {
+        let index = package(&[
+            ("[Content_Types].xml", CONTENT_TYPES),
+            ("_rels/.rels", ROOT_RELS),
+            ("ppt/presentation.xml", "<p/>"),
+            ("ppt/[draft.txt", "draft"),
+        ]);
+        assert_eq!(
+            part_of(&index, "no content type").as_deref(),
+            Some("/ppt/[draft.txt")
+        );
+        assert_eq!(
+            part_of(&index, "not reachable").as_deref(),
+            Some("/ppt/[draft.txt")
         );
     }
 
