@@ -132,7 +132,12 @@ pub fn compare<R: Read + Seek, S: Read + Seek>(
         comparison.record(path, status);
     }
     for (path, part_a) in &index_a.parts {
-        if part_a.kind == PartKind::Directory || index_b.parts.contains_key(path) {
+        if part_a.kind == PartKind::Directory
+            || index_b
+                .parts
+                .get(path)
+                .is_some_and(|part_b| part_b.kind != PartKind::Directory)
+        {
             continue;
         }
         comparison.record(path, PartStatus::Removed);
@@ -171,10 +176,17 @@ fn part_status<R: Read + Seek, S: Read + Seek>(
             return PartStatus::Changed;
         }
     };
-    if canonical_text(&bytes_a) == canonical_text(&bytes_b) {
-        PartStatus::Unchanged
-    } else {
-        PartStatus::Changed
+    match (canonical_text(&bytes_a), canonical_text(&bytes_b)) {
+        (Ok(text_a), Ok(text_b)) if text_a == text_b => PartStatus::Unchanged,
+        (Err(_), _) | (_, Err(_)) => {
+            comparison.diagnostics.push(Diagnostic::warning(
+                "compare",
+                Some(part_a.path.clone()),
+                "XML exceeds the comparison limit; reporting a difference",
+            ));
+            PartStatus::Changed
+        }
+        _ => PartStatus::Changed,
     }
 }
 
@@ -210,8 +222,16 @@ pub fn diff_part<R: Read + Seek, S: Read + Seek>(
     let bytes_b = part_b
         .map(|part| read(index_b, archive_b, part))
         .transpose()?;
-    let old = bytes_a.as_deref().map(canonical_text).unwrap_or_default();
-    let new = bytes_b.as_deref().map(canonical_text).unwrap_or_default();
+    let old = bytes_a
+        .as_deref()
+        .map(canonical_text)
+        .transpose()?
+        .unwrap_or_default();
+    let new = bytes_b
+        .as_deref()
+        .map(canonical_text)
+        .transpose()?
+        .unwrap_or_default();
     if old == new {
         return Ok(no_differences(path));
     }
@@ -291,8 +311,14 @@ fn unified_diff(old: &str, new: &str, label_a: &str, label_b: &str, path: &str) 
 
 /// Prefer the canonical form; fall back to raw text so a malformed part still
 /// produces a diff instead of an error.
-fn canonical_text(bytes: &[u8]) -> String {
-    canonical_xml(bytes).unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned())
+fn canonical_text(bytes: &[u8]) -> io::Result<String> {
+    match canonical_xml(bytes) {
+        Ok(text) => Ok(text),
+        Err(_) if bytes.len() <= MAX_XML_PREVIEW_BYTES => {
+            Ok(String::from_utf8_lossy(bytes).into_owned())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Canonical, pretty-printed XML used for comparison: attributes sorted by name,
@@ -341,12 +367,12 @@ pub fn canonical_xml(bytes: &[u8]) -> io::Result<String> {
                 output.push_str(event.name().as_ref());
                 output.push_str(">\n");
             }
-            Ok(Event::Text(event)) => pending.push_str(event.as_ref()),
-            Ok(Event::CData(event)) => pending.push_str(event.as_ref()),
+            Ok(Event::Text(event)) => append_pending(&mut pending, event.as_ref())?,
+            Ok(Event::CData(event)) => append_pending(&mut pending, event.as_ref())?,
             Ok(Event::GeneralRef(event)) => {
-                pending.push('&');
-                pending.push_str(event.as_ref());
-                pending.push(';');
+                append_pending(&mut pending, "&")?;
+                append_pending(&mut pending, event.as_ref())?;
+                append_pending(&mut pending, ";")?;
             }
             Ok(Event::Comment(event)) => {
                 flush_text(
@@ -390,7 +416,24 @@ pub fn canonical_xml(bytes: &[u8]) -> io::Result<String> {
         depth,
         preserve_space.last().copied().unwrap_or(false),
     );
+    if output.len() > MAX_XML_PREVIEW_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("canonical XML exceeds {MAX_XML_PREVIEW_BYTES} byte limit"),
+        ));
+    }
     Ok(output)
+}
+
+fn append_pending(pending: &mut String, text: &str) -> io::Result<()> {
+    if pending.len().saturating_add(text.len()) > MAX_XML_PREVIEW_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("canonical XML text exceeds {MAX_XML_PREVIEW_BYTES} byte limit"),
+        ));
+    }
+    pending.push_str(text);
+    Ok(())
 }
 
 fn xml_space_preserved(event: &BytesStart<'_>, inherited: bool) -> bool {
@@ -428,7 +471,7 @@ fn write_tag(output: &mut String, depth: usize, event: &BytesStart<'_>, empty: b
         output.push(' ');
         output.push_str(&key);
         output.push_str("=\"");
-        output.push_str(&value);
+        output.push_str(&value.replace('"', "&quot;"));
         output.push('"');
     }
     output.push_str(if empty { "/>\n" } else { ">\n" });
@@ -499,6 +542,43 @@ impl fmt::Write for BoundedText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Write as _};
+
+    fn test_archive(
+        entries: &[(&str, Option<&[u8]>)],
+    ) -> io::Result<zip::ZipArchive<Cursor<Vec<u8>>>> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, content) in entries {
+            let options = zip::write::SimpleFileOptions::default();
+            if let Some(content) = content {
+                writer
+                    .start_file(*name, options)
+                    .map_err(io::Error::other)?;
+                writer.write_all(content)?;
+            } else {
+                writer
+                    .add_directory(*name, options)
+                    .map_err(io::Error::other)?;
+            }
+        }
+        zip::ZipArchive::new(writer.finish().map_err(io::Error::other)?).map_err(io::Error::other)
+    }
+
+    #[test]
+    fn file_replaced_by_directory_is_reported_as_removed() -> io::Result<()> {
+        let mut archive_a = test_archive(&[("foo", Some(b"old"))])?;
+        let mut archive_b = test_archive(&[("foo/", None), ("foo/child.xml", Some(b"<child/>"))])?;
+        let index_a = PackageIndex::from_archive(&mut archive_a)?;
+        let index_b = PackageIndex::from_archive(&mut archive_b)?;
+
+        let comparison = compare(&index_a, &mut archive_a, &index_b, &mut archive_b);
+        assert_eq!(comparison.status_of("/foo"), Some(PartStatus::Removed));
+        assert_eq!(
+            comparison.status_of("/foo/child.xml"),
+            Some(PartStatus::Added)
+        );
+        Ok(())
+    }
 
     #[test]
     fn canonical_xml_ignores_attribute_order_and_formatting_whitespace() {
@@ -514,6 +594,24 @@ mod tests {
             a,
             "<root a=\"1\" b=\"2\">\n  <item>\n    hi there\n  </item>\n</root>\n"
         );
+    }
+
+    #[test]
+    fn canonical_xml_escapes_attribute_quotes_when_changing_delimiters() {
+        let quoted = canonical_xml(br#"<root a='x" y="z'/>"#).unwrap();
+        let separate = canonical_xml(br#"<root a="x" y="z"/>"#).unwrap();
+        assert!(quoted.contains("&quot;"));
+        assert_ne!(quoted, separate);
+    }
+
+    #[test]
+    fn oversized_xml_is_rejected_instead_of_falling_back_to_raw_text() {
+        let mut xml = Vec::with_capacity(MAX_XML_PREVIEW_BYTES + 16);
+        xml.extend_from_slice(b"<root>");
+        xml.resize(MAX_XML_PREVIEW_BYTES + 8, b'x');
+        xml.extend_from_slice(b"</root>");
+        assert!(canonical_xml(&xml).is_err());
+        assert!(canonical_text(&xml).is_err());
     }
 
     #[test]
