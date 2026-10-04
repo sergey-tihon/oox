@@ -26,6 +26,9 @@ const MAX_CONTENT_SEARCH_QUERY_CHARS: usize = 256;
 const MAX_EXPORT_PATH_CHARS: usize = 1024;
 /// Integrity issues rendered in the metadata panel; the rest are summarized.
 const MAX_INTEGRITY_LINES: usize = 50;
+/// Rows scanned in each direction when locating the start tag around the editor
+/// cursor. A start tag split across more rows than this is not worth following.
+const MAX_TAG_ROWS: usize = 64;
 
 /// Work an export produced that only the event loop can finish: running a
 /// command needs the terminal, and OSC 52 needs the backend's writer.
@@ -145,6 +148,71 @@ fn push_detail_line(text: &mut String, line: &str) -> usize {
     text.push_str(line);
     text.push('\n');
     line_number
+}
+
+/// The start tag enclosing `(row, column)` exactly as the preview renders it,
+/// plus the cursor's offset within it. A start tag can span several preview rows:
+/// `pretty_print_xml` forwards the raw tag bytes, and XML allows a newline
+/// between an attribute name, `=`, and its value.
+///
+/// A `>` inside an earlier attribute value ends the tag early, so a reference
+/// after it is not followed; OOXML relationship attributes never contain one.
+fn enclosing_start_tag(lines: &Lines, row: usize, column: usize) -> Option<(Vec<char>, usize)> {
+    let row_chars = |index: usize| lines.get(RowIndex::new(index));
+    // A start tag holds no raw `<`, so scanning back from the cursor reaches its
+    // opening `<` before any earlier tag's `>`. Reaching a `>` first means the
+    // cursor is in element text, not in an attribute.
+    let mut open = None;
+    for index in (row.saturating_sub(MAX_TAG_ROWS)..=row).rev() {
+        let Some(chars) = row_chars(index) else {
+            break;
+        };
+        let end = if index == row {
+            (column + 1).min(chars.len())
+        } else {
+            chars.len()
+        };
+        for position in (0..end).rev() {
+            match chars[position] {
+                '<' => open = Some((index, position)),
+                '>' => return None,
+                _ => continue,
+            }
+            break;
+        }
+        if open.is_some() {
+            break;
+        }
+    }
+    let (open_row, open_column) = open?;
+
+    // Collect the tag up to the `>` that closes it, remembering where the cursor
+    // falls inside it.
+    let mut tag = Vec::new();
+    let mut cursor_offset = None;
+    'tag: for index in open_row..=open_row.saturating_add(MAX_TAG_ROWS) {
+        let Some(chars) = row_chars(index) else {
+            break;
+        };
+        let from = if index == open_row { open_column } else { 0 };
+        let end = chars[from..]
+            .iter()
+            .position(|character| *character == '>')
+            .map_or(chars.len(), |at| from + at);
+        if index == row && column <= end {
+            cursor_offset = Some(tag.len() + column.saturating_sub(from));
+        }
+        tag.extend_from_slice(&chars[from..end]);
+        if end < chars.len() {
+            break 'tag;
+        }
+    }
+
+    // Comments, CDATA sections, and processing instructions hold no attributes.
+    if tag.starts_with(&['<', '!']) || tag.starts_with(&['<', '?']) {
+        return None;
+    }
+    Some((tag, cursor_offset?))
 }
 
 impl App {
@@ -726,8 +794,8 @@ impl App {
     }
 
     /// The relationship referenced by the token under the editor cursor. Only an
-    /// XML preview can reference relationships, and only an `r:*` attribute
-    /// value is treated as a reference.
+    /// XML preview can reference relationships, and only an `r:*` attribute value
+    /// inside the enclosing start tag is treated as a reference.
     fn relationship_at_cursor(&self) -> Option<Relationship> {
         if self.preview_kind != PreviewKind::Xml {
             return None;
@@ -735,11 +803,11 @@ impl App {
         let previewed = self.previewed_path.as_deref()?;
         let index = self.index();
         let relationships = index.outgoing.get(previewed)?;
-        let chars = self
-            .editor_state
-            .lines
-            .get(RowIndex::new(self.editor_state.cursor.row))?;
-        let column = self.editor_state.cursor.col;
+        let (chars, column) = enclosing_start_tag(
+            &self.editor_state.lines,
+            self.editor_state.cursor.row,
+            self.editor_state.cursor.col,
+        )?;
         let is_name_char = |character: char| {
             matches!(
                 character,
@@ -1969,7 +2037,7 @@ mod tests {
             ("ppt/presentation.xml", "<p:presentation/>"),
             (
                 "ppt/slides/slide1.xml",
-                r#"<p:sld xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><a:blip r:embed='rId10'/><a:blip r:id = "rId11"/><a:blip r:link="rId12"/><a:blip r:id="rId13"/></p:sld>"#,
+                "<p:sld xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><a:blip r:embed='rId10'/><a:blip\n    r:id\n    =\n    \"rId11\"/><a:blip r:link=\"rId12\"/><a:blip r:id=\"rId13\"/><a:t>see r:id=\"rId10\" here</a:t></p:sld>",
             ),
             (
                 "ppt/slides/_rels/slide1.xml.rels",
@@ -1993,10 +2061,11 @@ mod tests {
         Ok(path)
     }
 
-    /// XML permits single-quoted attribute values and whitespace around `=`.
-    /// Both forms stay visible in the pretty-printed preview, so both must be
-    /// followed; a directory or missing target is reported instead of
-    /// navigating away from the reference.
+    /// XML permits single-quoted attribute values and whitespace around `=`, and
+    /// a start tag may span several preview rows because `pretty_print_xml`
+    /// forwards the raw tag bytes. All of those forms stay visible in the preview
+    /// and must be followed, while the same text in element content must not be.
+    /// A directory or missing target is reported instead of navigating away.
     #[test]
     fn relationship_reference_lexical_variants_and_unusable_targets() -> io::Result<()> {
         let path = write_reference_package("follow-variants.pptx")?;
@@ -2007,12 +2076,22 @@ mod tests {
         preview_loaded(&mut app);
         assert_eq!(app.preview_kind, PreviewKind::Xml);
 
-        // Single quotes, then whitespace around `=`.
+        // Single quotes.
         assert!(put_cursor_on(&mut app, "r:embed='rId10'"));
         assert!(app.follow_relationship_at_cursor()?);
         preview_loaded(&mut app);
         assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide2.xml"));
         assert_eq!(app.preview_kind, PreviewKind::Xml);
+
+        assert!(app.navigate_back()?);
+        preview_loaded(&mut app);
+
+        // An attribute whose name, `=`, and value sit on three separate preview
+        // rows is followed from the name row and from the value row.
+        assert!(put_cursor_on(&mut app, "r:id"));
+        assert!(app.follow_relationship_at_cursor()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide3.xml"));
 
         assert!(app.navigate_back()?);
         preview_loaded(&mut app);
@@ -2044,6 +2123,14 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("missing.xml"))
         );
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide1.xml"));
+
+        // `<a:t>see r:id="rId10" here</a:t>` only looks like an attribute: it is
+        // element content, so the cursor there follows nothing.
+        app.status_message = None;
+        assert!(put_cursor_on(&mut app, "r:id=\"rId10\""));
+        assert!(!app.follow_relationship_at_cursor()?);
+        assert!(app.status_message.is_none());
         assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide1.xml"));
 
         std::fs::remove_file(&path)?;
