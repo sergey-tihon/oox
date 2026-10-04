@@ -57,7 +57,7 @@ fn has_office_document(index: &PackageIndex) -> bool {
 
 /// A relationship target must be a packaged part. Explicit ZIP directory
 /// entries live in `parts` too, but resolving to one is still dangling.
-fn is_part(index: &PackageIndex, path: &str) -> bool {
+pub(crate) fn is_part(index: &PackageIndex, path: &str) -> bool {
     index
         .parts
         .get(path)

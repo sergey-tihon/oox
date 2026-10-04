@@ -707,8 +707,14 @@ impl App {
             self.status_message = Some(format!("Relationship {} has no target", relationship.id));
             return Ok(true);
         };
-        if !self.index().parts.contains_key(&target) && !self.is_directory(&target) {
-            self.status_message = Some(format!("Relationship target is missing: {target}"));
+        // A relationship target must be a packaged part, so a directory or a path
+        // that is not in the package explains itself instead of moving the
+        // selection to an empty preview.
+        if !crate::integrity::is_part(self.index(), &target) {
+            self.status_message = Some(format!(
+                "Relationship {} target is not a part: {target}",
+                relationship.id
+            ));
             return Ok(true);
         }
         // An applied filter could hide the destination, which would make the
@@ -720,8 +726,8 @@ impl App {
     }
 
     /// The relationship referenced by the token under the editor cursor. Only an
-    /// XML preview can reference relationships, and only `r:*` attribute values
-    /// are treated as references.
+    /// XML preview can reference relationships, and only an `r:*` attribute
+    /// value is treated as a reference.
     fn relationship_at_cursor(&self) -> Option<Relationship> {
         if self.preview_kind != PreviewKind::Xml {
             return None;
@@ -734,37 +740,58 @@ impl App {
             .lines
             .get(RowIndex::new(self.editor_state.cursor.row))?;
         let column = self.editor_state.cursor.col;
+        let is_name_char = |character: char| {
+            matches!(
+                character,
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | ':' | '.' | '-'
+            )
+        };
 
         for relationship_index in relationships {
             let relationship = &index.relationships[*relationship_index];
             if relationship.id.is_empty() {
                 continue;
             }
-            let needle: Vec<char> = format!("\"{}\"", relationship.id).chars().collect();
-            let width = needle.len();
-            for value_quote in 0..chars.len().saturating_sub(width - 1) {
-                // `="value"` rules out the same text in element content.
-                if value_quote == 0 || chars[value_quote - 1] != '=' {
+            let id: Vec<char> = relationship.id.chars().collect();
+            let width = id.len();
+            for start in 0..chars.len().saturating_sub(width - 1) {
+                if chars[start..start + width] != id[..] {
                     continue;
                 }
-                if chars[value_quote..value_quote + width] != needle[..] {
+                // The value must be a quoted attribute value. Both quote styles
+                // XML allows reach the preview, which forwards the raw start tag
+                // instead of normalizing it.
+                let Some(quote_index) = start.checked_sub(1) else {
+                    continue;
+                };
+                let quote = chars[quote_index];
+                if quote != '"' && quote != '\'' {
                     continue;
                 }
-                // The token spans the attribute name too, so the cursor on
+                if chars.get(start + width) != Some(&quote) {
+                    continue;
+                }
+                // XML permits whitespace around `=`.
+                let mut quote_start = quote_index;
+                while quote_start > 0 && chars[quote_start - 1].is_ascii_whitespace() {
+                    quote_start -= 1;
+                }
+                if quote_start == 0 || chars[quote_start - 1] != '=' {
+                    continue;
+                }
+                // The token spans the `r:*` attribute name too, so the cursor on
                 // either side of `=` follows the reference.
-                let mut token_start = value_quote - 1;
-                while token_start > 0
-                    && matches!(
-                        chars[token_start - 1],
-                        'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | ':' | '.' | '-'
-                    )
-                {
+                let mut token_start = quote_start - 1;
+                while token_start > 0 && chars[token_start - 1].is_ascii_whitespace() {
+                    token_start -= 1;
+                }
+                while token_start > 0 && is_name_char(chars[token_start - 1]) {
                     token_start -= 1;
                 }
                 if chars[token_start] != 'r' || chars.get(token_start + 1) != Some(&':') {
                     continue;
                 }
-                if column >= token_start && column < value_quote + width {
+                if column >= token_start && column < start + width + 1 {
                     return Some(relationship.clone());
                 }
             }
@@ -1913,6 +1940,113 @@ mod tests {
         assert!(app.follow_relationship_at_cursor()?);
         preview_loaded(&mut app);
         assert_eq!(selected(&app).as_deref(), Some("/ppt/media/image1.gif"));
+        Ok(())
+    }
+
+    /// A package whose slide references two navigable parts and two unusable
+    /// targets through `r:*` attributes written in the lexical forms XML permits
+    /// (`pretty_print_xml` forwards the raw start tag, so these reach the
+    /// preview unchanged).
+    fn write_reference_package(name: &str) -> io::Result<std::path::PathBuf> {
+        use std::io::Write as _;
+
+        let path = std::env::temp_dir().join(format!("oox-test-{}-{name}", std::process::id()));
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&path)?);
+        let entries = [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+</Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>"#,
+            ),
+            ("ppt/presentation.xml", "<p:presentation/>"),
+            (
+                "ppt/slides/slide1.xml",
+                r#"<p:sld xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><a:blip r:embed='rId10'/><a:blip r:id = "rId11"/><a:blip r:link="rId12"/><a:blip r:id="rId13"/></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId10" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slide2.xml"/>
+  <Relationship Id="rId11" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slide3.xml"/>
+  <Relationship Id="rId12" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target=".."/>
+  <Relationship Id="rId13" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="missing.xml"/>
+</Relationships>"#,
+            ),
+            ("ppt/slides/slide2.xml", "<p:sld/>"),
+            ("ppt/slides/slide3.xml", "<p:sld/>"),
+        ];
+        for (entry, content) in entries {
+            writer
+                .start_file(entry, zip::write::SimpleFileOptions::default())
+                .map_err(io::Error::other)?;
+            writer.write_all(content.as_bytes())?;
+        }
+        writer.finish().map_err(io::Error::other)?;
+        Ok(path)
+    }
+
+    /// XML permits single-quoted attribute values and whitespace around `=`.
+    /// Both forms stay visible in the pretty-printed preview, so both must be
+    /// followed; a directory or missing target is reported instead of
+    /// navigating away from the reference.
+    #[test]
+    fn relationship_reference_lexical_variants_and_unusable_targets() -> io::Result<()> {
+        let path = write_reference_package("follow-variants.pptx")?;
+        let mut app = test_app(&path.to_string_lossy())?;
+        let selected = |app: &App| app.tree_state.selected().last().cloned();
+        app.select_path("/ppt/slides/slide1.xml");
+        app.load_selected_file_content()?;
+        preview_loaded(&mut app);
+        assert_eq!(app.preview_kind, PreviewKind::Xml);
+
+        // Single quotes, then whitespace around `=`.
+        assert!(put_cursor_on(&mut app, "r:embed='rId10'"));
+        assert!(app.follow_relationship_at_cursor()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide2.xml"));
+        assert_eq!(app.preview_kind, PreviewKind::Xml);
+
+        assert!(app.navigate_back()?);
+        preview_loaded(&mut app);
+        assert!(put_cursor_on(&mut app, "rId11"));
+        assert!(app.follow_relationship_at_cursor()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide3.xml"));
+
+        assert!(app.navigate_back()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide1.xml"));
+
+        // `Target=".."` resolves to `/ppt`, a directory that holds parts; it is
+        // still not a navigable part, so nothing moves and the status explains it.
+        assert!(put_cursor_on(&mut app, "rId12"));
+        assert!(app.follow_relationship_at_cursor()?);
+        assert!(
+            app.status_message.as_deref().is_some_and(
+                |message| message.contains("/ppt") && message.contains("is not a part")
+            )
+        );
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide1.xml"));
+        assert_eq!(app.preview_kind, PreviewKind::Xml);
+
+        assert!(put_cursor_on(&mut app, "rId13"));
+        assert!(app.follow_relationship_at_cursor()?);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("missing.xml"))
+        );
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide1.xml"));
+
+        std::fs::remove_file(&path)?;
         Ok(())
     }
 
