@@ -47,6 +47,11 @@ cargo install --path .
 # Inspect a specific OOXML file
 oox path/to/document.pptx
 
+# Compare two packages part by part
+# The tree marks parts as added (`+`), removed (`-`), or changed (`~`); the
+# content pane shows a unified diff of normalized XML for the selected part.
+oox before.docx after.docx
+
 # Inspect the bundled sample file from a source checkout
 cargo run -- data/sample.pptx
 

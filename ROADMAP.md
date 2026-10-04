@@ -26,6 +26,7 @@
 - Live visual tree filtering: non-matching paths are hidden while typing a search query, the selection follows the first match, Enter keeps the filter for n/N cycling, and Esc restores the full tree and its pre-search open/closed state.
 - Background content search: `Ctrl-f` performs bounded grep-style searches across package parts, filters the tree to matching parts, and supports n/N navigation.
 - Inline relationship references: `Ctrl-g` (or a click in the content pane) follows the `r:id`/`r:embed` token under the editor cursor to the referenced part, reports external targets in the status bar, and records the jump in the navigation history.
+- Two-package comparison (`oox a.docx b.docx`): the tree marks parts as added/removed/changed, directories advertise differing descendants, and the content pane shows a unified diff of normalized XML that ignores attribute-order and whitespace-only differences.
 
 ## Most important remaining features
 
@@ -49,6 +50,7 @@ This should not be added to the current package-inspection code. It needs indepe
 - **Multiple documents/tabs:** inspect more than one package without restarting the application.
 - **Directory aggregates:** show child counts, total uncompressed size, and part-kind breakdown for directories in the metadata panel.
 - **Reload:** re-open the package on demand (`R`) or when the file changes on disk.
+- **Watch the compared file:** re-index and re-diff automatically when the open package changes on disk, marking parts against the previously loaded version (follow-up to two-package comparison).
 - **Image zoom/pan:** toggle fit-to-pane versus actual size for image previews.
 
 ### Priority 3 — Richer document summaries

@@ -1,17 +1,22 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io,
     path::PathBuf,
     sync::{Arc, OnceLock},
 };
 
 use edtui::{EditorState, Lines, RowIndex};
+use ratatui::{
+    style::{Color, Style},
+    text::{Line, Span},
+};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use tui_tree_widget::{TreeItem, TreeState};
 
+use crate::compare::{Comparison, PartStatus};
 use crate::package::{
-    DiagnosticSeverity, Package, PackageIndex, PartInfo, PartKind, Relationship, TargetMode,
-    is_image_name, is_xml_name,
+    Diagnostic, DiagnosticSeverity, Package, PackageIndex, PartInfo, PartKind, Relationship,
+    TargetMode, is_image_name, is_xml_name,
 };
 use crate::preview::{Preview, PreviewKind};
 use crate::summary::{DetailLink, DetailsView};
@@ -45,6 +50,13 @@ pub enum CurrentWidget {
     TextArea,
 }
 
+/// A second package opened alongside the primary one, with the part-level
+/// comparison computed by the worker.
+pub struct Compare {
+    pub package: Package,
+    pub comparison: Comparison,
+}
+
 pub struct App {
     pub file_path: String,
     pub tree_state: TreeState<String>,
@@ -73,6 +85,13 @@ pub struct App {
     details_generation: u64,
     pub document_summary: Option<DetailsView>,
     package: Option<Package>,
+    /// Compare mode: the second package and its per-part status, once loaded.
+    pub compare: Option<Compare>,
+    /// Whether comparison mode hides parts that are unchanged.
+    pub hide_unchanged_parts: bool,
+    /// Second file from the command line; kept for the header before the
+    /// comparison finishes loading.
+    pub compare_path: Option<PathBuf>,
     worker: Worker,
     open_request_id: u64,
     preview_request_id: u64,
@@ -148,6 +167,224 @@ fn push_detail_line(text: &mut String, line: &str) -> usize {
     text.push_str(line);
     text.push('\n');
     line_number
+}
+
+fn append_package_diagnostics(
+    text: &mut String,
+    links: &mut Vec<DetailLink>,
+    index: &PackageIndex,
+    side: Option<&str>,
+) {
+    if !index.warnings.is_empty() {
+        push_detail_line(text, "");
+        push_detail_line(
+            text,
+            &side.map_or_else(|| "Warnings".to_string(), |side| format!("{side} warnings")),
+        );
+        for warning in &index.warnings {
+            push_detail_line(text, &format!("- {}", compact_text(warning, 56)));
+        }
+    }
+
+    if !index.integrity.is_empty() {
+        push_detail_line(text, "");
+        let prefix = side.map_or_else(String::new, |side| format!("{side} "));
+        let jump = if side.is_none() || side == Some("A") {
+            "  [i/I jump]"
+        } else {
+            ""
+        };
+        push_detail_line(
+            text,
+            &format!("{prefix}Integrity issues ({}){jump}", index.integrity.len()),
+        );
+        for issue in index.integrity.iter().take(MAX_INTEGRITY_LINES) {
+            let severity = match issue.severity {
+                DiagnosticSeverity::Error => "error",
+                DiagnosticSeverity::Warning => "warn",
+            };
+            let prefix = format!("  [{severity}] ");
+            let message = compact_text(&issue.message, 64);
+            let line_number = push_detail_line(text, &format!("{prefix}{message}"));
+            if let Some(part) = issue.part.as_deref() {
+                let start = prefix.chars().count();
+                links.push(DetailLink {
+                    line: line_number,
+                    start,
+                    end: start + message.chars().count(),
+                    target: part.to_string(),
+                });
+            }
+        }
+        if index.integrity.len() > MAX_INTEGRITY_LINES {
+            push_detail_line(
+                text,
+                &format!("  … {} more", index.integrity.len() - MAX_INTEGRITY_LINES),
+            );
+        }
+    }
+}
+
+fn append_comparison_diagnostics(text: &mut String, comparison: &Comparison, selected: &str) {
+    let diagnostics: Vec<&Diagnostic> = comparison
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .part
+                .as_deref()
+                .is_none_or(|path| path == selected)
+        })
+        .collect();
+    if diagnostics.is_empty() {
+        return;
+    }
+    push_detail_line(text, "");
+    push_detail_line(text, "Comparison diagnostics");
+    for diagnostic in diagnostics {
+        let severity = match diagnostic.severity {
+            DiagnosticSeverity::Error => "error",
+            DiagnosticSeverity::Warning => "warn",
+        };
+        push_detail_line(
+            text,
+            &format!(
+                "- [{severity}] {}: {}",
+                diagnostic.stage,
+                compact_text(&diagnostic.message, 56)
+            ),
+        );
+    }
+}
+
+fn append_comparison_side(text: &mut String, side: &str, index: &PackageIndex, selected: &str) {
+    let package_name = index
+        .source
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("Package {side}"));
+    push_detail_line(text, &format!("{side} — {package_name}"));
+
+    let Some(part) = index.parts.get(selected) else {
+        if index.is_directory(selected) {
+            push_detail_line(text, "  Kind: Directory");
+            return;
+        }
+        push_detail_line(text, "  Part: Absent");
+        return;
+    };
+
+    push_detail_line(text, &format!("  Kind: {}", part_kind_label(&part.kind)));
+    push_detail_line(
+        text,
+        &format!(
+            "  Content type: {}",
+            part.content_type.as_deref().unwrap_or("Unknown")
+        ),
+    );
+    push_detail_line(
+        text,
+        &format!(
+            "  Size: {} bytes ({} compressed)",
+            part.size, part.compressed_size
+        ),
+    );
+    let outgoing = index.outgoing.get(selected).map_or(0, Vec::len);
+    let incoming = index.incoming.get(selected).map_or(0, Vec::len);
+    push_detail_line(
+        text,
+        &format!("  Relationships: {outgoing} out, {incoming} in"),
+    );
+}
+
+type RelationshipLink = (usize, usize, String);
+type ComparisonRelationshipRow = (String, Option<RelationshipLink>);
+type ComparisonRelationshipRows = BTreeMap<String, ComparisonRelationshipRow>;
+
+fn comparison_relationships(index: &PackageIndex, selected: &str) -> ComparisonRelationshipRows {
+    let mut rows = BTreeMap::new();
+    for relationship_index in index.outgoing.get(selected).into_iter().flatten() {
+        let relationship = &index.relationships[*relationship_index];
+        let target = compact_text(&relationship_target_label(relationship), 48);
+        let relationship_type = relationship_type_label(relationship);
+        let display = format!("OUT {}  {target} ({relationship_type})", relationship.id);
+        let start = 4 + relationship.id.chars().count() + 2;
+        let link = relationship
+            .resolved_target
+            .as_ref()
+            .map(|target_path| (start, start + target.chars().count(), target_path.clone()));
+        let key = format!(
+            "out\0{}\0{}\0{}\0{}\0{:?}",
+            relationship.id,
+            relationship.source,
+            relationship.target,
+            relationship.relationship_type,
+            relationship.target_mode
+        );
+        rows.insert(key, (display, link));
+    }
+    for relationship_index in index.incoming.get(selected).into_iter().flatten() {
+        let relationship = &index.relationships[*relationship_index];
+        let source = compact_text(&relationship.source, 48);
+        let relationship_type = relationship_type_label(relationship);
+        let display = format!("IN {}  {source} ({relationship_type})", relationship.id);
+        let start = 3 + relationship.id.chars().count() + 2;
+        let link = Some((
+            start,
+            start + source.chars().count(),
+            relationship.source.clone(),
+        ));
+        let key = format!(
+            "in\0{}\0{}\0{}\0{}\0{:?}",
+            relationship.id,
+            relationship.source,
+            relationship.target,
+            relationship.relationship_type,
+            relationship.target_mode
+        );
+        rows.insert(key, (display, link));
+    }
+    rows
+}
+
+fn append_comparison_relationships(
+    text: &mut String,
+    links: &mut Vec<DetailLink>,
+    index_a: &PackageIndex,
+    index_b: &PackageIndex,
+    selected: &str,
+) {
+    let rows_a = comparison_relationships(index_a, selected);
+    let rows_b = comparison_relationships(index_b, selected);
+    if rows_a.is_empty() && rows_b.is_empty() {
+        return;
+    }
+
+    push_detail_line(text, "");
+    push_detail_line(text, "Related parts  [= shared, A/B side-specific]");
+    let mut add_row = |side: &str, (display, link): &ComparisonRelationshipRow| {
+        let prefix = format!("  [{side}] ");
+        let line_number = push_detail_line(text, &format!("{prefix}{display}"));
+        if let Some((start, end, target)) = link {
+            let prefix_len = prefix.chars().count();
+            links.push(DetailLink {
+                line: line_number,
+                start: prefix_len + start,
+                end: prefix_len + end,
+                target: target.clone(),
+            });
+        }
+    };
+
+    for (key, row) in &rows_a {
+        add_row(if rows_b.contains_key(key) { "=" } else { "A" }, row);
+    }
+    for (key, row) in &rows_b {
+        if !rows_a.contains_key(key) {
+            add_row("B", row);
+        }
+    }
 }
 
 /// Whether `character` is the `>` that ends a start tag, tracking whether a quoted
@@ -233,9 +470,15 @@ fn enclosing_start_tag(lines: &Lines, row: usize, column: usize) -> Option<(Vec<
 
 impl App {
     /// Construct an interactive loading state without opening the archive on the UI thread.
-    pub fn new_loading(path: String, picker: Picker, worker: Worker) -> io::Result<Self> {
+    pub fn new_loading(
+        path: String,
+        compare_path: Option<PathBuf>,
+        picker: Picker,
+        worker: Worker,
+    ) -> io::Result<Self> {
         let app = Self {
             file_path: path.clone(),
+            compare_path: compare_path.clone(),
             tree_state: TreeState::default(),
             tree_items: Vec::new(),
             filtered_tree_items: None,
@@ -255,6 +498,8 @@ impl App {
             details_generation: 0,
             document_summary: None,
             package: None,
+            compare: None,
+            hide_unchanged_parts: false,
             worker,
             open_request_id: 1,
             preview_request_id: 0,
@@ -284,9 +529,16 @@ impl App {
             pending_export: None,
             status_message: None,
         };
-        app.worker.submit(Job::Open {
-            request_id: app.open_request_id,
-            path: PathBuf::from(&app.file_path),
+        app.worker.submit(match app.compare_path.clone() {
+            Some(compare_path) => Job::Compare {
+                request_id: app.open_request_id,
+                path: PathBuf::from(&app.file_path),
+                compare_path,
+            },
+            None => Job::Open {
+                request_id: app.open_request_id,
+                path: PathBuf::from(&app.file_path),
+            },
         })?;
         Ok(app)
     }
@@ -332,26 +584,31 @@ impl App {
                         continue;
                     }
                     match *package {
-                        Ok(package) => {
-                            self.package = Some(package);
-                            self.details_generation = self.details_generation.wrapping_add(1);
-                            self.editor_state = EditorState::default();
-                            self.image_state = None;
-                            self.preview_kind = PreviewKind::Empty;
-                            self.previewed_path = None;
-                            self.install_tree();
-                            self.document_summary = summary.view;
-                            self.loading = false;
-                            self.content_message = Some(
-                                "Select a package part or press Enter to preview content"
-                                    .to_string(),
-                            );
+                        Ok(package) => self.install_loaded(package, summary.view, None),
+                        Err(error) => self.fail_load(error),
+                    }
+                }
+                ResultMessage::Compared {
+                    request_id,
+                    path,
+                    compare_path,
+                    result,
+                } => {
+                    if request_id != self.open_request_id
+                        || path.to_string_lossy() != self.file_path
+                    {
+                        continue;
+                    }
+                    self.compare_path = Some(compare_path);
+                    match *result {
+                        Ok(payload) => {
+                            let compare = Compare {
+                                package: payload.b,
+                                comparison: payload.comparison,
+                            };
+                            self.install_loaded(payload.a, payload.summary.view, Some(compare));
                         }
-                        Err(error) => {
-                            self.loading = false;
-                            self.worker_error = Some(error.clone());
-                            self.content_message = Some(format!("Could not open package: {error}"));
-                        }
+                        Err(error) => self.fail_load(error),
                     }
                 }
                 ResultMessage::PartRead {
@@ -474,6 +731,41 @@ impl App {
         changed
     }
 
+    /// Install a freshly opened package (optionally with a comparison) and
+    /// reset every view that referred to the previous one.
+    fn install_loaded(
+        &mut self,
+        package: Package,
+        summary: Option<DetailsView>,
+        compare: Option<Compare>,
+    ) {
+        self.package = Some(package);
+        self.hide_unchanged_parts = compare.is_some();
+        self.compare = compare;
+        self.details_generation = self.details_generation.wrapping_add(1);
+        self.editor_state = EditorState::default();
+        self.image_state = None;
+        self.preview_kind = PreviewKind::Empty;
+        self.previewed_path = None;
+        self.install_tree();
+        if self.compare.is_some() {
+            self.expand_all();
+        }
+        self.document_summary = summary;
+        self.loading = false;
+        self.content_message = Some(if self.compare.is_some() {
+            "Comparing packages: select a part to see its diff".to_string()
+        } else {
+            "Select a package part or press Enter to preview content".to_string()
+        });
+    }
+
+    fn fail_load(&mut self, error: String) {
+        self.loading = false;
+        self.worker_error = Some(error.clone());
+        self.content_message = Some(format!("Could not open package: {error}"));
+    }
+
     pub fn is_package_loaded(&self) -> bool {
         !self.loading && self.package.is_some()
     }
@@ -532,6 +824,36 @@ impl App {
         }
     }
 
+    pub fn toggle_unchanged_parts(&mut self) -> io::Result<()> {
+        if self.compare.is_none() {
+            self.status_message =
+                Some("Unchanged filtering is only available in compare mode".into());
+            return Ok(());
+        }
+        self.cancel_any_search();
+        let selected = self.tree_state.selected().last().cloned();
+        self.hide_unchanged_parts = !self.hide_unchanged_parts;
+        self.install_tree();
+
+        if let Some(selected) = selected.filter(|path| tree_contains(&self.tree_items, path)) {
+            self.select_path(&selected);
+        } else if let Some(path) = self.compare.as_ref().and_then(|compare| {
+            compare
+                .comparison
+                .statuses
+                .iter()
+                .find(|(_, status)| **status != PartStatus::Unchanged)
+                .map(|(path, _)| path.clone())
+        }) {
+            self.select_path(&path);
+        } else if let Some(first) = self.tree_items.first() {
+            self.tree_state.select(vec![first.identifier().clone()]);
+        } else {
+            self.tree_state.select(Vec::new());
+        }
+        self.load_selected_file_content_inner(false)
+    }
+
     /// Tree items currently rendered: the live filter result while searching,
     /// otherwise the full package tree.
     pub fn visible_tree_items(&self) -> &[TreeItem<'static, String>] {
@@ -573,6 +895,28 @@ impl App {
         let mut links = Vec::new();
         let display_name = selected.trim_start_matches('/');
         push_detail_line(&mut text, &format!("Part: {display_name}"));
+
+        if let Some(compare) = self.compare.as_ref() {
+            if let Some(status) = compare.comparison.status_of(selected) {
+                push_detail_line(&mut text, &format!("Diff: {}", status.label()));
+            }
+            push_detail_line(&mut text, &compare.comparison.summary_line());
+            push_detail_line(&mut text, "");
+            append_comparison_side(&mut text, "A", index, selected);
+            append_package_diagnostics(&mut text, &mut links, index, Some("A"));
+            push_detail_line(&mut text, "");
+            append_comparison_side(&mut text, "B", &compare.package.index, selected);
+            append_package_diagnostics(&mut text, &mut links, &compare.package.index, Some("B"));
+            append_comparison_diagnostics(&mut text, &compare.comparison, selected);
+            append_comparison_relationships(
+                &mut text,
+                &mut links,
+                index,
+                &compare.package.index,
+                selected,
+            );
+            return DetailsView { text, links };
+        }
 
         if let Some(part) = index.parts.get(selected) {
             if part.archive_name != display_name {
@@ -660,46 +1004,7 @@ impl App {
             }
         }
 
-        if !index.warnings.is_empty() {
-            push_detail_line(&mut text, "");
-            push_detail_line(&mut text, "Warnings");
-            for warning in &index.warnings {
-                push_detail_line(&mut text, &format!("- {}", compact_text(warning, 56)));
-            }
-        }
-
-        let issues = &index.integrity;
-        if !issues.is_empty() {
-            push_detail_line(&mut text, "");
-            push_detail_line(
-                &mut text,
-                &format!("Integrity issues ({})  [i/I jump]", issues.len()),
-            );
-            for issue in issues.iter().take(MAX_INTEGRITY_LINES) {
-                let severity = match issue.severity {
-                    DiagnosticSeverity::Error => "error",
-                    DiagnosticSeverity::Warning => "warn",
-                };
-                let prefix = format!("  [{severity}] ");
-                let message = compact_text(&issue.message, 64);
-                let line_number = push_detail_line(&mut text, &format!("{prefix}{message}"));
-                if let Some(part) = issue.part.as_deref() {
-                    let start = prefix.chars().count();
-                    links.push(DetailLink {
-                        line: line_number,
-                        start,
-                        end: start + message.chars().count(),
-                        target: part.to_string(),
-                    });
-                }
-            }
-            if issues.len() > MAX_INTEGRITY_LINES {
-                push_detail_line(
-                    &mut text,
-                    &format!("  … {} more", issues.len() - MAX_INTEGRITY_LINES),
-                );
-            }
-        }
+        append_package_diagnostics(&mut text, &mut links, index, None);
 
         DetailsView { text, links }
     }
@@ -755,12 +1060,21 @@ impl App {
             link.target.clone()
         };
 
-        if !self.index().parts.contains_key(&target) && !self.is_directory(&target) {
+        let target_exists = self.index().parts.contains_key(&target)
+            || self
+                .compare
+                .as_ref()
+                .is_some_and(|compare| compare.package.index.parts.contains_key(&target));
+        if !target_exists && !self.is_directory(&target) {
             return Ok(false);
         }
         // An applied filter could hide the destination, so a link that selected
         // an invisible item would look like it did nothing.
         self.cancel_any_search();
+        if self.hide_unchanged_parts && !tree_contains(&self.tree_items, &target) {
+            self.hide_unchanged_parts = false;
+            self.install_tree();
+        }
         self.select_path(&target);
         self.details_scroll = 0;
         self.load_selected_file_content()?;
@@ -1245,6 +1559,11 @@ impl App {
         };
 
         let mut status = format!("Part: {display_name} | Type: {part_type}");
+        if let Some(compare) = self.compare.as_ref() {
+            if let Some(diff) = compare.comparison.status_of(selected) {
+                status.push_str(&format!(" | Diff: {}", diff.label()));
+            }
+        }
         if self.content_search_active {
             status.push_str(&format!(
                 " | Content search: {}_ | {} matches",
@@ -1345,18 +1664,26 @@ impl App {
         }
 
         let display_name = selected.trim_start_matches('/').to_string();
-        let Some(part) = self.index().parts.get(&selected).cloned() else {
-            if self.is_directory(&selected) {
-                self.content_message = Some(format!("Directory: {display_name}"));
+        // In compare mode the selected part may exist in either package, so a
+        // part that was added or removed is still previewable as a diff.
+        let part_a = self.index().parts.get(&selected).cloned();
+        let part_b = self
+            .compare
+            .as_ref()
+            .and_then(|compare| compare.package.index.parts.get(&selected).cloned());
+        let Some(part) = [part_a, part_b]
+            .into_iter()
+            .flatten()
+            .find(|part| part.kind != PartKind::Directory)
+        else {
+            let message = if self.is_directory(&selected) {
+                format!("Directory: {display_name}")
             } else {
-                self.content_message = Some(format!("Unavailable package part: {display_name}"));
-            }
+                format!("Unavailable package part: {display_name}")
+            };
+            self.content_message = Some(message);
             return Ok(());
         };
-        if part.kind == PartKind::Directory {
-            self.content_message = Some(format!("Directory: {display_name}"));
-            return Ok(());
-        }
         let Some((package_source, index)) = self
             .package
             .as_ref()
@@ -1366,12 +1693,23 @@ impl App {
             return Ok(());
         };
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
-        if let Err(error) = self.worker.submit(Job::ReadPart {
-            request_id: self.preview_request_id,
-            package_path: package_source,
-            part: Box::new(part),
-            index,
-        }) {
+        let job = match self.compare.as_ref() {
+            Some(compare) => Job::DiffPart {
+                request_id: self.preview_request_id,
+                package_a: package_source,
+                package_b: compare.package.source.clone(),
+                part_path: selected.clone(),
+                index_a: index,
+                index_b: Arc::clone(&compare.package.index),
+            },
+            None => Job::ReadPart {
+                request_id: self.preview_request_id,
+                package_path: package_source,
+                part: Box::new(part),
+                index,
+            },
+        };
+        if let Err(error) = self.worker.submit(job) {
             self.preview_pending = false;
             self.preview_kind = PreviewKind::Error;
             self.worker_error = Some(error.to_string());
@@ -1379,12 +1717,20 @@ impl App {
             return Ok(());
         }
         self.preview_pending = true;
-        self.content_message = Some(format!("Loading {display_name}…"));
+        self.content_message = Some(if self.compare.is_some() {
+            format!("Comparing {display_name}…")
+        } else {
+            format!("Loading {display_name}…")
+        });
         Ok(())
     }
 
     fn is_directory(&self, path: &str) -> bool {
         self.index().is_directory(path)
+            || self
+                .compare
+                .as_ref()
+                .is_some_and(|compare| compare.package.index.is_directory(path))
     }
 
     /// The selected part when it can actually be read out of the package.
@@ -1481,32 +1827,68 @@ impl App {
     }
 
     fn install_tree(&mut self) {
-        // BTreeMap keys iterate in sorted order, which the tree builder relies on.
-        let paths: Vec<String> = self
-            .index()
-            .parts
-            .keys()
+        // A sorted, de-duplicated union: in compare mode the tree must show
+        // added and removed parts, not just the primary package's parts.
+        let mut paths: BTreeSet<&String> = self.index().parts.keys().collect();
+        if let Some(compare) = self.compare.as_ref() {
+            paths.extend(compare.package.index.parts.keys());
+        }
+        let paths: Vec<String> = paths
+            .into_iter()
+            .filter(|path| {
+                !self.hide_unchanged_parts
+                    || self
+                        .compare
+                        .as_ref()
+                        .and_then(|compare| compare.comparison.status_of(path))
+                        .is_some_and(|status| status != PartStatus::Unchanged)
+            })
             .map(|path| path.trim_start_matches('/'))
             .filter(|path| !path.is_empty())
             .map(str::to_string)
             .collect();
-        // Parts with an integrity issue are marked in the tree so they can be
-        // spotted without reading the metadata panel.
-        let issue_parts: HashSet<String> = self
-            .index()
-            .integrity
-            .iter()
-            .filter_map(|issue| issue.part.clone())
-            .collect();
+        // Parts with an integrity issue or a comparison difference are marked
+        // in the tree so they can be spotted without reading the metadata panel.
+        let markers = self.tree_markers();
         self.filtered_tree_items = None;
         self.opened_before_search = None;
-        match create_tree(&paths, &issue_parts) {
+        match create_tree(&paths, &markers) {
             Ok(tree_items) => self.tree_items = tree_items,
             Err(error) => {
                 self.tree_items.clear();
                 self.worker_error = Some(format!("Could not build package tree: {error}"));
             }
         }
+    }
+
+    /// Suffix markers appended to tree labels: integrity warnings and, in
+    /// compare mode, the part status. Ancestors of a differing part get a `*`
+    /// so a collapsed directory still advertises the change.
+    fn tree_markers(&self) -> HashMap<String, String> {
+        let mut markers: HashMap<String, String> = HashMap::new();
+        for issue in &self.index().integrity {
+            if let Some(part) = issue.part.as_deref() {
+                add_marker(&mut markers, part, "⚠");
+            }
+        }
+        let Some(compare) = self.compare.as_ref() else {
+            return markers;
+        };
+        for (path, status) in &compare.comparison.statuses {
+            if *status == PartStatus::Unchanged {
+                continue;
+            }
+            add_marker(&mut markers, path, status.marker());
+            let mut ancestor = path.as_str();
+            while let Some((parent, _)) = ancestor.rsplit_once('/') {
+                if parent.is_empty() {
+                    break;
+                }
+                add_marker(&mut markers, parent, "*");
+                ancestor = parent;
+            }
+        }
+        markers
     }
 
     fn select_path(&mut self, path: &str) {
@@ -1535,10 +1917,12 @@ impl App {
             return;
         }
 
-        let mut matches: Vec<String> = self
-            .index()
-            .parts
-            .keys()
+        let mut paths: BTreeSet<&String> = self.index().parts.keys().collect();
+        if let Some(compare) = self.compare.as_ref() {
+            paths.extend(compare.package.index.parts.keys());
+        }
+        let mut matches: Vec<String> = paths
+            .into_iter()
             .filter(|path| path.to_ascii_lowercase().contains(&query))
             .cloned()
             .collect();
@@ -1561,9 +1945,9 @@ impl App {
 /// slash) without an intermediate node structure.
 fn create_tree(
     paths: &[String],
-    issue_parts: &HashSet<String>,
+    markers: &HashMap<String, String>,
 ) -> io::Result<Vec<TreeItem<'static, String>>> {
-    create_tree_level("", paths, 0, issue_parts)
+    create_tree_level("", paths, 0, markers)
 }
 
 fn collect_open_paths(items: &[TreeItem<'static, String>]) -> Vec<Vec<String>> {
@@ -1652,14 +2036,55 @@ fn filter_tree_matches(
     Ok(result)
 }
 
-/// Tree labels for parts with an integrity issue carry a marker so they stand
-/// out without opening the metadata panel.
-fn tree_label(head: &str, identifier: &str, issue_parts: &HashSet<String>) -> String {
-    if issue_parts.contains(identifier) {
-        format!("{head} ⚠")
-    } else {
-        head.to_string()
+/// Tree labels carry any marker for the part: an integrity warning, a
+/// comparison status, or `*` for a directory with differing descendants.
+fn tree_label(head: &str, identifier: &str, markers: &HashMap<String, String>) -> String {
+    match markers.get(identifier) {
+        Some(marker) => format!("{head} {marker}"),
+        None => head.to_string(),
     }
+}
+
+fn styled_tree_label(
+    head: &str,
+    identifier: &str,
+    markers: &HashMap<String, String>,
+) -> Line<'static> {
+    let label = tree_label(head, identifier, markers);
+    let color = markers.get(identifier).and_then(|marker| {
+        let has = |symbol| marker.split(' ').any(|part| part == symbol);
+        if has("+") {
+            Some(Color::LightGreen)
+        } else if has("-") {
+            Some(Color::LightRed)
+        } else if has("~") || has("⚠") {
+            Some(Color::Yellow)
+        } else {
+            None
+        }
+    });
+    Line::from(Span::styled(
+        label,
+        color.map_or_else(Style::default, |color| Style::default().fg(color)),
+    ))
+}
+
+fn tree_contains(items: &[TreeItem<'static, String>], path: &str) -> bool {
+    items
+        .iter()
+        .any(|item| item.identifier() == path || tree_contains(item.children(), path))
+}
+
+/// Append a marker once, keeping markers space-separated in insertion order.
+fn add_marker(markers: &mut HashMap<String, String>, path: &str, marker: &str) {
+    let entry = markers.entry(path.to_string()).or_default();
+    if entry.split(' ').any(|existing| existing == marker) {
+        return;
+    }
+    if !entry.is_empty() {
+        entry.push(' ');
+    }
+    entry.push_str(marker);
 }
 
 /// `offset` is the byte length of the shared ancestor prefix including its
@@ -1669,7 +2094,7 @@ fn create_tree_level(
     parent: &str,
     paths: &[String],
     offset: usize,
-    issue_parts: &HashSet<String>,
+    markers: &HashMap<String, String>,
 ) -> io::Result<Vec<TreeItem<'static, String>>> {
     let mut items = Vec::new();
     let mut index = 0;
@@ -1677,7 +2102,7 @@ fn create_tree_level(
         let rest = &paths[index][offset..];
         let head = rest.split('/').next().unwrap_or(rest);
         let identifier = format!("{parent}/{head}");
-        let label = tree_label(head, &identifier, issue_parts);
+        let label = styled_tree_label(head, &identifier, markers);
         // A directory entry itself ("head") sorts before its children
         // ("head/..."); consume it so leaf and branch merge into one node.
         if rest.len() == head.len() {
@@ -1693,7 +2118,7 @@ fn create_tree_level(
             items.push(TreeItem::new_leaf(identifier, label));
         } else {
             let child_offset = offset + head.len() + 1;
-            let children = create_tree_level(&identifier, children, child_offset, issue_parts)?;
+            let children = create_tree_level(&identifier, children, child_offset, markers)?;
             items.push(TreeItem::new(identifier, label, children).map_err(io::Error::other)?);
         }
     }
@@ -1703,10 +2128,11 @@ fn create_tree_level(
 #[cfg(test)]
 mod tests {
     use super::PendingExport;
+    use crate::compare::PartStatus;
     use crate::preview::PreviewKind;
     use crate::{App, worker::Worker};
     use ratatui_image::picker::Picker;
-    use std::{io, time::Duration};
+    use std::{io, sync::Arc, time::Duration};
 
     /// Pump the worker until `done` holds, with a generous timeout. Tests run the
     /// real worker thread; they only avoid fixed sleeps.
@@ -1723,7 +2149,7 @@ mod tests {
 
     fn test_app(path: &str) -> io::Result<App> {
         let worker = Worker::start()?;
-        let mut app = App::new_loading(path.to_string(), Picker::halfblocks(), worker)?;
+        let mut app = App::new_loading(path.to_string(), None, Picker::halfblocks(), worker)?;
         pump_until(&mut app, |app| !app.loading);
         Ok(app)
     }
@@ -1735,8 +2161,12 @@ mod tests {
     #[test]
     fn loading_constructor_installs_worker_package_result() -> io::Result<()> {
         let worker = Worker::start()?;
-        let mut app =
-            App::new_loading("data/sample.pptx".to_string(), Picker::halfblocks(), worker)?;
+        let mut app = App::new_loading(
+            "data/sample.pptx".to_string(),
+            None,
+            Picker::halfblocks(),
+            worker,
+        )?;
         assert!(app.loading);
         assert!(app.tree_items.is_empty());
         pump_until(&mut app, |app| !app.loading);
@@ -2288,18 +2718,13 @@ mod tests {
         );
         preview_loaded(&mut app);
 
-        let issue_parts: std::collections::HashSet<String> = app
-            .index()
-            .integrity
-            .iter()
-            .filter_map(|issue| issue.part.clone())
-            .collect();
+        let markers = app.tree_markers();
         assert_eq!(
-            super::tree_label("presentation.xml", "/ppt/presentation.xml", &issue_parts),
+            super::tree_label("presentation.xml", "/ppt/presentation.xml", &markers),
             "presentation.xml ⚠"
         );
         assert_eq!(
-            super::tree_label("presentation.xml", "/ppt/other.xml", &issue_parts),
+            super::tree_label("presentation.xml", "/ppt/other.xml", &markers),
             "presentation.xml"
         );
 
@@ -2584,6 +3009,254 @@ mod tests {
         assert_eq!(ppt.identifier(), "/ppt");
         assert_eq!(ppt.children().len(), 1);
         assert_eq!(ppt.children()[0].identifier(), "/ppt/slides");
+        Ok(())
+    }
+
+    fn write_zip(name: &str, entries: &[(&str, &str)]) -> io::Result<std::path::PathBuf> {
+        use std::io::Write as _;
+
+        let path = std::env::temp_dir().join(format!("oox-test-{}-{name}", std::process::id()));
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&path)?);
+        for (entry, content) in entries {
+            writer
+                .start_file(*entry, zip::write::SimpleFileOptions::default())
+                .map_err(io::Error::other)?;
+            writer.write_all(content.as_bytes())?;
+        }
+        writer.finish().map_err(io::Error::other)?;
+        Ok(path)
+    }
+
+    fn editor_text(app: &App) -> String {
+        app.editor_state
+            .lines
+            .to_vecs()
+            .into_iter()
+            .map(|row| row.into_iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Acceptance for issue #11: comparing a package with a re-saved copy marks
+    /// added, removed, and changed parts, lists added parts in the tree, and
+    /// ignores XML that only changed attribute order or whitespace.
+    #[test]
+    fn compare_mode_marks_added_removed_and_changed_parts() -> io::Result<()> {
+        const CONTENT_TYPES: &str = r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/></Types>"#;
+        // The same content with reordered attributes and different spacing: the
+        // bytes differ, the canonical form does not.
+        const CONTENT_TYPES_REFORMATTED: &str = "<?xml version=\"1.0\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\n  <Default ContentType=\"application/vnd.openxmlformats-package.relationships+xml\" Extension=\"rels\"/>\n  <Default ContentType=\"application/xml\" Extension=\"xml\"/>\n  <Override ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml\" PartName=\"/ppt/presentation.xml\"/>\n</Types>";
+        const RELS: &str = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#;
+
+        let before = write_zip(
+            "compare-before.pptx",
+            &[
+                ("[Content_Types].xml", CONTENT_TYPES),
+                ("_rels/.rels", RELS),
+                ("ppt/presentation.xml", "<p:presentation/>"),
+                ("ppt/slides/slide1.xml", "<p:sld/>"),
+                ("ppt/notes.txt", "notes"),
+                ("ppt/aaa.txt", "aaa"),
+            ],
+        )?;
+        let after = write_zip(
+            "compare-after.pptx",
+            &[
+                ("[Content_Types].xml", CONTENT_TYPES_REFORMATTED),
+                ("_rels/.rels", RELS),
+                (
+                    "ppt/presentation.xml",
+                    "<p:presentation><p:sldIdLst/></p:presentation>",
+                ),
+                ("ppt/slides/slide1.xml", "<p:sld/>"),
+                ("ppt/slides/slide2.xml", "<p:sld><p:cSld/></p:sld>"),
+                ("ppt/slides/_rels/slide2.xml.rels", RELS),
+                ("ppt/notes.txt", "notes"),
+            ],
+        )?;
+
+        let worker = Worker::start()?;
+        let mut app = App::new_loading(
+            before.to_string_lossy().into_owned(),
+            Some(after.clone()),
+            Picker::halfblocks(),
+            worker,
+        )?;
+        pump_until(&mut app, |app| !app.loading);
+        assert!(app.is_package_loaded());
+        assert!(app.hide_unchanged_parts);
+        assert!(app.tree_state.opened().contains(&vec!["/ppt".to_string()]));
+
+        let status = |app: &App, path: &str| {
+            app.compare
+                .as_ref()
+                .and_then(|compare| compare.comparison.status_of(path))
+        };
+        assert_eq!(
+            status(&app, "/ppt/slides/slide2.xml"),
+            Some(PartStatus::Added)
+        );
+        assert_eq!(
+            status(&app, "/ppt/slides/_rels/slide2.xml.rels"),
+            Some(PartStatus::Added)
+        );
+        assert_eq!(
+            status(&app, "/ppt/presentation.xml"),
+            Some(PartStatus::Changed)
+        );
+        assert_eq!(status(&app, "/ppt/aaa.txt"), Some(PartStatus::Removed));
+        assert_eq!(status(&app, "/ppt/notes.txt"), Some(PartStatus::Unchanged));
+        assert_eq!(
+            status(&app, "/[Content_Types].xml"),
+            Some(PartStatus::Unchanged)
+        );
+
+        // The tree holds both packages' parts and carries the markers.
+        let markers = app.tree_markers();
+        assert_eq!(
+            markers.get("/ppt/slides/slide2.xml").map(String::as_str),
+            Some("+")
+        );
+        assert!(
+            markers
+                .get("/ppt/aaa.txt")
+                .is_some_and(|marker| marker.contains('-'))
+        );
+        assert!(
+            markers
+                .get("/ppt")
+                .is_some_and(|marker| marker.contains('*'))
+        );
+        let added_label =
+            super::styled_tree_label("slide2.xml", "/ppt/slides/slide2.xml", &markers);
+        assert_eq!(
+            added_label.spans[0].style.fg,
+            Some(ratatui::style::Color::LightGreen)
+        );
+        let changed_label =
+            super::styled_tree_label("presentation.xml", "/ppt/presentation.xml", &markers);
+        assert_eq!(
+            changed_label.spans[0].style.fg,
+            Some(ratatui::style::Color::Yellow)
+        );
+        let removed_label = super::styled_tree_label("aaa.txt", "/ppt/aaa.txt", &markers);
+        assert_eq!(
+            removed_label.spans[0].style.fg,
+            Some(ratatui::style::Color::LightRed)
+        );
+        let identifiers = flatten_identifiers(app.visible_tree_items());
+        assert!(identifiers.contains(&"/ppt/slides/slide2.xml".to_string()));
+        assert!(identifiers.contains(&"/ppt/aaa.txt".to_string()));
+
+        // Compare mode starts with changes only; `u` restores all parts and
+        // toggles back to the compact view.
+        assert!(app.hide_unchanged_parts);
+        assert!(!identifiers.contains(&"/ppt/notes.txt".to_string()));
+        app.toggle_unchanged_parts()?;
+        let identifiers = flatten_identifiers(app.visible_tree_items());
+        assert!(identifiers.contains(&"/ppt/notes.txt".to_string()));
+        app.toggle_unchanged_parts()?;
+        let identifiers = flatten_identifiers(app.visible_tree_items());
+        assert!(!identifiers.contains(&"/ppt/notes.txt".to_string()));
+
+        // Directories that exist only in the comparison package are still
+        // recognized as directories when selected.
+        app.select_path("/ppt/slides/_rels");
+        app.load_selected_file_content()?;
+        assert_eq!(
+            app.content_message.as_deref(),
+            Some("Directory: ppt/slides/_rels")
+        );
+
+        // The metadata panel clearly shows both sides and marks a missing part.
+        app.select_path("/ppt/slides/slide2.xml");
+        let details = app.details_view().text.clone();
+        assert!(details.contains("Diff: Added"));
+        assert!(details.contains("A — oox-test-") && details.contains("-compare-before.pptx"));
+        assert!(details.contains("B — oox-test-") && details.contains("-compare-after.pptx"));
+        assert!(details.contains("Part: Absent"));
+        assert!(details.contains("Kind: XML"));
+        assert!(details.contains("Related parts  [= shared, A/B side-specific]"));
+        assert!(details.contains("  [B] OUT rId1"));
+
+        // An unchanged relationship appears once, labeled shared by A and B.
+        app.select_path("/ppt/presentation.xml");
+        let details = app.details_view().text.clone();
+        assert_eq!(details.matches("  [=] IN rId1").count(), 1);
+
+        // The added part previews as a unified diff.
+        app.select_path("/ppt/slides/slide2.xml");
+        app.load_selected_file_content()?;
+        preview_loaded(&mut app);
+        assert_eq!(app.preview_kind, PreviewKind::Diff);
+        let diff = editor_text(&app);
+        assert!(diff.contains("+<p:sld>"), "unexpected diff: {diff}");
+
+        // An unchanged part says so instead of showing a diff.
+        app.select_path("/ppt/notes.txt");
+        app.load_selected_file_content()?;
+        preview_loaded(&mut app);
+        assert!(editor_text(&app).contains("No differences"));
+
+        // Filename search and navigation include parts that exist only in B.
+        app.start_search();
+        for character in "slide2.xml".chars() {
+            app.search_input_char(character);
+        }
+        app.finish_search();
+        assert!(
+            app.search_matches
+                .contains(&"/ppt/slides/slide2.xml".to_string())
+        );
+        app.next_search_match(false);
+        assert_eq!(
+            app.tree_state.selected().last().unwrap(),
+            "/ppt/slides/slide2.xml"
+        );
+        app.cancel_search();
+
+        // Both package diagnostics and comparison-time diagnostics are visible.
+        Arc::make_mut(&mut app.package.as_mut().unwrap().index)
+            .warnings
+            .push("A package warning".to_string());
+        Arc::make_mut(&mut app.package.as_mut().unwrap().index)
+            .integrity
+            .push(crate::package::Diagnostic::warning(
+                "test",
+                Some("/ppt/presentation.xml".to_string()),
+                "A integrity warning",
+            ));
+        Arc::make_mut(&mut app.compare.as_mut().unwrap().package.index)
+            .warnings
+            .push("B package warning".to_string());
+        Arc::make_mut(&mut app.compare.as_mut().unwrap().package.index)
+            .integrity
+            .push(crate::package::Diagnostic::warning(
+                "test",
+                Some("/ppt/presentation.xml".to_string()),
+                "B integrity warning",
+            ));
+        app.compare.as_mut().unwrap().comparison.diagnostics.push(
+            crate::package::Diagnostic::warning(
+                "compare",
+                Some("/ppt/presentation.xml".to_string()),
+                "Comparison normalization warning",
+            ),
+        );
+        app.details_generation = app.details_generation.wrapping_add(1);
+        app.select_path("/ppt/presentation.xml");
+        let details = app.details_view().text.clone();
+        assert!(details.contains("A warnings") && details.contains("A package warning"));
+        assert!(details.contains("B warnings") && details.contains("B package warning"));
+        assert!(details.contains("A Integrity issues") && details.contains("A integrity warning"));
+        assert!(details.contains("B Integrity issues") && details.contains("B integrity warning"));
+        assert!(
+            details.contains("Comparison diagnostics")
+                && details.contains("Comparison normalization warning")
+        );
+
+        std::fs::remove_file(&before)?;
+        std::fs::remove_file(&after)?;
         Ok(())
     }
 }

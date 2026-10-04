@@ -49,6 +49,12 @@ pub enum Action {
     /// Select the last visible tree item.
     #[keybindings["G"]]
     Last,
+    /// Toggle unchanged parts in package comparison mode.
+    #[keybindings["u"]]
+    ToggleUnchangedParts,
+    /// Expand or collapse the selected tree node without exporting.
+    #[keybindings["e"]]
+    ToggleSelected,
     /// Open the selected part in the content preview.
     #[keybindings["Enter"]]
     OpenContent,
@@ -71,7 +77,7 @@ pub enum Action {
     #[keybindings["Control+f"]]
     StartContentSearch,
     /// Extract the selected part to a file.
-    #[keybindings["e"]]
+    #[keybindings["x"]]
     ExtractPart,
     /// Open the selected part in `$PAGER`/`$EDITOR` from a temporary file.
     #[keybindings["o"]]
@@ -197,7 +203,8 @@ pub fn help_sections() -> Vec<(&'static str, Vec<HelpRow>)> {
                 HelpRow::Binding(Action::PageUp, "Scroll up"),
                 HelpRow::Binding(Action::First, "First item"),
                 HelpRow::Binding(Action::Last, "Last item"),
-                HelpRow::Binding(Action::OpenContent, "Expand / preview content"),
+                HelpRow::Binding(Action::ToggleSelected, "Expand / collapse selected"),
+                HelpRow::Binding(Action::OpenContent, "Open / preview selected"),
                 HelpRow::Binding(Action::ShowMetadata, "Toggle metadata panel"),
                 HelpRow::Binding(Action::ShowSummary, "Toggle document summary"),
                 HelpRow::Text("Mouse click   Select/expand tree item"),
@@ -223,6 +230,13 @@ pub fn help_sections() -> Vec<(&'static str, Vec<HelpRow>)> {
                 HelpRow::Binding(Action::NextMatch, "Next match / content match"),
                 HelpRow::Binding(Action::PreviousMatch, "Previous match"),
                 HelpRow::Binding(Action::Cancel, "Cancel search / clear filter"),
+            ],
+        ),
+        (
+            "Comparison",
+            vec![
+                HelpRow::Binding(Action::ToggleUnchangedParts, "Toggle unchanged parts"),
+                HelpRow::Text("+ Added (green)   ~ Changed (yellow)   - Removed (red)"),
             ],
         ),
         (
@@ -286,6 +300,17 @@ mod tests {
     fn shift_modified_uppercase_key_is_supported() {
         Action::init_and_load(None::<crossterm_keybind::toml::Value>).unwrap();
         let event = KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT);
-        assert!(Action::dispatch(&event).contains(&Action::ExpandAll));
+        let actions = Action::dispatch(&event);
+        assert!(actions.contains(&Action::ExpandAll));
+        assert!(!actions.contains(&Action::ToggleSelected));
+        assert!(!actions.contains(&Action::ExtractPart));
+
+        let expand = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        let expand_actions = Action::dispatch(&expand);
+        assert!(expand_actions.contains(&Action::ToggleSelected));
+        assert!(!expand_actions.contains(&Action::ExtractPart));
+
+        let extract = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(Action::dispatch(&extract).contains(&Action::ExtractPart));
     }
 }

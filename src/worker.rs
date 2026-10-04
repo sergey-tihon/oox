@@ -14,8 +14,9 @@ use std::{
 };
 
 use crate::{
+    compare::{self, Comparison},
     package::{Diagnostic, MAX_ENTRY_BYTES, Package, PackageIndex, PartInfo, PartKind},
-    preview::{Preview, build_preview},
+    preview::{Preview, PreviewKind, build_preview},
     summary::{DetailsView, build_document_summary},
 };
 
@@ -28,11 +29,26 @@ pub enum Job {
         request_id: u64,
         path: PathBuf,
     },
+    /// Open two packages and compare every part between them.
+    Compare {
+        request_id: u64,
+        path: PathBuf,
+        compare_path: PathBuf,
+    },
     ReadPart {
         request_id: u64,
         package_path: PathBuf,
         part: Box<PartInfo>,
         index: Arc<PackageIndex>,
+    },
+    /// Build the part diff between two packages for the content pane.
+    DiffPart {
+        request_id: u64,
+        package_a: PathBuf,
+        package_b: PathBuf,
+        part_path: String,
+        index_a: Arc<PackageIndex>,
+        index_b: Arc<PackageIndex>,
     },
     SearchContent {
         request_id: u64,
@@ -92,6 +108,15 @@ pub struct SummaryPayload {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Two open packages plus their comparison, ready for the UI.
+#[derive(Debug)]
+pub struct ComparedPackages {
+    pub a: Package,
+    pub b: Package,
+    pub summary: SummaryPayload,
+    pub comparison: Comparison,
+}
+
 #[derive(Debug)]
 pub enum ResultMessage {
     Opened {
@@ -104,6 +129,12 @@ pub enum ResultMessage {
         request_id: u64,
         selected_path: String,
         preview: Result<Preview, String>,
+    },
+    Compared {
+        request_id: u64,
+        path: PathBuf,
+        compare_path: PathBuf,
+        result: Box<Result<ComparedPackages, String>>,
     },
     ContentSearch {
         request_id: u64,
@@ -124,27 +155,73 @@ impl Drop for AliveGuard {
     }
 }
 
-/// Caches the open ZIP archive so per-part preview reads do not re-parse the
-/// central directory on every selection change. Only one package is open at a
-/// time, so a single-entry cache keyed by package path is sufficient.
-type ArchiveCache = Option<(PathBuf, zip::ZipArchive<File>)>;
+/// Caches the open ZIP archives so per-part preview reads do not re-parse the
+/// central directory on every selection change. Two entries are enough for
+/// comparison mode, which reads from both packages in turn.
+type ArchiveCache = Vec<(PathBuf, zip::ZipArchive<File>)>;
+
+const ARCHIVE_CACHE_CAPACITY: usize = 2;
+
+/// Open `path` if it is not cached, evicting the least recently used archive at
+/// capacity. A cache hit is refreshed so the pair used by comparison mode is
+/// not evicted between the two reads.
+fn ensure_cached(cache: &mut ArchiveCache, path: &Path) -> io::Result<()> {
+    if let Some(index) = cache.iter().position(|(cached, _)| cached == path) {
+        let entry = cache.remove(index);
+        cache.push(entry);
+        return Ok(());
+    }
+    let file = File::open(path)?;
+    let archive = zip::ZipArchive::new(file)?;
+    if cache.len() >= ARCHIVE_CACHE_CAPACITY {
+        cache.remove(0);
+    }
+    cache.push((path.to_path_buf(), archive));
+    Ok(())
+}
 
 fn cached_archive<'a>(
     cache: &'a mut ArchiveCache,
     path: &Path,
 ) -> io::Result<&'a mut zip::ZipArchive<File>> {
-    let stale = match cache {
-        Some((cached_path, _)) => cached_path != path,
-        None => true,
-    };
-    if stale {
-        let file = File::open(path)?;
-        *cache = Some((path.to_path_buf(), zip::ZipArchive::new(file)?));
+    ensure_cached(cache, path)?;
+    Ok(&mut cache
+        .last_mut()
+        .expect("the archive cache is non-empty after a successful fill")
+        .1)
+}
+
+/// Two distinct cached archives borrowed at once. Comparison mode reads the same
+/// part from both packages, which needs both handles simultaneously.
+fn cached_archives<'a>(
+    cache: &'a mut ArchiveCache,
+    first: &Path,
+    second: &Path,
+) -> io::Result<(&'a mut zip::ZipArchive<File>, &'a mut zip::ZipArchive<File>)> {
+    ensure_cached(cache, first)?;
+    ensure_cached(cache, second)?;
+    let i = cache
+        .iter()
+        .position(|(cached, _)| cached == first)
+        .expect("first package was just cached");
+    let j = cache
+        .iter()
+        .position(|(cached, _)| cached == second)
+        .expect("second package was just cached");
+    if i == j {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "comparison needs two distinct packages",
+        ));
     }
-    cache
-        .as_mut()
-        .map(|(_, archive)| archive)
-        .ok_or_else(|| io::Error::other("archive cache is empty after refill"))
+    // `split_at_mut` turns the two positions into disjoint mutable borrows.
+    if i < j {
+        let (left, right) = cache.split_at_mut(j);
+        Ok((&mut left[i].1, &mut right[0].1))
+    } else {
+        let (left, right) = cache.split_at_mut(i);
+        Ok((&mut right[0].1, &mut left[j].1))
+    }
 }
 
 pub struct Worker {
@@ -192,7 +269,7 @@ impl Worker {
             .name("oox-package-worker".into())
             .spawn(move || {
                 let _alive_guard = AliveGuard(worker_alive);
-                let mut archive_cache: ArchiveCache = None;
+                let mut archive_cache: ArchiveCache = Vec::new();
                 'worker: while !worker_stop.load(Ordering::Acquire) {
                     let job = match worker_queue.lock() {
                         Ok(mut queue) => queue.pop_front(),
@@ -232,6 +309,42 @@ impl Worker {
                                 path,
                                 package: Box::new(package),
                                 summary: Box::new(summary),
+                            }
+                        }
+                        Job::Compare {
+                            request_id,
+                            path,
+                            compare_path,
+                        } => {
+                            let result = compare_packages(&mut archive_cache, &path, &compare_path);
+                            ResultMessage::Compared {
+                                request_id,
+                                path,
+                                compare_path,
+                                result: Box::new(result),
+                            }
+                        }
+                        Job::DiffPart {
+                            request_id,
+                            package_a,
+                            package_b,
+                            part_path,
+                            index_a,
+                            index_b,
+                        } => {
+                            let preview = diff_part(
+                                &mut archive_cache,
+                                &package_a,
+                                &package_b,
+                                &index_a,
+                                &index_b,
+                                &part_path,
+                            )
+                            .map_err(|error| error.to_string());
+                            ResultMessage::PartRead {
+                                request_id,
+                                selected_path: part_path,
+                                preview,
                             }
                         }
                         Job::ReadPart {
@@ -383,6 +496,68 @@ fn build_summary(cache: &mut ArchiveCache, package: &Package) -> SummaryPayload 
             )],
         },
     }
+}
+
+/// Open both packages, build the primary summary, and compare every part. A
+/// comparison of a package with itself is short-circuited: the parts cannot
+/// differ, and the archive cache could not hold two handles to one path.
+fn compare_packages(
+    cache: &mut ArchiveCache,
+    path_a: &Path,
+    path_b: &Path,
+) -> Result<ComparedPackages, String> {
+    let mut a = Package::open(path_a).map_err(|error| error.to_string())?;
+    let summary = build_summary(cache, &a);
+    for diagnostic in &summary.diagnostics {
+        Arc::make_mut(&mut a.index).record(diagnostic.clone());
+    }
+
+    if path_a == path_b {
+        return Ok(ComparedPackages {
+            comparison: Comparison::identical(&a.index),
+            b: a.clone(),
+            a,
+            summary,
+        });
+    }
+
+    let b = Package::open(path_b).map_err(|error| error.to_string())?;
+    let mut comparison = {
+        let (archive_a, archive_b) =
+            cached_archives(cache, path_a, path_b).map_err(|error| error.to_string())?;
+        compare::compare(&a.index, archive_a, &b.index, archive_b)
+    };
+    for diagnostic in &comparison.diagnostics {
+        Arc::make_mut(&mut a.index).record(diagnostic.clone());
+    }
+    comparison.diagnostics.clear();
+
+    Ok(ComparedPackages {
+        a,
+        b,
+        summary,
+        comparison,
+    })
+}
+
+/// Read one part out of both packages and render its diff. A package compared
+/// with itself has no differences to read for.
+fn diff_part(
+    cache: &mut ArchiveCache,
+    package_a: &Path,
+    package_b: &Path,
+    index_a: &PackageIndex,
+    index_b: &PackageIndex,
+    part_path: &str,
+) -> io::Result<Preview> {
+    if package_a == package_b {
+        return Ok(Preview::Editor {
+            kind: PreviewKind::Diff,
+            text: format!("No differences in {part_path}\n"),
+        });
+    }
+    let (archive_a, archive_b) = cached_archives(cache, package_a, package_b)?;
+    compare::diff_part(index_a, archive_a, index_b, archive_b, part_path)
 }
 
 fn read_preview(
