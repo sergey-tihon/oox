@@ -91,6 +91,9 @@ pub enum Action {
     /// Jump to the previous part with an integrity issue.
     #[keybindings["I"]]
     PreviousIssue,
+    /// Follow the `r:id`/`r:embed` relationship reference under the editor cursor.
+    #[keybindings["Control+g"]]
+    FollowRelationship,
     /// Cancel a transient mode or overlay.
     #[keybindings["Esc"]]
     Cancel,
@@ -202,6 +205,10 @@ pub fn help_sections() -> Vec<(&'static str, Vec<HelpRow>)> {
                 HelpRow::Text("Click link    Open related part"),
                 HelpRow::Binding(Action::ExpandAll, "Expand all"),
                 HelpRow::Binding(Action::CollapseAll, "Collapse all"),
+                HelpRow::Binding(
+                    Action::FollowRelationship,
+                    "Open r:id/r:embed target at cursor",
+                ),
             ],
         ),
         (

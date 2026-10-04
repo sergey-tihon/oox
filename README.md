@@ -10,6 +10,7 @@ A terminal user interface for inspecting Office Open XML (OOXML) documents such 
 - **Raw file previews** — View plain text and JSON, inspect `.bin` files as hex, and see metadata for binary media, fonts, and OLE parts.
 - **Content search** — Grep package-part contents in the background and filter the tree to matching parts.
 - **Export parts** — Extract a part to a file, open it in `$PAGER`/`$EDITOR`, or copy its pretty-printed content to the clipboard (OSC 52).
+- **Inline relationship jumps** — Follow an `r:id`/`r:embed` reference inside the XML preview with `Ctrl-g` or a mouse click: internal targets open the referenced part (images preview directly), external URLs are reported in the status bar, and `Alt-Left` returns to where you jumped from.
 - **Document summaries** — Press `s` to inspect slide, paragraph, heading, table, sheet, cell, and formula summaries for PowerPoint, Word, and Excel packages; linked part paths navigate back to the tree.
 - **Package integrity** — Phase-1 OPC checks (dangling relationship targets, parts without a content type, orphan parts, duplicate relationship ids, missing required parts) are listed in the metadata panel, marked with `⚠` in the tree, and reachable with `i`/`I`.
 - **Vim-like navigation** — Move through files with `j`/`k` and the editor with Vim bindings.
@@ -70,6 +71,7 @@ oox --version
 | `Ctrl-f`  | Search part contents in the background       |
 | `n` / `N` | Select the next / previous search match     |
 | `i` / `I` | Jump to the next / previous part with a package issue |
+| `Ctrl-g`  | Follow the `r:id`/`r:embed` reference under the content cursor |
 | `Esc`     | Cancel search / clear the applied filter    |
 | `Enter`   | Toggle directory / preview file content     |
 | `1` / `2` / `3` | Focus tree / metadata / content panels  |

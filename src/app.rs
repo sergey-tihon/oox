@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use edtui::{EditorState, Lines};
+use edtui::{EditorState, Lines, RowIndex};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use tui_tree_widget::{TreeItem, TreeState};
 
@@ -26,6 +26,9 @@ const MAX_CONTENT_SEARCH_QUERY_CHARS: usize = 256;
 const MAX_EXPORT_PATH_CHARS: usize = 1024;
 /// Integrity issues rendered in the metadata panel; the rest are summarized.
 const MAX_INTEGRITY_LINES: usize = 50;
+/// Rows scanned in each direction when locating the start tag around the editor
+/// cursor. A start tag split across more rows than this is not worth following.
+const MAX_TAG_ROWS: usize = 64;
 
 /// Work an export produced that only the event loop can finish: running a
 /// command needs the terminal, and OSC 52 needs the backend's writer.
@@ -53,6 +56,10 @@ pub struct App {
     pub editor_state: EditorState,
     pub image_state: Option<StatefulProtocol>,
     pub preview_kind: PreviewKind,
+    /// The part whose content the preview currently shows. The tree selection
+    /// can move on without reloading the preview, so relationship references in
+    /// the editor must be resolved against this path, not the selection.
+    previewed_path: Option<String>,
     picker: Picker,
     pub current_widget: CurrentWidget,
     /// Message rendered in the content pane when no editor/image/summary is shown.
@@ -143,6 +150,87 @@ fn push_detail_line(text: &mut String, line: &str) -> usize {
     line_number
 }
 
+/// Whether `character` is the `>` that ends a start tag, tracking whether a quoted
+/// attribute value is in effect. XML only treats the quote character that opened a
+/// value as its delimiter, so a literal `>`, `<`, or the other quote character
+/// inside a value is ordinary text rather than a tag boundary.
+fn ends_tag(quote: &mut Option<char>, character: char) -> bool {
+    match *quote {
+        Some(active) => {
+            if character == active {
+                *quote = None;
+            }
+            false
+        }
+        None => match character {
+            '"' | '\'' => {
+                *quote = Some(character);
+                false
+            }
+            '>' => true,
+            _ => false,
+        },
+    }
+}
+
+/// The start tag enclosing `(row, column)` exactly as the preview renders it,
+/// plus the cursor's offset within it. A start tag can span several preview rows:
+/// `pretty_print_xml` forwards the raw tag bytes, and XML allows a newline
+/// between an attribute name, `=`, and its value.
+fn enclosing_start_tag(lines: &Lines, row: usize, column: usize) -> Option<(Vec<char>, usize)> {
+    let row_chars = |index: usize| lines.get(RowIndex::new(index));
+    // A literal `<` inside a value has to be escaped, so the nearest one before the
+    // cursor opens the tag the cursor may be in.
+    let mut open = None;
+    'open: for index in (row.saturating_sub(MAX_TAG_ROWS)..=row).rev() {
+        let Some(chars) = row_chars(index) else {
+            break;
+        };
+        let end = if index == row {
+            (column + 1).min(chars.len())
+        } else {
+            chars.len()
+        };
+        for position in (0..end).rev() {
+            if chars[position] == '<' {
+                open = Some((index, position));
+                break 'open;
+            }
+        }
+    }
+    let (open_row, open_column) = open?;
+
+    // Collect the tag up to the `>` that closes it, remembering where the cursor
+    // falls inside it. Quote tracking starts right after the `<`, where it is
+    // unambiguous, and carries across rows because a value may span them.
+    let mut quote = None;
+    let mut tag = Vec::new();
+    let mut cursor_offset = None;
+    'tag: for index in open_row..=open_row.saturating_add(MAX_TAG_ROWS) {
+        let Some(chars) = row_chars(index) else {
+            break;
+        };
+        let from = if index == open_row { open_column } else { 0 };
+        for (position, character) in chars.iter().enumerate().skip(from) {
+            if index == row && position == column {
+                cursor_offset = Some(tag.len());
+            }
+            if ends_tag(&mut quote, *character) {
+                break 'tag;
+            }
+            tag.push(*character);
+        }
+    }
+
+    // Comments, CDATA sections, and processing instructions hold no attributes.
+    if tag.starts_with(&['<', '!']) || tag.starts_with(&['<', '?']) {
+        return None;
+    }
+    // A cursor that the scan passed without recording sits after the tag that the
+    // nearest `<` opened, so it is in element text rather than in an attribute.
+    Some((tag, cursor_offset?))
+}
+
 impl App {
     /// Construct an interactive loading state without opening the archive on the UI thread.
     pub fn new_loading(path: String, picker: Picker, worker: Worker) -> io::Result<Self> {
@@ -155,6 +243,7 @@ impl App {
             editor_state: EditorState::default(),
             image_state: None,
             preview_kind: PreviewKind::Empty,
+            previewed_path: None,
             picker,
             current_widget: CurrentWidget::Tree,
             content_message: Some("Loading package…".to_string()),
@@ -249,6 +338,7 @@ impl App {
                             self.editor_state = EditorState::default();
                             self.image_state = None;
                             self.preview_kind = PreviewKind::Empty;
+                            self.previewed_path = None;
                             self.install_tree();
                             self.document_summary = summary.view;
                             self.loading = false;
@@ -282,6 +372,7 @@ impl App {
                         Ok(Preview::Editor { kind, text }) => {
                             self.preview_kind = kind;
                             self.editor_state = EditorState::new(Lines::from(text.as_str()));
+                            self.previewed_path = Some(selected_path);
                             self.content_message = None;
                         }
                         Ok(Preview::Image(image)) => {
@@ -682,6 +773,114 @@ impl App {
         } else {
             self.summary_scroll = self.summary_scroll.saturating_add(amount as u16);
         }
+    }
+
+    /// Jump to the relationship target referenced by the token under the editor
+    /// cursor, recording the jump in the navigation history. Returns `false`
+    /// when the cursor is not on a relationship reference, so callers can fall
+    /// back to normal key handling.
+    pub fn follow_relationship_at_cursor(&mut self) -> io::Result<bool> {
+        let Some(relationship) = self.relationship_at_cursor() else {
+            return Ok(false);
+        };
+        if relationship.target_mode == TargetMode::External {
+            self.status_message = Some(format!("External target: {}", relationship.target));
+            return Ok(true);
+        }
+        let Some(target) = relationship.resolved_target.clone() else {
+            self.status_message = Some(format!("Relationship {} has no target", relationship.id));
+            return Ok(true);
+        };
+        // A relationship target must be a packaged part, so a directory or a path
+        // that is not in the package explains itself instead of moving the
+        // selection to an empty preview.
+        if !crate::integrity::is_part(self.index(), &target) {
+            self.status_message = Some(format!(
+                "Relationship {} target is not a part: {target}",
+                relationship.id
+            ));
+            return Ok(true);
+        }
+        // An applied filter could hide the destination, which would make the
+        // jump look like it did nothing.
+        self.cancel_any_search();
+        self.select_path(&target);
+        self.load_selected_file_content()?;
+        Ok(true)
+    }
+
+    /// The relationship referenced by the token under the editor cursor. Only an
+    /// XML preview can reference relationships, and only an `r:*` attribute value
+    /// inside the enclosing start tag is treated as a reference.
+    fn relationship_at_cursor(&self) -> Option<Relationship> {
+        if self.preview_kind != PreviewKind::Xml {
+            return None;
+        }
+        let previewed = self.previewed_path.as_deref()?;
+        let index = self.index();
+        let relationships = index.outgoing.get(previewed)?;
+        let (chars, column) = enclosing_start_tag(
+            &self.editor_state.lines,
+            self.editor_state.cursor.row,
+            self.editor_state.cursor.col,
+        )?;
+        let is_name_char = |character: char| {
+            matches!(
+                character,
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | ':' | '.' | '-'
+            )
+        };
+
+        for relationship_index in relationships {
+            let relationship = &index.relationships[*relationship_index];
+            if relationship.id.is_empty() {
+                continue;
+            }
+            let id: Vec<char> = relationship.id.chars().collect();
+            let width = id.len();
+            for start in 0..chars.len().saturating_sub(width - 1) {
+                if chars[start..start + width] != id[..] {
+                    continue;
+                }
+                // The value must be a quoted attribute value. Both quote styles
+                // XML allows reach the preview, which forwards the raw start tag
+                // instead of normalizing it.
+                let Some(quote_index) = start.checked_sub(1) else {
+                    continue;
+                };
+                let quote = chars[quote_index];
+                if quote != '"' && quote != '\'' {
+                    continue;
+                }
+                if chars.get(start + width) != Some(&quote) {
+                    continue;
+                }
+                // XML permits whitespace around `=`.
+                let mut quote_start = quote_index;
+                while quote_start > 0 && chars[quote_start - 1].is_ascii_whitespace() {
+                    quote_start -= 1;
+                }
+                if quote_start == 0 || chars[quote_start - 1] != '=' {
+                    continue;
+                }
+                // The token spans the `r:*` attribute name too, so the cursor on
+                // either side of `=` follows the reference.
+                let mut token_start = quote_start - 1;
+                while token_start > 0 && chars[token_start - 1].is_ascii_whitespace() {
+                    token_start -= 1;
+                }
+                while token_start > 0 && is_name_char(chars[token_start - 1]) {
+                    token_start -= 1;
+                }
+                if chars[token_start] != 'r' || chars.get(token_start + 1) != Some(&':') {
+                    continue;
+                }
+                if column >= token_start && column < start + width + 1 {
+                    return Some(relationship.clone());
+                }
+            }
+        }
+        None
     }
 
     pub fn activate_summary_link(&mut self, line: usize, column: usize) -> io::Result<bool> {
@@ -1131,6 +1330,7 @@ impl App {
         self.image_state = None;
         self.editor_state = EditorState::default();
         self.preview_kind = PreviewKind::Empty;
+        self.previewed_path = None;
         self.summary_visible = false;
         self.summary_scroll = 0;
         self.status_message = None;
@@ -1762,6 +1962,205 @@ mod tests {
             Some("/ppt/slideLayouts/slideLayout1.xml")
         );
 
+        Ok(())
+    }
+
+    /// Place the editor cursor on the first occurrence of `needle`.
+    fn put_cursor_on(app: &mut App, needle: &str) -> bool {
+        for (row, line) in app.editor_state.lines.to_vecs().iter().enumerate() {
+            let text: String = line.iter().collect();
+            if let Some(byte_offset) = text.find(needle) {
+                let column = text[..byte_offset].chars().count();
+                app.editor_state.cursor = edtui::Index2::new(row, column);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Issue #14 acceptance: an `r:embed="rIdN"` token in slide XML opens the
+    /// referenced image part, `Alt-Left` returns to the slide, and an external
+    /// hyperlink reference is reported in the status bar instead of followed.
+    #[test]
+    fn relationship_references_jump_to_their_targets() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        let selected = |app: &App| app.tree_state.selected().last().cloned();
+        app.select_path("/ppt/slides/slide2.xml");
+        app.load_selected_file_content()?;
+        preview_loaded(&mut app);
+        assert_eq!(app.preview_kind, PreviewKind::Xml);
+
+        // Ordinary XML at the cursor is not a reference.
+        app.editor_state.cursor = edtui::Index2::new(0, 0);
+        assert!(!app.follow_relationship_at_cursor()?);
+        assert!(app.status_message.is_none());
+
+        assert!(put_cursor_on(&mut app, "\"rId2\""), "slide embeds rId2");
+        assert!(app.follow_relationship_at_cursor()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/media/image1.gif"));
+        assert!(app.image_state.is_some());
+
+        assert!(app.navigate_back()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide2.xml"));
+
+        assert!(put_cursor_on(&mut app, "r:id=\"rId3\""));
+        assert!(app.follow_relationship_at_cursor()?);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("https://chunyu.site/neovim/"))
+        );
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide2.xml"));
+
+        // The tree selection may move on without reloading the preview; tokens
+        // must still resolve against the part shown in the editor, not the
+        // selection. slide1 (the selection) has no rId2, so a selection-based
+        // lookup would fail to jump at all.
+        app.tree_state
+            .select(vec!["/ppt/slides/slide1.xml".to_string()]);
+        assert!(put_cursor_on(&mut app, "r:embed=\"rId2\""));
+        assert!(app.follow_relationship_at_cursor()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/media/image1.gif"));
+        Ok(())
+    }
+
+    /// A package whose slide references two navigable parts and two unusable
+    /// targets through `r:*` attributes written in the lexical forms XML permits
+    /// (`pretty_print_xml` forwards the raw start tag, so these reach the
+    /// preview unchanged).
+    fn write_reference_package(name: &str) -> io::Result<std::path::PathBuf> {
+        use std::io::Write as _;
+
+        let path = std::env::temp_dir().join(format!("oox-test-{}-{name}", std::process::id()));
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&path)?);
+        let entries = [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+</Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>"#,
+            ),
+            ("ppt/presentation.xml", "<p:presentation/>"),
+            (
+                "ppt/slides/slide1.xml",
+                "<p:sld xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><a:blip r:embed='rId10'/><a:blip\n    r:id\n    =\n    \"rId11\"/><a:blip r:link=\"rId12\"/><a:blip r:id=\"rId13\"/><a:blip descr=\"A > B and it's fine\" r:embed=\"rId14\"/><a:t>see r:id=\"rId10\" here</a:t></p:sld>",
+            ),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId10" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slide2.xml"/>
+  <Relationship Id="rId11" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slide3.xml"/>
+  <Relationship Id="rId12" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target=".."/>
+  <Relationship Id="rId13" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="missing.xml"/>
+  <Relationship Id="rId14" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="../presentation.xml"/>
+</Relationships>"#,
+            ),
+            ("ppt/slides/slide2.xml", "<p:sld/>"),
+            ("ppt/slides/slide3.xml", "<p:sld/>"),
+        ];
+        for (entry, content) in entries {
+            writer
+                .start_file(entry, zip::write::SimpleFileOptions::default())
+                .map_err(io::Error::other)?;
+            writer.write_all(content.as_bytes())?;
+        }
+        writer.finish().map_err(io::Error::other)?;
+        Ok(path)
+    }
+
+    /// XML permits single-quoted attribute values and whitespace around `=`, and
+    /// a start tag may span several preview rows because `pretty_print_xml`
+    /// forwards the raw tag bytes. All of those forms stay visible in the preview
+    /// and must be followed, while the same text in element content must not be.
+    /// A directory or missing target is reported instead of navigating away.
+    #[test]
+    fn relationship_reference_lexical_variants_and_unusable_targets() -> io::Result<()> {
+        let path = write_reference_package("follow-variants.pptx")?;
+        let mut app = test_app(&path.to_string_lossy())?;
+        let selected = |app: &App| app.tree_state.selected().last().cloned();
+        app.select_path("/ppt/slides/slide1.xml");
+        app.load_selected_file_content()?;
+        preview_loaded(&mut app);
+        assert_eq!(app.preview_kind, PreviewKind::Xml);
+
+        // Single quotes.
+        assert!(put_cursor_on(&mut app, "r:embed='rId10'"));
+        assert!(app.follow_relationship_at_cursor()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide2.xml"));
+        assert_eq!(app.preview_kind, PreviewKind::Xml);
+
+        assert!(app.navigate_back()?);
+        preview_loaded(&mut app);
+
+        // An attribute whose name, `=`, and value sit on three separate preview
+        // rows is followed from the name row and from the value row.
+        assert!(put_cursor_on(&mut app, "r:id"));
+        assert!(app.follow_relationship_at_cursor()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide3.xml"));
+
+        assert!(app.navigate_back()?);
+        preview_loaded(&mut app);
+        assert!(put_cursor_on(&mut app, "rId11"));
+        assert!(app.follow_relationship_at_cursor()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide3.xml"));
+
+        assert!(app.navigate_back()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide1.xml"));
+
+        // `Target=".."` resolves to `/ppt`, a directory that holds parts; it is
+        // still not a navigable part, so nothing moves and the status explains it.
+        assert!(put_cursor_on(&mut app, "rId12"));
+        assert!(app.follow_relationship_at_cursor()?);
+        assert!(
+            app.status_message.as_deref().is_some_and(
+                |message| message.contains("/ppt") && message.contains("is not a part")
+            )
+        );
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide1.xml"));
+        assert_eq!(app.preview_kind, PreviewKind::Xml);
+
+        assert!(put_cursor_on(&mut app, "rId13"));
+        assert!(app.follow_relationship_at_cursor()?);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("missing.xml"))
+        );
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide1.xml"));
+
+        // `descr="A > B and it's fine"` precedes the reference: a `>` and the
+        // other quote character inside a value are literal, not tag boundaries.
+        assert!(put_cursor_on(&mut app, "r:embed=\"rId14\""));
+        assert!(app.follow_relationship_at_cursor()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/presentation.xml"));
+        assert!(app.navigate_back()?);
+        preview_loaded(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide1.xml"));
+
+        // `<a:t>see r:id="rId10" here</a:t>` only looks like an attribute: it is
+        // element content, so the cursor there follows nothing.
+        app.status_message = None;
+        assert!(put_cursor_on(&mut app, "r:id=\"rId10\""));
+        assert!(!app.follow_relationship_at_cursor()?);
+        assert!(app.status_message.is_none());
+        assert_eq!(selected(&app).as_deref(), Some("/ppt/slides/slide1.xml"));
+
+        std::fs::remove_file(&path)?;
         Ok(())
     }
 

@@ -25,6 +25,7 @@
 - Minimum-terminal-size guard, capped navigation history, generated help overlay, read-only content labeling, and F1 help in Emacs editor mode.
 - Live visual tree filtering: non-matching paths are hidden while typing a search query, the selection follows the first match, Enter keeps the filter for n/N cycling, and Esc restores the full tree and its pre-search open/closed state.
 - Background content search: `Ctrl-f` performs bounded grep-style searches across package parts, filters the tree to matching parts, and supports n/N navigation.
+- Inline relationship references: `Ctrl-g` (or a click in the content pane) follows the `r:id`/`r:embed` token under the editor cursor to the referenced part, reports external targets in the status bar, and records the jump in the navigation history.
 
 ## Most important remaining features
 
