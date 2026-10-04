@@ -107,6 +107,8 @@ pub struct PackageIndex {
     pub incoming: BTreeMap<String, Vec<usize>>,
     pub warnings: Vec<String>,
     pub diagnostics: Vec<Diagnostic>,
+    /// OPC structural problems found by [`crate::integrity::check`].
+    pub integrity: Vec<Diagnostic>,
     pub source: Option<PathBuf>,
     content_types: ContentTypes,
 }
@@ -264,6 +266,7 @@ impl PackageIndex {
                     .push(relationship_index);
             }
         }
+        index.integrity = crate::integrity::check(&index);
         Ok(index)
     }
 
