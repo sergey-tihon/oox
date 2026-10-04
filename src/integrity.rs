@@ -6,7 +6,7 @@
 //! No XML schema validation happens here.
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::package::{Diagnostic, PackageIndex, PartKind, TargetMode};
+use crate::package::{Diagnostic, PackageIndex, PartKind, TargetMode, relationship_source};
 
 const CONTENT_TYPES_PART: &str = "/[Content_Types].xml";
 const ROOT_RELS_PART: &str = "/_rels/.rels";
@@ -48,7 +48,20 @@ fn has_office_document(index: &PackageIndex) -> bool {
     relationships_from(index, "/").any(|relationship| {
         relationship.target_mode == TargetMode::Internal
             && relationship.relationship_type.rsplit('/').next() == Some("officeDocument")
+            && relationship
+                .resolved_target
+                .as_deref()
+                .is_some_and(|target| is_part(index, target))
     })
+}
+
+/// A relationship target must be a packaged part. Explicit ZIP directory
+/// entries live in `parts` too, but resolving to one is still dangling.
+fn is_part(index: &PackageIndex, path: &str) -> bool {
+    index
+        .parts
+        .get(path)
+        .is_some_and(|part| part.kind != PartKind::Directory)
 }
 
 fn relationships_from<'a>(
@@ -72,7 +85,7 @@ fn check_relationships(index: &PackageIndex, issues: &mut Vec<Diagnostic>) {
             .resolved_target
             .as_deref()
             .unwrap_or(&relationship.target);
-        if !index.parts.contains_key(target) {
+        if !is_part(index, target) {
             let relationship_type = relationship
                 .relationship_type
                 .rsplit('/')
@@ -127,8 +140,12 @@ fn check_content_types(index: &PackageIndex, issues: &mut Vec<Diagnostic>) {
 }
 
 /// Parts must be reachable from `/_rels/.rels` by following internal
-/// relationships. `[Content_Types].xml` and `.rels` parts are implicit in OPC
-/// and are never relationship targets, so they are not orphans.
+/// relationships. `[Content_Types].xml` and relationship parts are implicit in
+/// OPC and are never relationship targets, so they are not orphans.
+///
+/// The exemption only covers real relationship-part paths (`_rels/.rels` or
+/// `.../_rels/<name>.rels`): an ordinary part that merely ends in `.rels` is
+/// reachable like any other part.
 fn check_orphans(index: &PackageIndex, issues: &mut Vec<Diagnostic>) {
     let mut reachable = BTreeSet::new();
     let mut queue = vec!["/".to_string()];
@@ -137,7 +154,7 @@ fn check_orphans(index: &PackageIndex, issues: &mut Vec<Diagnostic>) {
             let Some(target) = relationship.resolved_target.as_deref() else {
                 continue;
             };
-            if index.parts.contains_key(target) && reachable.insert(target.to_string()) {
+            if is_part(index, target) && reachable.insert(target.to_string()) {
                 queue.push(target.to_string());
             }
         }
@@ -146,7 +163,7 @@ fn check_orphans(index: &PackageIndex, issues: &mut Vec<Diagnostic>) {
     for (path, part) in &index.parts {
         if is_reserved_part(path)
             || part.kind == PartKind::Directory
-            || part.archive_name.to_ascii_lowercase().ends_with(".rels")
+            || relationship_source(path.trim_start_matches('/')).is_some()
         {
             continue;
         }
@@ -175,7 +192,7 @@ fn owner_part(index: &PackageIndex, source: &str) -> Option<String> {
     } else {
         source.to_string()
     };
-    if index.parts.contains_key(&candidate) {
+    if is_part(index, &candidate) {
         return Some(candidate);
     }
     let rels = rels_part(source);
@@ -358,6 +375,50 @@ mod tests {
         assert_eq!(
             part_of(&index, "no content type").as_deref(),
             Some("/_rels/.rels")
+        );
+    }
+
+    #[test]
+    fn directory_entries_are_not_valid_relationship_targets() {
+        let index = package(&[
+            ("[Content_Types].xml", CONTENT_TYPES),
+            (
+                "_rels/.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/"/>
+</Relationships>"#,
+            ),
+            ("ppt/", ""),
+        ]);
+        let messages = messages(&index);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("targets missing part /ppt")),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("no officeDocument part")),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn only_real_relationship_part_paths_are_exempt_from_orphans() {
+        let index = package(&[
+            ("[Content_Types].xml", CONTENT_TYPES),
+            ("_rels/.rels", ROOT_RELS),
+            ("ppt/presentation.xml", "<p/>"),
+            (
+                "custom/data.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#,
+            ),
+        ]);
+        assert_eq!(
+            part_of(&index, "not reachable").as_deref(),
+            Some("/custom/data.rels")
         );
     }
 

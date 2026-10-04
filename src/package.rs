@@ -493,7 +493,11 @@ fn required_xml_attribute(
 fn local_name(name: &str) -> &str {
     name.rsplit(':').next().unwrap_or(name)
 }
-fn relationship_source(path: &str) -> Option<String> {
+/// Maps a `.rels` part path (without a leading slash) to the part it describes.
+/// `None` means the name is not a relationship part, even when it ends in
+/// `.rels`; [`crate::integrity`] relies on this to tell implicit parts apart
+/// from ordinary ones.
+pub(crate) fn relationship_source(path: &str) -> Option<String> {
     if path == "_rels/.rels" {
         return Some("/".into());
     }
