@@ -182,7 +182,7 @@ fn part_status<R: Read + Seek, S: Read + Seek>(
             comparison.diagnostics.push(Diagnostic::warning(
                 "compare",
                 Some(part_a.path.clone()),
-                "XML exceeds the comparison limit; reporting a difference",
+                "XML could not be normalized; reporting a difference",
             ));
             PartStatus::Changed
         }
@@ -309,9 +309,11 @@ fn unified_diff(old: &str, new: &str, label_a: &str, label_b: &str, path: &str) 
     output.finish()
 }
 
-/// Prefer the canonical form; fall back to raw text so a malformed part still
-/// produces a diff instead of an error.
+/// Prefer the canonical form; fall back to raw text for malformed XML with valid UTF-8.
+/// Invalid UTF-8 is rejected to avoid lossy-decoding collisions.
 fn canonical_text(bytes: &[u8]) -> io::Result<String> {
+    std::str::from_utf8(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     match canonical_xml(bytes) {
         Ok(text) => Ok(text),
         Err(_) if bytes.len() <= MAX_XML_PREVIEW_BYTES => {
@@ -325,8 +327,9 @@ fn canonical_text(bytes: &[u8]) -> io::Result<String> {
 /// insignificant whitespace dropped. Two parts that differ only by attribute
 /// order, spacing, or indentation canonicalize identically.
 pub fn canonical_xml(bytes: &[u8]) -> io::Result<String> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut reader = Reader::from_str(&text);
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut reader = Reader::from_str(text);
     reader.config_mut().trim_text(false);
     let mut output = String::new();
     let mut buffer = Vec::new();
@@ -652,6 +655,19 @@ mod tests {
         xml.extend_from_slice(b"</root>");
         assert!(canonical_xml(&xml).is_err());
         assert!(canonical_text(&xml).is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_xml_is_reported_as_changed() -> io::Result<()> {
+        let mut archive_a = test_archive(&[("bad.xml", Some(b"<root>\xff</root>"))])?;
+        let mut archive_b = test_archive(&[("bad.xml", Some(b"<root>\xfe</root>"))])?;
+        let index_a = PackageIndex::from_archive(&mut archive_a)?;
+        let index_b = PackageIndex::from_archive(&mut archive_b)?;
+
+        let comparison = compare(&index_a, &mut archive_a, &index_b, &mut archive_b);
+        assert_eq!(comparison.status_of("/bad.xml"), Some(PartStatus::Changed));
+        assert_eq!(comparison.diagnostics.len(), 1);
+        Ok(())
     }
 
     #[test]

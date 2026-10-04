@@ -15,8 +15,8 @@ use tui_tree_widget::{TreeItem, TreeState};
 
 use crate::compare::{Comparison, PartStatus};
 use crate::package::{
-    DiagnosticSeverity, Package, PackageIndex, PartInfo, PartKind, Relationship, TargetMode,
-    is_image_name, is_xml_name,
+    Diagnostic, DiagnosticSeverity, Package, PackageIndex, PartInfo, PartKind, Relationship,
+    TargetMode, is_image_name, is_xml_name,
 };
 use crate::preview::{Preview, PreviewKind};
 use crate::summary::{DetailLink, DetailsView};
@@ -167,6 +167,94 @@ fn push_detail_line(text: &mut String, line: &str) -> usize {
     text.push_str(line);
     text.push('\n');
     line_number
+}
+
+fn append_package_diagnostics(
+    text: &mut String,
+    links: &mut Vec<DetailLink>,
+    index: &PackageIndex,
+    side: Option<&str>,
+) {
+    if !index.warnings.is_empty() {
+        push_detail_line(text, "");
+        push_detail_line(
+            text,
+            &side.map_or_else(|| "Warnings".to_string(), |side| format!("{side} warnings")),
+        );
+        for warning in &index.warnings {
+            push_detail_line(text, &format!("- {}", compact_text(warning, 56)));
+        }
+    }
+
+    if !index.integrity.is_empty() {
+        push_detail_line(text, "");
+        let prefix = side.map_or_else(String::new, |side| format!("{side} "));
+        let jump = if side.is_none() || side == Some("A") {
+            "  [i/I jump]"
+        } else {
+            ""
+        };
+        push_detail_line(
+            text,
+            &format!("{prefix}Integrity issues ({}){jump}", index.integrity.len()),
+        );
+        for issue in index.integrity.iter().take(MAX_INTEGRITY_LINES) {
+            let severity = match issue.severity {
+                DiagnosticSeverity::Error => "error",
+                DiagnosticSeverity::Warning => "warn",
+            };
+            let prefix = format!("  [{severity}] ");
+            let message = compact_text(&issue.message, 64);
+            let line_number = push_detail_line(text, &format!("{prefix}{message}"));
+            if let Some(part) = issue.part.as_deref() {
+                let start = prefix.chars().count();
+                links.push(DetailLink {
+                    line: line_number,
+                    start,
+                    end: start + message.chars().count(),
+                    target: part.to_string(),
+                });
+            }
+        }
+        if index.integrity.len() > MAX_INTEGRITY_LINES {
+            push_detail_line(
+                text,
+                &format!("  … {} more", index.integrity.len() - MAX_INTEGRITY_LINES),
+            );
+        }
+    }
+}
+
+fn append_comparison_diagnostics(text: &mut String, comparison: &Comparison, selected: &str) {
+    let diagnostics: Vec<&Diagnostic> = comparison
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .part
+                .as_deref()
+                .is_none_or(|path| path == selected)
+        })
+        .collect();
+    if diagnostics.is_empty() {
+        return;
+    }
+    push_detail_line(text, "");
+    push_detail_line(text, "Comparison diagnostics");
+    for diagnostic in diagnostics {
+        let severity = match diagnostic.severity {
+            DiagnosticSeverity::Error => "error",
+            DiagnosticSeverity::Warning => "warn",
+        };
+        push_detail_line(
+            text,
+            &format!(
+                "- [{severity}] {}: {}",
+                diagnostic.stage,
+                compact_text(&diagnostic.message, 56)
+            ),
+        );
+    }
 }
 
 fn append_comparison_side(text: &mut String, side: &str, index: &PackageIndex, selected: &str) {
@@ -815,8 +903,11 @@ impl App {
             push_detail_line(&mut text, &compare.comparison.summary_line());
             push_detail_line(&mut text, "");
             append_comparison_side(&mut text, "A", index, selected);
+            append_package_diagnostics(&mut text, &mut links, index, Some("A"));
             push_detail_line(&mut text, "");
             append_comparison_side(&mut text, "B", &compare.package.index, selected);
+            append_package_diagnostics(&mut text, &mut links, &compare.package.index, Some("B"));
+            append_comparison_diagnostics(&mut text, &compare.comparison, selected);
             append_comparison_relationships(
                 &mut text,
                 &mut links,
@@ -913,46 +1004,7 @@ impl App {
             }
         }
 
-        if !index.warnings.is_empty() {
-            push_detail_line(&mut text, "");
-            push_detail_line(&mut text, "Warnings");
-            for warning in &index.warnings {
-                push_detail_line(&mut text, &format!("- {}", compact_text(warning, 56)));
-            }
-        }
-
-        let issues = &index.integrity;
-        if !issues.is_empty() {
-            push_detail_line(&mut text, "");
-            push_detail_line(
-                &mut text,
-                &format!("Integrity issues ({})  [i/I jump]", issues.len()),
-            );
-            for issue in issues.iter().take(MAX_INTEGRITY_LINES) {
-                let severity = match issue.severity {
-                    DiagnosticSeverity::Error => "error",
-                    DiagnosticSeverity::Warning => "warn",
-                };
-                let prefix = format!("  [{severity}] ");
-                let message = compact_text(&issue.message, 64);
-                let line_number = push_detail_line(&mut text, &format!("{prefix}{message}"));
-                if let Some(part) = issue.part.as_deref() {
-                    let start = prefix.chars().count();
-                    links.push(DetailLink {
-                        line: line_number,
-                        start,
-                        end: start + message.chars().count(),
-                        target: part.to_string(),
-                    });
-                }
-            }
-            if issues.len() > MAX_INTEGRITY_LINES {
-                push_detail_line(
-                    &mut text,
-                    &format!("  … {} more", issues.len() - MAX_INTEGRITY_LINES),
-                );
-            }
-        }
+        append_package_diagnostics(&mut text, &mut links, index, None);
 
         DetailsView { text, links }
     }
@@ -1865,10 +1917,12 @@ impl App {
             return;
         }
 
-        let mut matches: Vec<String> = self
-            .index()
-            .parts
-            .keys()
+        let mut paths: BTreeSet<&String> = self.index().parts.keys().collect();
+        if let Some(compare) = self.compare.as_ref() {
+            paths.extend(compare.package.index.parts.keys());
+        }
+        let mut matches: Vec<String> = paths
+            .into_iter()
             .filter(|path| path.to_ascii_lowercase().contains(&query))
             .cloned()
             .collect();
@@ -2078,7 +2132,7 @@ mod tests {
     use crate::preview::PreviewKind;
     use crate::{App, worker::Worker};
     use ratatui_image::picker::Picker;
-    use std::{io, time::Duration};
+    use std::{io, sync::Arc, time::Duration};
 
     /// Pump the worker until `done` holds, with a generous timeout. Tests run the
     /// real worker thread; they only avoid fixed sleeps.
@@ -3143,6 +3197,63 @@ mod tests {
         app.load_selected_file_content()?;
         preview_loaded(&mut app);
         assert!(editor_text(&app).contains("No differences"));
+
+        // Filename search and navigation include parts that exist only in B.
+        app.start_search();
+        for character in "slide2.xml".chars() {
+            app.search_input_char(character);
+        }
+        app.finish_search();
+        assert!(
+            app.search_matches
+                .contains(&"/ppt/slides/slide2.xml".to_string())
+        );
+        app.next_search_match(false);
+        assert_eq!(
+            app.tree_state.selected().last().unwrap(),
+            "/ppt/slides/slide2.xml"
+        );
+        app.cancel_search();
+
+        // Both package diagnostics and comparison-time diagnostics are visible.
+        Arc::make_mut(&mut app.package.as_mut().unwrap().index)
+            .warnings
+            .push("A package warning".to_string());
+        Arc::make_mut(&mut app.package.as_mut().unwrap().index)
+            .integrity
+            .push(crate::package::Diagnostic::warning(
+                "test",
+                Some("/ppt/presentation.xml".to_string()),
+                "A integrity warning",
+            ));
+        Arc::make_mut(&mut app.compare.as_mut().unwrap().package.index)
+            .warnings
+            .push("B package warning".to_string());
+        Arc::make_mut(&mut app.compare.as_mut().unwrap().package.index)
+            .integrity
+            .push(crate::package::Diagnostic::warning(
+                "test",
+                Some("/ppt/presentation.xml".to_string()),
+                "B integrity warning",
+            ));
+        app.compare.as_mut().unwrap().comparison.diagnostics.push(
+            crate::package::Diagnostic::warning(
+                "compare",
+                Some("/ppt/presentation.xml".to_string()),
+                "Comparison normalization warning",
+            ),
+        );
+        app.details_generation = app.details_generation.wrapping_add(1);
+        app.select_path("/ppt/presentation.xml");
+        let details = app.details_view().text.clone();
+        assert!(details.contains("A warnings") && details.contains("A package warning"));
+        assert!(details.contains("B warnings") && details.contains("B package warning"));
+        assert!(details.contains("A Integrity issues") && details.contains("A integrity warning"));
+        assert!(details.contains("B Integrity issues") && details.contains("B integrity warning"));
+        assert!(
+            details.contains("Comparison diagnostics")
+                && details.contains("Comparison normalization warning")
+        );
 
         std::fs::remove_file(&before)?;
         std::fs::remove_file(&after)?;
