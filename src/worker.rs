@@ -1,7 +1,7 @@
 //! Bounded background package work. UI state is never shared with this worker.
 use std::{
-    fs::File,
-    io,
+    fs::{File, OpenOptions},
+    io::{self, Write as _},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -39,6 +39,31 @@ pub enum Job {
         query: String,
         index: Arc<PackageIndex>,
     },
+    ExportPart {
+        request_id: u64,
+        package_path: PathBuf,
+        part: Box<PartInfo>,
+        index: Arc<PackageIndex>,
+        mode: ExportMode,
+    },
+}
+
+/// How a selected part leaves `oox`.
+#[derive(Clone, Debug)]
+pub enum ExportMode {
+    /// Raw, byte-identical part bytes written to this path.
+    SaveTo(PathBuf),
+    /// Raw, byte-identical part bytes written to a fresh temporary file.
+    OpenTemp,
+    /// Pretty-printed preview text for the clipboard.
+    Clipboard,
+}
+
+#[derive(Clone, Debug)]
+pub enum ExportOutcome {
+    Saved(PathBuf),
+    TempFile(PathBuf),
+    Clipboard(String),
 }
 
 #[derive(Debug)]
@@ -64,6 +89,10 @@ pub enum ResultMessage {
         request_id: u64,
         query: String,
         matches: Result<Vec<String>, String>,
+    },
+    Exported {
+        request_id: u64,
+        outcome: Result<ExportOutcome, String>,
     },
 }
 
@@ -200,6 +229,21 @@ impl Worker {
                                 request_id,
                                 query,
                                 matches,
+                            }
+                        }
+                        Job::ExportPart {
+                            request_id,
+                            package_path,
+                            part,
+                            index,
+                            mode,
+                        } => {
+                            let outcome =
+                                export_part(&mut archive_cache, &package_path, &part, &index, mode)
+                                    .map_err(|error| error.to_string());
+                            ResultMessage::Exported {
+                                request_id,
+                                outcome,
                             }
                         }
                     };
@@ -356,6 +400,77 @@ fn search_content(
         }
     }
     Ok(matches)
+}
+
+/// Read the raw part bytes under the same bound as previews, so export honors
+/// the existing per-part read limit.
+fn read_bytes(
+    cache: &mut ArchiveCache,
+    package_path: &Path,
+    part: &PartInfo,
+    index: &PackageIndex,
+) -> io::Result<Vec<u8>> {
+    let archive = cached_archive(cache, package_path)?;
+    index.read_part(archive, &part.path, MAX_ENTRY_BYTES)
+}
+
+fn export_part(
+    cache: &mut ArchiveCache,
+    package_path: &Path,
+    part: &PartInfo,
+    index: &PackageIndex,
+    mode: ExportMode,
+) -> io::Result<ExportOutcome> {
+    match mode {
+        ExportMode::Clipboard => match read_preview(cache, package_path, part, index)? {
+            Preview::Editor { text, .. } => Ok(ExportOutcome::Clipboard(text)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "part has no text preview to copy",
+            )),
+        },
+        ExportMode::SaveTo(destination) => {
+            let bytes = read_bytes(cache, package_path, part, index)?;
+            write_new_file(&destination, &bytes)?;
+            Ok(ExportOutcome::Saved(destination))
+        }
+        ExportMode::OpenTemp => {
+            let bytes = read_bytes(cache, package_path, part, index)?;
+            Ok(ExportOutcome::TempFile(write_temp_file(
+                &part.archive_name,
+                &bytes,
+            )?))
+        }
+    }
+}
+
+/// `create_new` refuses to clobber an existing file (and does not follow
+/// symlinks), so extracting never silently destroys unrelated data.
+fn write_new_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?
+        .write_all(bytes)
+}
+
+/// Temporary files keep the part's file name so editors and pagers can pick a
+/// syntax mode from the extension.
+fn write_temp_file(archive_name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    let base = Path::new(archive_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("part");
+    let directory = std::env::temp_dir();
+    for attempt in 0..100 {
+        let candidate = directory.join(format!("oox-{}-{attempt}-{base}", std::process::id()));
+        match write_new_file(&candidate, bytes) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::other("could not allocate a temporary file"))
 }
 
 fn stream_contains<R: io::Read>(reader: &mut R, needle: &[u8]) -> io::Result<bool> {

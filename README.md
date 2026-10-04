@@ -9,6 +9,7 @@ A terminal user interface for inspecting Office Open XML (OOXML) documents such 
 - **Image preview** — Preview common embedded PNG, JPEG, GIF, BMP, and WebP images.
 - **Raw file previews** — View plain text and JSON, inspect `.bin` files as hex, and see metadata for binary media, fonts, and OLE parts.
 - **Content search** — Grep package-part contents in the background and filter the tree to matching parts.
+- **Export parts** — Extract a part to a file, open it in `$PAGER`/`$EDITOR`, or copy its pretty-printed content to the clipboard (OSC 52).
 - **Document summaries** — Press `s` to inspect slide, paragraph, heading, table, sheet, cell, and formula summaries for PowerPoint, Word, and Excel packages; linked part paths navigate back to the tree.
 - **Vim-like navigation** — Move through files with `j`/`k` and the editor with Vim bindings.
 
@@ -61,6 +62,9 @@ oox --version
 | `Ctrl-d` / `Ctrl-u` | Scroll down / up in the tree       |
 | `g` / `G` | Select the first / last visible item        |
 | `E` / `C` | Expand / collapse all tree nodes              |
+| `e`       | Extract the selected part to a file         |
+| `o`       | Open the selected part in `$PAGER`/`$EDITOR` |
+| `y`       | Copy pretty-printed content to the clipboard |
 | `/`       | Search and live-filter package paths          |
 | `Ctrl-f`  | Search part contents in the background       |
 | `n` / `N` | Select the next / previous search match     |

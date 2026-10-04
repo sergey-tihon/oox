@@ -2,13 +2,13 @@ use std::{
     error::Error,
     fs::OpenOptions,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
 use clap::Parser;
 
-use app::{App, CurrentWidget};
+use app::{App, CurrentWidget, PendingExport};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -126,6 +126,152 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Finish background export work. Only the event loop has the terminal, so this
+/// is where external commands run and OSC 52 bytes reach the backend.
+fn apply_export(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    app: &mut App,
+    export: PendingExport,
+) -> io::Result<()> {
+    match export {
+        PendingExport::Extracted(path) => {
+            app.status_message = Some(format!("Extracted part to {}", path.display()));
+        }
+        PendingExport::Clipboard(text) => match osc52_sequence(&text) {
+            Ok(sequence) => {
+                terminal.backend_mut().write_all(sequence.as_bytes())?;
+                io::Write::flush(terminal.backend_mut())?;
+                app.status_message = Some(format!(
+                    "Copied {} bytes to the clipboard (OSC 52)",
+                    text.len()
+                ));
+            }
+            Err(error) => {
+                app.status_message = Some(format!("Clipboard copy failed: {error}"));
+            }
+        },
+        PendingExport::OpenTemp(path) => {
+            let result = open_external(terminal, &path);
+            // The temp copy is a read-only snapshot; drop it on return.
+            let _ = std::fs::remove_file(&path);
+            app.status_message = Some(match result {
+                Ok(()) => format!(
+                    "Returned from {} for {}",
+                    external_command_label(),
+                    path.display()
+                ),
+                Err(error) => format!("Could not open external viewer: {error}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `$PAGER` first, then `$EDITOR`, then `$VISUAL`: inspecting is the common case,
+/// editing the read-only snapshot the rare one.
+fn external_command() -> Option<(String, Vec<String>)> {
+    let value = ["PAGER", "EDITOR", "VISUAL"].iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })?;
+    let mut parts = value.split_whitespace();
+    let program = parts.next()?.to_string();
+    Some((program, parts.map(str::to_string).collect()))
+}
+
+fn external_command_label() -> String {
+    external_command()
+        .map(|(program, _)| program)
+        .unwrap_or_default()
+}
+
+fn open_external(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    path: &Path,
+) -> io::Result<()> {
+    let (program, args) = external_command().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no $PAGER, $EDITOR, or $VISUAL is set",
+        )
+    })?;
+    with_terminal_suspended(terminal, || {
+        let status = std::process::Command::new(&program)
+            .args(&args)
+            .arg(path)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("{program} exited with {status}")))
+        }
+    })
+}
+
+/// Hand the terminal to a child process, then always take it back, so a failed
+/// or interrupted viewer cannot leave `oox` in a broken state.
+fn with_terminal_suspended<T>(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    run: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    let result = run();
+
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
+    terminal.clear()?;
+    result
+}
+
+/// Terminals truncate oversized OSC 52 payloads, so refuse rather than silently
+/// copying a partial part.
+const MAX_CLIPBOARD_BYTES: usize = 100_000;
+
+fn osc52_sequence(text: &str) -> io::Result<String> {
+    if text.len() > MAX_CLIPBOARD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("content exceeds the {MAX_CLIPBOARD_BYTES} byte clipboard limit"),
+        ));
+    }
+    Ok(format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes())))
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let third = u32::from(*chunk.get(2).unwrap_or(&0));
+        let packed =
+            (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | third;
+        encoded.push(ALPHABET[(packed >> 18) as usize & 0x3f] as char);
+        encoded.push(ALPHABET[(packed >> 12) as usize & 0x3f] as char);
+        encoded.push(if chunk.len() > 1 {
+            ALPHABET[(packed >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            ALPHABET[packed as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    encoded
+}
+
 fn next_focus(current: CurrentWidget, details_visible: bool, backwards: bool) -> CurrentWidget {
     match (current, details_visible, backwards) {
         (CurrentWidget::Tree, true, false) => CurrentWidget::Details,
@@ -153,6 +299,10 @@ fn run_app(
     loop {
         if app.poll_worker() {
             redraw = true;
+        }
+        if let Some(export) = app.take_pending_export() {
+            redraw = true;
+            apply_export(terminal, app, export)?;
         }
         if redraw {
             terminal.draw(|f| ui::ui(f, app))?;
@@ -308,6 +458,23 @@ fn run_app(
                 continue;
             }
 
+            if app.export_active {
+                if actions.contains(&Action::Cancel) {
+                    debug_log("canceling extract");
+                    app.cancel_extract();
+                } else if actions.contains(&Action::Confirm) {
+                    debug_log(format!("confirming extract path={:?}", app.export_query));
+                    app.confirm_extract()?;
+                } else if actions.contains(&Action::Backspace) {
+                    app.export_backspace();
+                } else if let KeyCode::Char(character) = key.code {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                        app.export_input_char(character);
+                    }
+                }
+                continue;
+            }
+
             if actions.contains(&Action::NavigateBack) {
                 if app.is_package_loaded() {
                     app.navigate_back()?;
@@ -445,6 +612,12 @@ fn run_app(
                         } else {
                             app.next_search_match(true);
                         }
+                    } else if actions.contains(&Action::ExtractPart) {
+                        app.start_extract();
+                    } else if actions.contains(&Action::OpenPartExternally) {
+                        app.open_selected_externally()?;
+                    } else if actions.contains(&Action::CopyPartContent) {
+                        app.copy_selected_content()?;
                     } else if actions.contains(&Action::Cancel)
                         && (!app.search_query.is_empty() || app.has_content_search_query())
                     {
@@ -474,6 +647,12 @@ fn run_app(
                         if !app.details_visible {
                             app.current_widget = CurrentWidget::Tree;
                         }
+                    } else if actions.contains(&Action::ExtractPart) {
+                        app.start_extract();
+                    } else if actions.contains(&Action::OpenPartExternally) {
+                        app.open_selected_externally()?;
+                    } else if actions.contains(&Action::CopyPartContent) {
+                        app.copy_selected_content()?;
                     }
                 }
             }
@@ -481,5 +660,26 @@ fn run_app(
                 editor_handler.on_event(event, &mut app.editor_state);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::{MAX_CLIPBOARD_BYTES, base64_encode, osc52_sequence};
+
+    #[test]
+    fn base64_matches_rfc4648_padding() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(&[0xff, 0xfe, 0xfd]), "//79");
+    }
+
+    #[test]
+    fn oversized_clipboard_content_is_refused() {
+        assert!(osc52_sequence(&"a".repeat(MAX_CLIPBOARD_BYTES + 1)).is_err());
+        assert_eq!(osc52_sequence("hi").unwrap(), "\x1b]52;c;aGk=\x07");
     }
 }
