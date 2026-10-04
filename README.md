@@ -30,14 +30,14 @@ A terminal user interface for inspecting Office Open XML (OOXML) documents such 
 Install the published binary from crates.io:
 
 ```bash
-cargo install oox
+cargo install oox-tui
 ```
 
 Or install the latest source version:
 
 ```bash
-git clone https://github.com/sergey-tihon/ooxml-tui.git
-cd ooxml-tui
+git clone https://github.com/sergey-tihon/oox.git
+cd oox
 cargo install --path .
 ```
 
