@@ -20,7 +20,9 @@ crossterm = "0.29"
 crossterm-keybind = "0.4.3"
 dirs = "7.0"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order`/`arbitrary_precision` keep an edited JSON part byte-faithful:
+# key order and number literals (`1.10`) survive the pretty-print round trip.
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 ratatui = "0.30"
 tui-tree-widget = "0.24"
 edtui = { version = "0.11", default-features = false, features = ["syntax-highlighting", "mouse-support"] }

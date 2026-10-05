@@ -1,7 +1,7 @@
 //! Canonical OOXML package metadata and bounded archive access.
 use std::{
     collections::BTreeMap,
-    io::{self, Read, Seek},
+    io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,6 +11,7 @@ use quick_xml::{
     Reader,
     events::{BytesStart, Event},
 };
+use zip::write::SimpleFileOptions;
 
 pub const MAX_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
@@ -307,6 +308,81 @@ impl PackageIndex {
                 .keys()
                 .any(|child| child.starts_with(&format!("{path}/")))
     }
+}
+
+/// Copy `source` into `writer`, replacing the listed parts by `edits` (keyed by
+/// package path).
+///
+/// Entry order is the source order and untouched entries are copied as raw
+/// compressed bytes, so a part that was not edited comes back byte-identical.
+/// An edited entry keeps its compression method, timestamp, and permissions, so
+/// only its contents change. The effective output entry count and total
+/// uncompressed size are checked against the same limits used during indexing.
+pub fn write_edited<R: Read + Seek, W: Write + Seek>(
+    source: &mut zip::ZipArchive<R>,
+    writer: &mut zip::ZipWriter<W>,
+    index: &PackageIndex,
+    edits: &BTreeMap<String, Vec<u8>>,
+) -> io::Result<()> {
+    // Package paths are normalized; the archive wants the original entry names.
+    let mut replacements: BTreeMap<String, &[u8]> = BTreeMap::new();
+    for (path, bytes) in edits {
+        let part = index.parts.get(path).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("part not found: {path}"))
+        })?;
+        replacements.insert(part.archive_name.clone(), bytes.as_slice());
+    }
+
+    let entry_count = source.len();
+    check_archive_limits(entry_count, 0)?;
+    let mut total_uncompressed = 0u64;
+
+    let comment = source.comment().to_vec();
+    if !comment.is_empty() {
+        writer
+            .set_raw_comment(comment.into_boxed_slice())
+            .map_err(io::Error::other)?;
+    }
+
+    for entry_index in 0..entry_count {
+        let entry = source.by_index_raw(entry_index).map_err(io::Error::other)?;
+        let name = entry.name().to_string();
+        let replacement = replacements.remove(&name);
+        let effective_size = match replacement {
+            Some(bytes) => u64::try_from(bytes.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "replacement size exceeds u64")
+            })?,
+            None => entry.size(),
+        };
+        total_uncompressed = total_uncompressed.saturating_add(effective_size);
+        check_archive_limits(entry_count, total_uncompressed)?;
+        let Some(bytes) = replacement else {
+            writer.raw_copy_file(entry).map_err(io::Error::other)?;
+            continue;
+        };
+        // Recompress using the original method. If this zip build lacks a
+        // compressor for that method, `start_file`/`write_all` fails rather than
+        // silently changing the entry's compression format.
+        let method = entry.compression();
+        let mut options = SimpleFileOptions::default().compression_method(method);
+        if let Some(modified) = entry.last_modified() {
+            options = options.last_modified_time(modified);
+        }
+        if let Some(mode) = entry.unix_mode() {
+            options = options.unix_permissions(mode);
+        }
+        writer.start_file(name, options).map_err(io::Error::other)?;
+        writer.write_all(bytes)?;
+    }
+    // A replacement whose archive entry was never seen would be reported as a
+    // successful save while silently keeping the old bytes.
+    if let Some(name) = replacements.keys().next() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("archive entry not found: {name}"),
+        ));
+    }
+    Ok(())
 }
 
 /// A package owns the canonical source path and immutable metadata snapshot.
@@ -690,29 +766,113 @@ mod tests {
 
     #[cfg(test)]
     fn archive_with_declared_sizes(names: &[&str], declared_size: u32) -> Vec<u8> {
+        let entries: Vec<_> = names.iter().map(|name| (*name, declared_size)).collect();
+        archive_with_entry_sizes(&entries)
+    }
+
+    #[cfg(test)]
+    fn archive_with_entry_sizes(entries: &[(&str, u32)]) -> Vec<u8> {
         use std::io::Write;
         use zip::write::SimpleFileOptions;
 
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        for name in names {
+        for (name, _) in entries {
             writer
                 .start_file(*name, SimpleFileOptions::default())
                 .unwrap();
             writer.write_all(b"x").unwrap();
         }
         let mut bytes = writer.finish().unwrap().into_inner();
-        let local_header = b"PK\x03\x04";
-        let central_header = b"PK\x01\x02";
         for offset in 0..bytes.len().saturating_sub(3) {
-            if bytes[offset..].starts_with(local_header) {
-                bytes[offset + 22..offset + 26].copy_from_slice(&declared_size.to_le_bytes());
-            } else if bytes[offset..].starts_with(central_header) {
-                bytes[offset + 24..offset + 28].copy_from_slice(&declared_size.to_le_bytes());
+            let (name_length_offset, name_offset, size_offset) =
+                if bytes[offset..].starts_with(&[0x50, 0x4b, 0x03, 0x04]) {
+                    (offset + 26, offset + 30, offset + 22)
+                } else if bytes[offset..].starts_with(&[0x50, 0x4b, 0x01, 0x02]) {
+                    (offset + 28, offset + 46, offset + 24)
+                } else {
+                    continue;
+                };
+            let name_length =
+                u16::from_le_bytes([bytes[name_length_offset], bytes[name_length_offset + 1]])
+                    as usize;
+            let name = std::str::from_utf8(&bytes[name_offset..name_offset + name_length]).unwrap();
+            if let Some((_, declared_size)) = entries.iter().find(|(entry, _)| *entry == name) {
+                bytes[size_offset..size_offset + 4].copy_from_slice(&declared_size.to_le_bytes());
             }
         }
         bytes
     }
 
+    #[test]
+    fn rewrite_rejects_replacements_that_push_total_size_over_limit() {
+        use std::io::Cursor;
+
+        // The input declares MAX-1 and 1 bytes (exactly at the allowed total),
+        // but stores just one byte per entry. The edit grows the second part by
+        // one byte, so no large allocation is needed to exercise the boundary.
+        let source_bytes = archive_with_entry_sizes(&[
+            ("large.bin", (MAX_TOTAL_UNCOMPRESSED_BYTES - 1) as u32),
+            ("edit.xml", 1),
+        ]);
+        let mut source = zip::ZipArchive::new(Cursor::new(source_bytes)).unwrap();
+        let mut index = PackageIndex::default();
+        index.parts.insert(
+            "/edit.xml".to_string(),
+            PartInfo {
+                path: "/edit.xml".to_string(),
+                archive_name: "edit.xml".to_string(),
+                content_type: None,
+                size: 1,
+                compressed_size: 1,
+                crc32: 0,
+                kind: PartKind::Xml,
+            },
+        );
+        let edits = BTreeMap::from([("/edit.xml".to_string(), b"xx".to_vec())]);
+        let mut output = zip::ZipWriter::new(Cursor::new(Vec::new()));
+
+        let error = write_edited(&mut source, &mut output, &index, &edits)
+            .expect_err("rewrites must honor the package total-size limit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("uncompressed size"));
+    }
+
+    #[test]
+    fn rewrite_does_not_silently_change_unsupported_compression() {
+        use std::io::Cursor;
+
+        // Mark a tiny stored fixture with an unknown ZIP compression method.
+        // Rewrite must fail rather than silently converting it to Deflate.
+        let mut archive_bytes = archive_with_declared_sizes(&["edit.xml"], 1);
+        let method = 0xffff_u16;
+        for offset in 0..archive_bytes.len().saturating_sub(3) {
+            if archive_bytes[offset..].starts_with(&[0x50, 0x4b, 0x03, 0x04]) {
+                archive_bytes[offset + 8..offset + 10].copy_from_slice(&method.to_le_bytes());
+            } else if archive_bytes[offset..].starts_with(&[0x50, 0x4b, 0x01, 0x02]) {
+                archive_bytes[offset + 10..offset + 12].copy_from_slice(&method.to_le_bytes());
+            }
+        }
+        let mut source = zip::ZipArchive::new(Cursor::new(archive_bytes)).unwrap();
+        let mut index = PackageIndex::default();
+        index.parts.insert(
+            "/edit.xml".to_string(),
+            PartInfo {
+                path: "/edit.xml".to_string(),
+                archive_name: "edit.xml".to_string(),
+                content_type: None,
+                size: 1,
+                compressed_size: 1,
+                crc32: 0,
+                kind: PartKind::Xml,
+            },
+        );
+        let edits = BTreeMap::from([("/edit.xml".to_string(), b"xx".to_vec())]);
+        let mut output = zip::ZipWriter::new(Cursor::new(Vec::new()));
+
+        let error = write_edited(&mut source, &mut output, &index, &edits)
+            .expect_err("unsupported source compression must not be changed silently");
+        assert!(error.to_string().contains("Unsupported compression"));
+    }
     #[test]
     fn ignored_entries_still_count_toward_total_size_limit() {
         let oversized_empty =

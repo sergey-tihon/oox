@@ -10,6 +10,7 @@ A terminal user interface for inspecting Office Open XML (OOXML) documents such 
 - **Raw file previews** — View plain text and JSON, inspect `.bin` files as hex, and see metadata for binary media, fonts, and OLE parts.
 - **Content search** — Grep package-part contents in the background and filter the tree to matching parts.
 - **Export parts** — Extract a part to a file, open it in `$PAGER`/`$EDITOR`, or copy its pretty-printed content to the clipboard (OSC 52).
+- **Edit and save** — The content pane is editable for XML, text, and JSON parts. `Ctrl-s` writes a new package (default `<name>.edited.<ext>`, overwriting only after a second confirm) that preserves every untouched part byte for byte and re-indexes the result; edited parts are marked with `●` in the tree, `q` warns about unsaved edits, and `Ctrl-e`/`F4` can round-trip the part through `$VISUAL`/`$EDITOR`.
 - **Inline relationship jumps** — Follow an `r:id`/`r:embed` reference inside the XML preview with `Ctrl-g` or a mouse click: internal targets open the referenced part (images preview directly), external URLs are reported in the status bar, and `Alt-Left` returns to where you jumped from.
 - **Document summaries** — Press `s` to inspect slide, paragraph, heading, table, sheet, cell, and formula summaries for PowerPoint, Word, and Excel packages; linked part paths navigate back to the tree.
 - **Package integrity** — Phase-1 OPC checks (dangling relationship targets, parts without a content type, orphan parts, duplicate relationship ids, missing required parts) are listed in the metadata panel, marked with `⚠` in the tree, and reachable with `i`/`I`.
@@ -72,6 +73,8 @@ oox --version
 | `e`       | Extract the selected part to a file         |
 | `o`       | Open the selected part in `$PAGER`/`$EDITOR` |
 | `y`       | Copy pretty-printed content to the clipboard |
+| `Ctrl-s` / `F2` | Save edited parts to a new package       |
+| `Ctrl-e` / `F4` | Edit the part in `$VISUAL`/`$EDITOR`, then return |
 | `/`       | Search and live-filter package paths          |
 | `Ctrl-f`  | Search part contents in the background       |
 | `n` / `N` | Select the next / previous search match     |
