@@ -408,6 +408,13 @@ fn editor_key_dirty_policy(
         return (mutates, false, false);
     }
 
+    if state_mode == EdtuiMode::Visual {
+        // These Visual-mode bindings mutate the selection immediately; they
+        // are not the multi-key operators that `d`/`c` start in Normal mode.
+        let mutates = unmodified && matches!(character, Some('d' | 'c' | 'x' | 'p'));
+        return (mutates, false, false);
+    }
+
     let restores_baseline =
         (state_mode == EdtuiMode::Normal && unmodified && character == Some('u'))
             || (modifiers == KeyModifiers::CONTROL && character == Some('r'));
@@ -1115,6 +1122,34 @@ mod tests {
                 false,
             ),
             (true, true, false)
+        );
+    }
+
+    #[test]
+    fn visual_mutations_are_not_classified_as_normal_operators() {
+        for character in ['d', 'c', 'x', 'p'] {
+            assert_eq!(
+                editor_key_dirty_policy(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                    EditorMode::Vim,
+                    EdtuiMode::Visual,
+                    false,
+                ),
+                (true, false, false),
+                "Visual {character} mutates immediately",
+            );
+        }
+        assert_eq!(
+            editor_key_dirty_policy(
+                KeyCode::Char('d'),
+                KeyModifiers::NONE,
+                EditorMode::Vim,
+                EdtuiMode::Normal,
+                false,
+            ),
+            (false, false, true),
+            "Normal d still starts an operator",
         );
     }
 

@@ -220,8 +220,8 @@ pub struct App {
     save_warnings: Vec<String>,
     save_request_id: u64,
     save_pending: bool,
-    /// The last path this session wrote, so saving again does not re-ask about
-    /// overwriting its own output.
+    /// The last path this session wrote, used to choose the default target for
+    /// another save. Its previous contents do not authorize future overwrites.
     last_saved: Option<PathBuf>,
     /// Part to select once a saved package has been re-indexed, with the cursor to
     /// put back once its buffer has been read.
@@ -2345,8 +2345,8 @@ impl App {
         self.status_message = None;
     }
 
-    /// Confirm the target. A path that already exists but was not written by
-    /// this session is asked about a second time, and never overwritten silently.
+    /// Any occupied target requires an explicit second confirmation, including
+    /// a target this session saved earlier: another process may have changed it.
     pub fn confirm_save(&mut self) -> io::Result<()> {
         let target = self.save_query.trim().to_string();
         if target.is_empty() {
@@ -2360,16 +2360,14 @@ impl App {
             self.status_message = Some(format!("{target} is a directory"));
             return Ok(());
         }
-        let written_here = self.last_saved.as_deref() == Some(Path::new(&target));
         // `exists()` follows symlinks, so a dangling one would slip past the
         // confirmation and be replaced by the install. Any directory entry at
         // the path, symlink included, has to be asked about.
         let occupied = std::fs::symlink_metadata(&target_path).is_ok();
-        // The authorization is decided here, where the user's answer lives, and
-        // carried into the job: the worker must not re-decide it against a path
-        // that may have changed in the meantime.
-        let overwrite = written_here || self.save_confirm.as_deref() == Some(&target);
-        if occupied && !written_here && self.save_confirm.as_deref() != Some(&target) {
+        // Authorization belongs to this exact prompt interaction; having saved
+        // the path in the past does not protect against external modification.
+        let overwrite = self.save_confirm.as_deref() == Some(&target);
+        if occupied && !overwrite {
             // The prompt itself renders the confirmation, so no status message.
             self.save_confirm = Some(target.clone());
             return Ok(());
@@ -4493,6 +4491,40 @@ mod tests {
         assert_ne!(std::fs::read("data/sample.pptx")?, std::fs::read(&victim)?);
 
         std::fs::remove_file(&victim)?;
+        Ok(())
+    }
+
+    /// A path written by this session is only a default, not lasting overwrite
+    /// authorization: another process may replace the file before the next save.
+    #[test]
+    fn a_previously_saved_target_requires_confirmation_again() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        let target = temp_save_path("previously-saved.pptx");
+        let _ = std::fs::remove_file(&target);
+        std::fs::copy("data/sample.pptx", &target)?;
+        let external_contents = std::fs::read(&target)?;
+        app.last_saved = Some(target.clone());
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>second edit</a>")?;
+
+        app.start_save();
+        assert!(app.save_active);
+        assert_eq!(app.save_query, target.to_string_lossy());
+        app.confirm_save()?;
+
+        assert!(app.save_active, "the overwrite confirmation must stay open");
+        assert!(!app.save_pending);
+        assert_eq!(std::fs::read(&target)?, external_contents);
+        assert!(
+            app.selection_status().contains("exists"),
+            "prompt did not ask: {}",
+            app.selection_status()
+        );
+
+        app.confirm_save()?;
+        pump_until(&mut app, |app| !app.save_pending);
+        pump_until(&mut app, |app| !app.loading);
+        assert_ne!(std::fs::read(&target)?, external_contents);
+        std::fs::remove_file(&target)?;
         Ok(())
     }
 
