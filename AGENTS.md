@@ -12,7 +12,7 @@
 - `src/integrity.rs` — Phase-1 OPC package integrity checks over an indexed package (dangling targets, missing content types, orphans, duplicate relationship ids, missing required parts).
 - `src/preview.rs` — Part-preview classification and formatters (XML/JSON pretty-print, hex dump, binary info), with bounded output writers; `editable` on `Preview::Editor` says whether the text can be written back, and `xml_well_formed` is the advisory check used before saving.
 - `src/summary/` — Document summary view model (`mod.rs`) and per-format parsers (`ppt.rs`, `word.rs`, `excel.rs`).
-- `src/worker.rs` — Background worker thread; owns a cached `ZipArchive` handle and receives the shared `Arc<PackageIndex>`. `Job::SavePackage` rewrites a package into a temporary file and renames it over the target, so a failed save never damages the original.
+- `src/worker.rs` — Background worker thread; owns a cached `ZipArchive` handle and receives the shared `Arc<PackageIndex>`. `Job::SavePackage` builds a validated sibling temporary package, then installs it with a no-clobber hard link for new targets or an atomic replacing rename for confirmed overwrites.
 - `src/keybindings.rs` — Configurable `Action` bindings, editor mode, and generated help-overlay content.
 - `src/layout.rs` — Shared layout geometry used by both rendering and mouse hit testing.
 - `src/ui.rs` — Ratatui layout and widgets (tree + metadata + content + help).
