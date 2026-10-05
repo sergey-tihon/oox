@@ -751,12 +751,20 @@ fn save_package(
     // Re-open the result before it replaces anything, so a truncated write is
     // caught while the original is still intact.
     zip::ZipArchive::new(File::open(temp.path())?)?;
-    // The temporary file is owner-only while it is written. The final file takes
-    // the permissions of the file it replaces, or of the package it came from
-    // when the target is new, so an edit never narrows a shared document.
-    let template = std::fs::metadata(target).or_else(|_| std::fs::metadata(package_path));
-    if let Ok(template) = template {
-        std::fs::set_permissions(temp.path(), template.permissions())?;
+    // Preserve permissions only from a regular file being replaced. A symlink
+    // target must not borrow its referent's mode; for it (or a new target), use
+    // the source package's permissions instead.
+    let template_permissions = std::fs::symlink_metadata(target)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+        .map(|metadata| metadata.permissions())
+        .or_else(|| {
+            std::fs::metadata(package_path)
+                .ok()
+                .map(|metadata| metadata.permissions())
+        });
+    if let Some(permissions) = template_permissions {
+        std::fs::set_permissions(temp.path(), permissions)?;
     }
     // The cached handles are stale after the install, and on Windows a read
     // handle would block it. `temp` deletes its file if anything fails here.
@@ -778,6 +786,16 @@ fn save_package(
 /// `AlreadyExists` and leaves the existing entry untouched. On success, removing
 /// `source` leaves the target link to the same completed file contents. The
 /// temporary file lives beside the target, so the link cannot cross filesystems.
+fn hard_link_install_error(target: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "cannot install new package at {} without replacing an existing target because this filesystem refused a hard link: {error}; choose a filesystem that supports hard links or select an existing target and confirm overwrite",
+            target.display()
+        ),
+    )
+}
+
 fn install_without_replacing(source: &Path, target: &Path) -> io::Result<()> {
     match std::fs::hard_link(source, target) {
         Ok(()) => {
@@ -791,6 +809,14 @@ fn install_without_replacing(source: &Path, target: &Path) -> io::Result<()> {
                 target.display()
             ),
         )),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Err(hard_link_install_error(target, error))
+        }
         Err(error) => Err(error),
     }
 }
@@ -1091,5 +1117,21 @@ mod tests {
 
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::remove_file(&source);
+    }
+
+    #[test]
+    fn unsupported_hard_link_errors_explain_the_alternatives() {
+        let target = PathBuf::from("/shared/output.pptx");
+        for kind in [
+            std::io::ErrorKind::Unsupported,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let error = super::hard_link_install_error(&target, std::io::Error::from(kind));
+            assert_eq!(error.kind(), kind);
+            let message = error.to_string();
+            assert!(message.contains("hard link"));
+            assert!(message.contains("/shared/output.pptx"));
+            assert!(message.contains("confirm overwrite"));
+        }
     }
 }

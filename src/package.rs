@@ -11,7 +11,7 @@ use quick_xml::{
     Reader,
     events::{BytesStart, Event},
 };
-use zip::{CompressionMethod, write::SimpleFileOptions};
+use zip::write::SimpleFileOptions;
 
 pub const MAX_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
@@ -360,13 +360,10 @@ pub fn write_edited<R: Read + Seek, W: Write + Seek>(
             writer.raw_copy_file(entry).map_err(io::Error::other)?;
             continue;
         };
-        // Anything already compressed stays compressed; stored entries stay
-        // stored rather than being silently re-encoded.
-        let method = if entry.compression() == CompressionMethod::Stored {
-            CompressionMethod::Stored
-        } else {
-            CompressionMethod::Deflated
-        };
+        // Recompress using the original method. If this zip build lacks a
+        // compressor for that method, `start_file`/`write_all` fails rather than
+        // silently changing the entry's compression format.
+        let method = entry.compression();
         let mut options = SimpleFileOptions::default().compression_method(method);
         if let Some(modified) = entry.last_modified() {
             options = options.last_modified_time(modified);
@@ -838,6 +835,43 @@ mod tests {
             .expect_err("rewrites must honor the package total-size limit");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("uncompressed size"));
+    }
+
+    #[test]
+    fn rewrite_does_not_silently_change_unsupported_compression() {
+        use std::io::Cursor;
+
+        // Mark a tiny stored fixture with an unknown ZIP compression method.
+        // Rewrite must fail rather than silently converting it to Deflate.
+        let mut archive_bytes = archive_with_declared_sizes(&["edit.xml"], 1);
+        let method = 0xffff_u16;
+        for offset in 0..archive_bytes.len().saturating_sub(3) {
+            if archive_bytes[offset..].starts_with(&[0x50, 0x4b, 0x03, 0x04]) {
+                archive_bytes[offset + 8..offset + 10].copy_from_slice(&method.to_le_bytes());
+            } else if archive_bytes[offset..].starts_with(&[0x50, 0x4b, 0x01, 0x02]) {
+                archive_bytes[offset + 10..offset + 12].copy_from_slice(&method.to_le_bytes());
+            }
+        }
+        let mut source = zip::ZipArchive::new(Cursor::new(archive_bytes)).unwrap();
+        let mut index = PackageIndex::default();
+        index.parts.insert(
+            "/edit.xml".to_string(),
+            PartInfo {
+                path: "/edit.xml".to_string(),
+                archive_name: "edit.xml".to_string(),
+                content_type: None,
+                size: 1,
+                compressed_size: 1,
+                crc32: 0,
+                kind: PartKind::Xml,
+            },
+        );
+        let edits = BTreeMap::from([("/edit.xml".to_string(), b"xx".to_vec())]);
+        let mut output = zip::ZipWriter::new(Cursor::new(Vec::new()));
+
+        let error = write_edited(&mut source, &mut output, &index, &edits)
+            .expect_err("unsupported source compression must not be changed silently");
+        assert!(error.to_string().contains("Unsupported compression"));
     }
     #[test]
     fn ignored_entries_still_count_toward_total_size_limit() {

@@ -4988,6 +4988,47 @@ mod tests {
         Ok(())
     }
 
+    /// Replacing a symlink must not inherit the mode of its referent: the
+    /// installed target is a regular file, so use the package's mode instead.
+    #[cfg(unix)]
+    #[test]
+    fn overwriting_a_symlink_does_not_copy_referent_permissions() -> io::Result<()> {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+
+        let target = temp_save_path("symlink-target.pptx");
+        let referent = temp_save_path("symlink-referent.pptx");
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&referent);
+        std::fs::write(&referent, b"referent")?;
+        let source_mode = std::fs::metadata("data/sample.pptx")?.permissions().mode() & 0o777;
+        let referent_mode = if source_mode == 0o600 { 0o644 } else { 0o600 };
+        std::fs::set_permissions(&referent, std::fs::Permissions::from_mode(referent_mode))?;
+        symlink(&referent, &target)?;
+
+        app.submit_save(target.clone(), true)?;
+        pump_until(&mut app, |app| {
+            !app.is_saving() && !app.loading && !app.preview_pending
+        });
+
+        let installed = std::fs::symlink_metadata(&target)?;
+        assert!(
+            installed.file_type().is_file(),
+            "symlink should be replaced"
+        );
+        let installed_mode = installed.permissions().mode() & 0o777;
+        assert_eq!(installed_mode, source_mode);
+        assert_ne!(
+            installed_mode, referent_mode,
+            "must not inherit referent mode"
+        );
+
+        std::fs::remove_file(&target)?;
+        std::fs::remove_file(&referent)?;
+        Ok(())
+    }
+
     /// A dangling symlink occupies the path but `exists()` reports false, so it
     /// would otherwise be replaced without the second confirmation.
     #[cfg(unix)]

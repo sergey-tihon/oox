@@ -308,8 +308,11 @@ pub fn key_hint(action: Action) -> String {
 /// character, and Tab) plus the chords below; an app action bound to one of
 /// them would steal it from the editor. Everything else, including a
 /// user-configured chord such as `Alt+S`, is free for the app. edtui exposes no
-/// way to query its keymap, so this mirrors `emacs_keybindings` in edtui
-/// 0.11.7 and must be revisited when edtui is upgraded.
+/// way to query its keymap.
+/// The table mirrors `emacs_keybindings` in the edtui 0.11.7 version currently
+/// pinned by `Cargo.lock`; `Cargo.toml` permits compatible 0.11 patch updates.
+/// Recheck this predicate and `emacs_pane_leaves_only_editor_chords_to_the_editor`
+/// whenever the locked edtui version changes.
 pub fn emacs_editor_owns(key: &KeyEvent) -> bool {
     let modifiers = key.modifiers;
     match key.code {
