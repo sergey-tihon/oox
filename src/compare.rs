@@ -239,6 +239,7 @@ pub fn diff_part<R: Read + Seek, S: Read + Seek>(
     Ok(Preview::Editor {
         kind: PreviewKind::Diff,
         text,
+        editable: false,
     })
 }
 
@@ -246,6 +247,7 @@ fn no_differences(path: &str) -> Preview {
     Preview::Editor {
         kind: PreviewKind::Diff,
         text: format!("No differences in {path}\n"),
+        editable: false,
     }
 }
 

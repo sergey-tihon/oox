@@ -1,6 +1,9 @@
 use std::{fs, io, path::Path};
 
-use crossterm_keybind::{KeyBind, KeyBindTrait};
+use crossterm_keybind::{
+    DisplayFormat, KeyBind, KeyBindTrait,
+    event::{KeyCode, KeyEvent, KeyModifiers},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, KeyBind)]
 pub enum Action {
@@ -85,6 +88,15 @@ pub enum Action {
     /// Copy the pretty-printed part content to the clipboard (OSC 52).
     #[keybindings["y"]]
     CopyPartContent,
+    /// Save the edited parts back to a package file (a new file by default).
+    #[keybindings["Control+s", "F2"]]
+    SavePackage,
+    /// Hand the selected part to `$VISUAL`/`$EDITOR` and take the text back.
+    #[keybindings["Control+e", "F4"]]
+    EditPartExternally,
+    /// Discard the unsaved edits of the selected part.
+    #[keybindings["R", "Shift+R", "Shift+r"]]
+    RevertPart,
     /// Select the next search result.
     #[keybindings["n"]]
     NextMatch,
@@ -247,6 +259,22 @@ pub fn help_sections() -> Vec<(&'static str, Vec<HelpRow>)> {
             ],
         ),
         (
+            "Editing",
+            vec![
+                HelpRow::Text("The content pane is editable for XML, text and JSON parts"),
+                HelpRow::Binding(Action::SavePackage, "Save edited parts to a new package"),
+                HelpRow::Binding(
+                    Action::EditPartExternally,
+                    "Edit in $VISUAL / $EDITOR, then return",
+                ),
+                HelpRow::Binding(
+                    Action::RevertPart,
+                    "Discard unsaved edits of the part (press twice)",
+                ),
+                HelpRow::Text("●             Part with unsaved edits"),
+            ],
+        ),
+        (
             "Export",
             vec![
                 HelpRow::Binding(Action::ExtractPart, "Extract part to a file"),
@@ -265,6 +293,70 @@ pub fn help_sections() -> Vec<(&'static str, Vec<HelpRow>)> {
             ],
         ),
     ]
+}
+
+/// The configured key(s) for an action, for messages that tell the user which
+/// key to press. Empty when bindings have not been initialized, so it is safe to
+/// call from tests and from any code path that runs before startup.
+pub fn key_hint(action: Action) -> String {
+    action.key_bindings_display_with_format(&DisplayFormat::Abbreviation)
+}
+
+/// Whether edtui's Emacs keymap acts on `key` while the content pane has focus.
+///
+/// Emacs mode is modeless, so the editor owns typing (every plain or shifted
+/// character, and Tab) plus the chords below; an app action bound to one of
+/// them would steal it from the editor. Everything else, including a
+/// user-configured chord such as `Alt+S`, is free for the app. edtui exposes no
+/// way to query its keymap.
+/// The table mirrors `emacs_keybindings` in the edtui 0.11.7 version currently
+/// pinned by `Cargo.lock`; `Cargo.toml` permits compatible 0.11 patch updates.
+/// Recheck this predicate and `emacs_pane_leaves_only_editor_chords_to_the_editor`
+/// whenever the locked edtui version changes.
+pub fn emacs_editor_owns(key: &KeyEvent) -> bool {
+    let modifiers = key.modifiers;
+    match key.code {
+        KeyCode::Char(_) if modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT => {
+            true
+        }
+        KeyCode::Char(character) if modifiers == KeyModifiers::CONTROL => matches!(
+            character.to_ascii_lowercase(),
+            'a' | 'b'
+                | 'd'
+                | 'e'
+                | 'f'
+                | 'g'
+                | 'h'
+                | 'j'
+                | 'k'
+                | 'n'
+                | 'o'
+                | 'p'
+                | 'r'
+                | 's'
+                | 'u'
+                | 'v'
+                | 'y'
+        ),
+        KeyCode::Char(character) if modifiers == KeyModifiers::ALT => {
+            matches!(character, '<' | '>' | 'b' | 'd' | 'e' | 'f' | 'u' | 'v')
+        }
+        KeyCode::Left | KeyCode::Right if modifiers == KeyModifiers::CONTROL => true,
+        KeyCode::Backspace if modifiers == KeyModifiers::ALT => true,
+        KeyCode::Tab
+        | KeyCode::Enter
+        | KeyCode::Backspace
+        | KeyCode::Delete
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown => modifiers == KeyModifiers::NONE,
+        _ => false,
+    }
 }
 
 pub fn generate(path: &Path) -> io::Result<()> {
@@ -290,15 +382,24 @@ pub fn generate(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Action;
+    use super::{Action, emacs_editor_owns};
     use crossterm_keybind::{
         KeyBindTrait,
         event::{KeyCode, KeyEvent, KeyModifiers},
     };
 
+    /// The bindings are a process-wide table that is filled exactly once, as at
+    /// startup; a second `init_and_load` would drop the default aliases.
+    fn init_bindings() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            Action::init_and_load(None::<crossterm_keybind::toml::Value>).unwrap();
+        });
+    }
+
     #[test]
     fn shift_modified_uppercase_key_is_supported() {
-        Action::init_and_load(None::<crossterm_keybind::toml::Value>).unwrap();
+        init_bindings();
         let event = KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT);
         let actions = Action::dispatch(&event);
         assert!(actions.contains(&Action::ExpandAll));
@@ -312,5 +413,82 @@ mod tests {
 
         let extract = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
         assert!(Action::dispatch(&extract).contains(&Action::ExtractPart));
+    }
+
+    /// Ctrl+S reaches the editor in Vim mode, and F2/F4 are the fallbacks that
+    /// edtui never consumes.
+    #[test]
+    fn save_and_external_edit_keys_are_dispatched() {
+        init_bindings();
+        let save = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(Action::dispatch(&save).contains(&Action::SavePackage));
+        let f2 = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+        assert!(Action::dispatch(&f2).contains(&Action::SavePackage));
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert!(Action::dispatch(&ctrl_e).contains(&Action::EditPartExternally));
+        let f4 = KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE);
+        assert!(Action::dispatch(&f4).contains(&Action::EditPartExternally));
+        // The tree keeps `e` and `s` for its own actions.
+        let e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(Action::dispatch(&e).contains(&Action::ToggleSelected));
+    }
+
+    /// `R` is the revert key in both its raw and shift-modified spellings.
+    #[test]
+    fn revert_key_is_dispatched() {
+        init_bindings();
+        for event in [
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::SHIFT),
+        ] {
+            assert!(
+                Action::dispatch(&event).contains(&Action::RevertPart),
+                "{event:?} must revert"
+            );
+        }
+    }
+
+    /// In the Emacs content pane the editor keeps typing and its own chords,
+    /// while any other binding stays usable for app actions such as saving.
+    #[test]
+    fn emacs_pane_leaves_only_editor_chords_to_the_editor() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        // Owned by the editor: Ctrl+S is its search, and typing is typing.
+        assert!(emacs_editor_owns(&key(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(emacs_editor_owns(&key(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        )));
+        assert!(emacs_editor_owns(&key(
+            KeyCode::Char('S'),
+            KeyModifiers::SHIFT
+        )));
+        assert!(emacs_editor_owns(&key(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(emacs_editor_owns(&key(
+            KeyCode::Left,
+            KeyModifiers::CONTROL
+        )));
+        assert!(emacs_editor_owns(&key(
+            KeyCode::Backspace,
+            KeyModifiers::ALT
+        )));
+        // Free for the app: the default F2 and chords edtui does not bind.
+        assert!(!emacs_editor_owns(&key(KeyCode::F(2), KeyModifiers::NONE)));
+        assert!(!emacs_editor_owns(&key(
+            KeyCode::Char('s'),
+            KeyModifiers::ALT
+        )));
+        assert!(!emacs_editor_owns(&key(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )));
+        assert!(!emacs_editor_owns(&key(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL
+        )));
     }
 }

@@ -1,6 +1,6 @@
 //! Bounded background package work. UI state is never shared with this worker.
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs::{File, OpenOptions},
     io::{self, Write as _},
     path::{Path, PathBuf},
@@ -15,7 +15,7 @@ use std::{
 
 use crate::{
     compare::{self, Comparison},
-    package::{Diagnostic, MAX_ENTRY_BYTES, Package, PackageIndex, PartInfo, PartKind},
+    package::{self, Diagnostic, MAX_ENTRY_BYTES, Package, PackageIndex, PartInfo, PartKind},
     preview::{Preview, PreviewKind, build_preview},
     summary::{DetailsView, build_document_summary},
 };
@@ -62,6 +62,21 @@ pub enum Job {
         part: Box<PartInfo>,
         index: Arc<PackageIndex>,
         mode: ExportMode,
+    },
+    /// Write a new package with the listed parts replaced, then re-index it for
+    /// the UI. `edits` maps package paths to their new contents.
+    ///
+    /// `overwrite` carries the authorization the user gave on the UI thread: the
+    /// UI decides whether a target may be replaced, and the install honors that
+    /// decision rather than re-deciding it here. Without it, a file created
+    /// between the confirmation and the rename would be clobbered silently.
+    SavePackage {
+        request_id: u64,
+        package_path: PathBuf,
+        target: PathBuf,
+        overwrite: bool,
+        index: Arc<PackageIndex>,
+        edits: Vec<(String, Vec<u8>)>,
     },
 }
 
@@ -144,6 +159,13 @@ pub enum ResultMessage {
     Exported {
         request_id: u64,
         outcome: Result<ExportOutcome, String>,
+    },
+    Saved {
+        request_id: u64,
+        path: PathBuf,
+        /// The write outcome. Well-formedness warnings are shown before the
+        /// write, so a success carries no payload.
+        result: Result<(), String>,
     },
 }
 
@@ -241,7 +263,7 @@ impl Job {
     /// moved past, so a newer request makes it obsolete. Exports have side
     /// effects (files, clipboard) and must run exactly once.
     fn is_replaceable(&self) -> bool {
-        !matches!(self, Job::ExportPart { .. })
+        !matches!(self, Job::ExportPart { .. } | Job::SavePackage { .. })
     }
 }
 
@@ -390,6 +412,29 @@ impl Worker {
                             ResultMessage::Exported {
                                 request_id,
                                 outcome,
+                            }
+                        }
+                        Job::SavePackage {
+                            request_id,
+                            package_path,
+                            target,
+                            overwrite,
+                            index,
+                            edits,
+                        } => {
+                            let result = save_package(
+                                &mut archive_cache,
+                                &package_path,
+                                &target,
+                                overwrite,
+                                &index,
+                                edits,
+                            )
+                            .map_err(|error| error.to_string());
+                            ResultMessage::Saved {
+                                request_id,
+                                path: target.clone(),
+                                result,
                             }
                         }
                     };
@@ -554,6 +599,7 @@ fn diff_part(
         return Ok(Preview::Editor {
             kind: PreviewKind::Diff,
             text: format!("No differences in {part_path}\n"),
+            editable: false,
         });
     }
     let (archive_a, archive_b) = cached_archives(cache, package_a, package_b)?;
@@ -668,9 +714,141 @@ fn write_new_file(path: &Path, bytes: &[u8], owner_only: bool) -> io::Result<()>
     options.open(path)?.write_all(bytes)
 }
 
+/// Rewrite the package with the edited parts replaced.
+///
+/// The new package is built in a sibling temporary file and installed onto the
+/// target, so a failure part-way through leaves the original untouched. When
+/// `overwrite` is false the install refuses to replace an existing file, so a
+/// target that appeared after the user confirmed is never silently clobbered.
+fn save_package(
+    cache: &mut ArchiveCache,
+    package_path: &Path,
+    target: &Path,
+    overwrite: bool,
+    index: &PackageIndex,
+    edits: Vec<(String, Vec<u8>)>,
+) -> io::Result<()> {
+    let replacements: BTreeMap<String, Vec<u8>> = edits.into_iter().collect();
+
+    let directory = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let base = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("package");
+    let (temp, file) = create_temp_file(&directory, base)?;
+
+    let mut writer = zip::ZipWriter::new(file);
+    {
+        let source = cached_archive(cache, package_path)?;
+        package::write_edited(source, &mut writer, index, &replacements)?;
+    }
+    writer.finish()?.sync_all()?;
+
+    // Re-open the result before it replaces anything, so a truncated write is
+    // caught while the original is still intact.
+    zip::ZipArchive::new(File::open(temp.path())?)?;
+    // Preserve permissions only from a regular file being replaced. A symlink
+    // target must not borrow its referent's mode; for it (or a new target), use
+    // the source package's permissions instead.
+    let template_permissions = std::fs::symlink_metadata(target)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+        .map(|metadata| metadata.permissions())
+        .or_else(|| {
+            std::fs::metadata(package_path)
+                .ok()
+                .map(|metadata| metadata.permissions())
+        });
+    if let Some(permissions) = template_permissions {
+        std::fs::set_permissions(temp.path(), permissions)?;
+    }
+    // The cached handles are stale after the install, and on Windows a read
+    // handle would block it. `temp` deletes its file if anything fails here.
+    cache.retain(|(cached, _)| cached != target && cached != package_path);
+    if overwrite {
+        // `rename` replaces the target atomically, which is what the user
+        // confirmed on the prompt.
+        std::fs::rename(temp.path(), target)?;
+    } else {
+        install_without_replacing(temp.path(), target)?;
+    }
+    Ok(())
+}
+
+/// Install `source` at `target` without replacing any existing directory entry.
+///
+/// `hard_link` atomically creates the target link only when that path is free;
+/// if a file or symlink appeared while the package was being written, it returns
+/// `AlreadyExists` and leaves the existing entry untouched. On success, removing
+/// `source` leaves the target link to the same completed file contents. The
+/// temporary file lives beside the target, so the link cannot cross filesystems.
+fn hard_link_install_error(target: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "cannot install new package at {} without replacing an existing target because this filesystem refused a hard link: {error}; choose a filesystem that supports hard links or select an existing target and confirm overwrite",
+            target.display()
+        ),
+    )
+}
+
+fn install_without_replacing(source: &Path, target: &Path) -> io::Result<()> {
+    match std::fs::hard_link(source, target) {
+        Ok(()) => {
+            std::fs::remove_file(source)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} was created while the package was being written",
+                target.display()
+            ),
+        )),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Err(hard_link_install_error(target, error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// A fresh, empty, owner-only file next to `target`. `create_new` refuses to
+/// follow a symlink or reuse an existing file, so a predictable name in a
+/// shared directory cannot be turned into a write the user did not intend.
+fn create_temp_file(directory: &Path, base: &str) -> io::Result<(TempPart, File)> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    for attempt in 0..100 {
+        let candidate = directory.join(format!(".{base}.oox-{}-{attempt}.tmp", std::process::id()));
+        match options.open(&candidate) {
+            Ok(file) => return Ok((TempPart(candidate), file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a temporary save file",
+    ))
+}
+
 /// Temporary files keep the part's file name so editors and pagers can pick a
 /// syntax mode from the extension.
-fn write_temp_file(archive_name: &str, bytes: &[u8]) -> io::Result<TempPart> {
+pub(crate) fn write_temp_file(archive_name: &str, bytes: &[u8]) -> io::Result<TempPart> {
     let base = Path::new(archive_name)
         .file_name()
         .and_then(|name| name.to_str())
@@ -875,5 +1053,85 @@ mod tests {
         // result channel is disconnected, or the app quits with it still queued.
         drop(ExportOutcome::TempFile(temp));
         assert!(!path.exists());
+    }
+
+    /// The unconfirmed install must refuse to replace a file that appeared after
+    /// the user was asked, which a `rename` would silently clobber.
+    #[test]
+    fn unconfirmed_install_never_replaces_an_existing_file() {
+        let directory = std::env::temp_dir().join(format!("oox-install-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("create scratch directory");
+        let source = directory.join("source.tmp");
+        let target = directory.join("target.pptx");
+
+        std::fs::write(&source, b"new").expect("write source");
+        std::fs::write(&target, b"existing").expect("write target");
+        let error = super::install_without_replacing(&source, &target)
+            .expect_err("an existing target must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&target).expect("target readable"),
+            b"existing",
+            "the existing file must survive"
+        );
+        assert!(
+            source.exists(),
+            "the refused install must leave the source alone"
+        );
+
+        // With the path free, the install succeeds and consumes the source.
+        std::fs::remove_file(&target).expect("clear target");
+        super::install_without_replacing(&source, &target).expect("a free path installs");
+        assert_eq!(std::fs::read(&target).expect("target readable"), b"new");
+        assert!(!source.exists(), "the source is moved onto the target");
+
+        std::fs::remove_file(&target).expect("clean up");
+    }
+
+    /// A dangling symlink occupies the path, so an unconfirmed install must not
+    /// replace it either.
+    #[cfg(unix)]
+    #[test]
+    fn unconfirmed_install_refuses_a_dangling_symlink() {
+        let directory =
+            std::env::temp_dir().join(format!("oox-install-link-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("create scratch directory");
+        let source = directory.join("source.tmp");
+        let target = directory.join("target.pptx");
+        let missing = directory.join("never-created.pptx");
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&missing);
+        std::fs::write(&source, b"new").expect("write source");
+        std::os::unix::fs::symlink(&missing, &target).expect("create dangling symlink");
+
+        let error = super::install_without_replacing(&source, &target)
+            .expect_err("a dangling symlink must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .expect("target entry")
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive"
+        );
+
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    #[test]
+    fn unsupported_hard_link_errors_explain_the_alternatives() {
+        let target = PathBuf::from("/shared/output.pptx");
+        for kind in [
+            std::io::ErrorKind::Unsupported,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let error = super::hard_link_install_error(&target, std::io::Error::from(kind));
+            assert_eq!(error.kind(), kind);
+            let message = error.to_string();
+            assert!(message.contains("hard link"));
+            assert!(message.contains("/shared/output.pptx"));
+            assert!(message.contains("confirm overwrite"));
+        }
     }
 }

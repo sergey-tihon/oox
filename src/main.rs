@@ -16,7 +16,7 @@ use crossterm::{
 };
 use crossterm_keybind::KeyBindTrait;
 use crossterm_keybind::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
-use edtui::{EditorEventHandler, EditorMode as EdtuiMode};
+use edtui::{EditorEventHandler, EditorMode as EdtuiMode, EditorState};
 use keybindings::Action;
 use ratatui::prelude::*;
 use ratatui_image::picker::Picker;
@@ -179,6 +179,60 @@ fn external_command() -> Option<String> {
     })
 }
 
+/// The editor for the round-trip edit. `$VISUAL` wins because it means "the
+/// editor for interactive use"; `$PAGER` is deliberately not a candidate.
+/// A GUI editor needs its wait flag (`code --wait`), as with git.
+fn editor_command() -> Option<String> {
+    ["VISUAL", "EDITOR"].iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+/// Hand the part's buffer to the external editor and take the text back. The
+/// package is written only by the ordinary save, so quitting the editor without
+/// saving leaves the document alone.
+fn run_external_edit(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    app: &mut App,
+) -> io::Result<()> {
+    let Some(requested) = app.take_external_edit_request() else {
+        return Ok(());
+    };
+    // The request is consumed first: a missing editor must not leave it pending,
+    // which would make the event loop retry it on every iteration.
+    let Some(editor) = editor_command() else {
+        app.status_message = Some("No $VISUAL or $EDITOR is set".to_string());
+        return Ok(());
+    };
+    // Failing to write the snapshot is recoverable; it must not end the session.
+    let pending = match app.begin_external_edit() {
+        Ok(pending) => pending,
+        Err(error) => {
+            app.status_message = Some(format!("Could not prepare the external edit: {error}"));
+            return Ok(());
+        }
+    };
+    let path = pending.temp.path().to_path_buf();
+    // The snapshot deletes itself when `pending` drops at the end of this scope.
+    // A stale `$VISUAL`/`$EDITOR` must not take the session down with it, so the
+    // failure is reported the same way the external viewer reports it.
+    match with_terminal_suspended(terminal, || run_external(&editor, &path)) {
+        Ok(status) => match std::fs::read(&path) {
+            Ok(bytes) => app.apply_external_edit(&pending.written, &bytes, status.success()),
+            Err(error) => {
+                app.status_message = Some(format!("Could not read the edited part: {error}"));
+            }
+        },
+        Err(error) => {
+            app.status_message = Some(format!("Could not run the editor: {error}"));
+        }
+    }
+    debug_log(format!("external edit of {requested} finished"));
+    Ok(())
+}
+
 /// Run the configured command against `path`, returning its exit status.
 #[cfg(unix)]
 fn run_external(command: &str, path: &Path) -> io::Result<std::process::ExitStatus> {
@@ -305,6 +359,136 @@ fn next_focus(current: CurrentWidget, details_visible: bool, backwards: bool) ->
     }
 }
 
+/// Decide whether an editor key can change buffer contents and whether it can
+/// restore the baseline (undo/redo). Pure cursor motions and search keys skip
+/// the full buffer comparison; once dirty, ordinary edits remain sticky until
+/// an undo/redo or explicit save/navigation reconciliation.
+fn editor_key_dirty_policy(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    editor_mode: keybindings::EditorMode,
+    state_mode: EdtuiMode,
+    vim_operator_pending: bool,
+) -> (bool, bool, bool) {
+    let character = match code {
+        KeyCode::Char(character) => Some(character),
+        _ => None,
+    };
+    let unmodified = modifiers == KeyModifiers::NONE;
+    let plain_character = character.is_some() && (unmodified || modifiers == KeyModifiers::SHIFT);
+
+    if editor_mode == keybindings::EditorMode::Emacs {
+        let control = modifiers == KeyModifiers::CONTROL;
+        let alt = modifiers == KeyModifiers::ALT;
+        let restores_baseline = control && matches!(character, Some('u' | 'r' | 'U' | 'R'));
+        let mutates = plain_character
+            || (unmodified
+                && matches!(
+                    code,
+                    KeyCode::Tab | KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete
+                ))
+            || (control && matches!(character, Some('d' | 'h' | 'j' | 'k' | 'o' | 'y')))
+            || (alt && matches!(character, Some('d' | 'u')))
+            || (alt && code == KeyCode::Backspace);
+        return (mutates || restores_baseline, restores_baseline, false);
+    }
+
+    if state_mode == EdtuiMode::Search {
+        return (false, false, false);
+    }
+    if state_mode == EdtuiMode::Insert {
+        let mutates = plain_character
+            || (unmodified
+                && matches!(
+                    code,
+                    KeyCode::Tab | KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete
+                ))
+            || modifiers.contains(KeyModifiers::CONTROL)
+                && !matches!(code, KeyCode::Left | KeyCode::Right);
+        return (mutates, false, false);
+    }
+
+    if state_mode == EdtuiMode::Visual {
+        // These Visual-mode bindings mutate the selection immediately; they
+        // are not the multi-key operators that `d`/`c` start in Normal mode.
+        let mutates = unmodified && matches!(character, Some('d' | 'c' | 'x' | 'p'));
+        return (mutates, false, false);
+    }
+
+    let restores_baseline =
+        (state_mode == EdtuiMode::Normal && unmodified && character == Some('u'))
+            || (modifiers == KeyModifiers::CONTROL && character == Some('r'));
+    if restores_baseline {
+        return (true, true, false);
+    }
+
+    if vim_operator_pending {
+        let continues_operator = matches!(
+            character,
+            Some('i' | 'a' | 'f' | 'F' | 't' | 'T' | 'u' | 'U' | '~')
+        );
+        return (true, false, continues_operator);
+    }
+
+    let starts_operator =
+        unmodified && matches!(character, Some('d' | 'c' | 'y' | 'g' | '>' | '<' | '!'));
+    if starts_operator {
+        return (false, false, true);
+    }
+
+    let mutates = unmodified
+        && matches!(
+            character,
+            Some(
+                'x' | 'X'
+                    | 'r'
+                    | 'R'
+                    | 's'
+                    | 'S'
+                    | 'D'
+                    | 'C'
+                    | 'p'
+                    | 'P'
+                    | 'J'
+                    | '~'
+                    | 'o'
+                    | 'O'
+                    | '.'
+            )
+        )
+        || code == KeyCode::Delete;
+    (mutates, false, false)
+}
+
+/// Whether this key can actually quit from the current editor context. The
+/// global `Quit` binding is only a quit action in tree/details and Vim Normal;
+/// modeless Emacs only quits through `QuitEditor`.
+fn can_quit_from(
+    current_widget: CurrentWidget,
+    editor_mode: keybindings::EditorMode,
+    editor_state_mode: EdtuiMode,
+    actions: &[Action],
+) -> bool {
+    match current_widget {
+        CurrentWidget::Tree | CurrentWidget::Details => actions.contains(&Action::Quit),
+        CurrentWidget::TextArea => match editor_mode {
+            keybindings::EditorMode::Vim => {
+                actions.contains(&Action::Quit) && editor_state_mode == EdtuiMode::Normal
+            }
+            keybindings::EditorMode::Emacs => actions.contains(&Action::QuitEditor),
+        },
+    }
+}
+
+/// edtui's Emacs handler registers its modeless keymap in Insert mode. Fresh
+/// previews create a Normal-mode state, so put it in Insert before dispatching
+/// any Emacs input; subsequent non-Normal modes (e.g. search) are left alone.
+fn ensure_emacs_insert_mode(state: &mut EditorState, editor_mode: keybindings::EditorMode) {
+    if editor_mode == keybindings::EditorMode::Emacs && state.mode == EdtuiMode::Normal {
+        state.mode = EdtuiMode::Insert;
+    }
+}
+
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
     app: &mut App,
@@ -314,9 +498,16 @@ fn run_app(
     // Redraw-on-change: render once, then again only when the worker reports new
     // state or a terminal event arrives. Idle polling no longer repaints at 20 fps.
     let mut redraw = true;
+    let mut vim_operator_pending = false;
     loop {
         if app.poll_worker() {
             redraw = true;
+        }
+        ensure_emacs_insert_mode(&mut app.editor_state, editor_mode);
+        // The requested part has to be on screen before the editor can take over.
+        if !app.save_active && !app.is_saving() && app.external_edit_ready() {
+            redraw = true;
+            run_external_edit(terminal, app)?;
         }
         if let Some(export) = app.take_pending_export() {
             redraw = true;
@@ -334,7 +525,20 @@ fn run_app(
         redraw = true;
         debug_log(format!("event={event:?}"));
 
+        // A save in flight owns `previewed_path` and the buffers: navigation
+        // would move the edit into `edits` and make the reload reselect the
+        // wrong part, and quitting would detach a worker that is still writing.
+        // Poll and redraw above stay live so the result is still delivered.
+        if app.is_saving() {
+            continue;
+        }
+
         if let Event::Mouse(mouse) = &event {
+            // Any-motion tracking fires while the pointer merely moves; that is
+            // not the user answering a confirmation, so only real gestures disarm.
+            if !matches!(mouse.kind, MouseEventKind::Moved) {
+                app.disarm_confirmation();
+            }
             if app.show_help {
                 continue;
             }
@@ -379,6 +583,8 @@ fn run_app(
                                 mouse.row,
                             );
                     editor_handler.on_event(event, &mut app.editor_state);
+                    // Mouse handling changes cursor/viewport/selection, not text.
+                    vim_operator_pending = false;
                     if follows_reference {
                         app.follow_relationship_at_cursor()?;
                     }
@@ -425,6 +631,29 @@ fn run_app(
             }
 
             let actions = dispatched_actions.as_deref().unwrap_or(&[]);
+            // Only preserve a confirmation for an action that can actually
+            // answer it here. In Emacs, plain `q` is text; only `QuitEditor`
+            // can confirm quit. Revert is valid only from Tree/Details.
+            let modal_active = app.show_help
+                || app.search_active
+                || app.content_search_active
+                || app.export_active
+                || app.save_active;
+            let can_quit = !modal_active
+                && can_quit_from(
+                    app.current_widget,
+                    editor_mode,
+                    app.editor_state.mode,
+                    actions,
+                );
+            let can_revert = !modal_active
+                && app.is_package_loaded()
+                && matches!(
+                    app.current_widget,
+                    CurrentWidget::Tree | CurrentWidget::Details
+                )
+                && actions.contains(&Action::RevertPart);
+            app.disarm_confirmation_unless(can_quit, can_revert);
             debug_log(format!(
                 "key={:?} modifiers={:?} actions={actions:?} focus={:?} editor_mode={:?} help={} search={}",
                 key.code,
@@ -507,6 +736,55 @@ fn run_app(
                 continue;
             }
 
+            if app.save_active {
+                if actions.contains(&Action::Cancel) {
+                    app.cancel_save();
+                } else if actions.contains(&Action::Confirm) {
+                    debug_log(format!("confirming save path={:?}", app.save_query));
+                    app.confirm_save()?;
+                } else if actions.contains(&Action::Backspace) {
+                    app.save_backspace();
+                } else if let KeyCode::Char(character) = key.code {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                        app.save_input_char(character);
+                    }
+                }
+                continue;
+            }
+
+            // In Emacs mode the editor owns typing and its own chords (Ctrl+S is
+            // search there), so only those are left to it; any other configured
+            // save binding, such as F2 or a custom Alt+S, still saves. Vim mode
+            // has no conflicting save chord.
+            let can_save = match app.current_widget {
+                CurrentWidget::Tree | CurrentWidget::Details => true,
+                CurrentWidget::TextArea => match editor_mode {
+                    keybindings::EditorMode::Vim => true,
+                    keybindings::EditorMode::Emacs => !keybindings::emacs_editor_owns(key),
+                },
+            };
+            if actions.contains(&Action::SavePackage) && can_save && app.is_package_loaded() {
+                debug_log("opening the save prompt");
+                app.start_save();
+                continue;
+            }
+
+            // Plain `O` is not usable: uppercase keys are already taken by the
+            // tree bindings and Vim's `O` in the editor. F4 is the editor key
+            // everywhere, and Ctrl+E outside the editor.
+            let can_edit_externally = match app.current_widget {
+                CurrentWidget::Tree | CurrentWidget::Details => true,
+                CurrentWidget::TextArea => matches!(key.code, KeyCode::F(_)),
+            };
+            if actions.contains(&Action::EditPartExternally)
+                && can_edit_externally
+                && app.is_package_loaded()
+            {
+                debug_log("requesting external edit");
+                app.request_external_edit()?;
+                continue;
+            }
+
             if actions.contains(&Action::NavigateBack) {
                 if app.is_package_loaded() {
                     app.navigate_back()?;
@@ -580,18 +858,11 @@ fn run_app(
                 continue;
             }
 
-            let can_quit = match app.current_widget {
-                CurrentWidget::Tree | CurrentWidget::Details => actions.contains(&Action::Quit),
-                CurrentWidget::TextArea => match editor_mode {
-                    keybindings::EditorMode::Vim => {
-                        actions.contains(&Action::Quit)
-                            && app.editor_state.mode == EdtuiMode::Normal
-                    }
-                    keybindings::EditorMode::Emacs => actions.contains(&Action::QuitEditor),
-                },
-            };
             if can_quit {
-                return Ok(());
+                if app.request_quit() {
+                    return Ok(());
+                }
+                continue;
             }
 
             let can_switch = match app.current_widget {
@@ -667,6 +938,8 @@ fn run_app(
                         app.open_selected_externally()?;
                     } else if actions.contains(&Action::CopyPartContent) {
                         app.copy_selected_content()?;
+                    } else if actions.contains(&Action::RevertPart) {
+                        app.request_revert();
                     } else if actions.contains(&Action::Cancel)
                         && (!app.search_query.is_empty() || app.has_content_search_query())
                     {
@@ -706,11 +979,35 @@ fn run_app(
                         app.open_selected_externally()?;
                     } else if actions.contains(&Action::CopyPartContent) {
                         app.copy_selected_content()?;
+                    } else if actions.contains(&Action::RevertPart) {
+                        app.request_revert();
                     }
                 }
             }
             CurrentWidget::TextArea => {
+                let (may_change_content, may_restore_baseline) = match &event {
+                    Event::Key(key) => {
+                        let (may_change, restores, pending) = editor_key_dirty_policy(
+                            key.code,
+                            key.modifiers,
+                            editor_mode,
+                            app.editor_state.mode,
+                            vim_operator_pending,
+                        );
+                        vim_operator_pending = pending;
+                        (may_change, restores)
+                    }
+                    Event::Paste(_) => {
+                        vim_operator_pending = false;
+                        (true, false)
+                    }
+                    _ => {
+                        vim_operator_pending = false;
+                        (false, false)
+                    }
+                };
                 editor_handler.on_event(event, &mut app.editor_state);
+                app.refresh_editor_dirty_after_input(may_change_content, may_restore_baseline);
             }
         }
     }
@@ -718,7 +1015,143 @@ fn run_app(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CLIPBOARD_BYTES, base64_encode, osc52_sequence};
+    use super::{
+        MAX_CLIPBOARD_BYTES, base64_encode, can_quit_from, editor_key_dirty_policy,
+        ensure_emacs_insert_mode, osc52_sequence,
+    };
+    use crate::{
+        app::CurrentWidget,
+        keybindings::{Action, EditorMode},
+    };
+    use crossterm_keybind::event::{KeyCode, KeyModifiers};
+    use edtui::EditorMode as EdtuiMode;
+
+    #[test]
+    fn emacs_editor_starts_in_edtui_insert_mode() {
+        let mut state = edtui::EditorState::default();
+        ensure_emacs_insert_mode(&mut state, EditorMode::Emacs);
+        assert_eq!(state.mode, EdtuiMode::Insert);
+
+        // Search has its own active state and must not be reset by redraws.
+        state.mode = EdtuiMode::Search;
+        ensure_emacs_insert_mode(&mut state, EditorMode::Emacs);
+        assert_eq!(state.mode, EdtuiMode::Search);
+
+        let mut state = edtui::EditorState::default();
+        ensure_emacs_insert_mode(&mut state, EditorMode::Vim);
+        assert_eq!(state.mode, EdtuiMode::Normal);
+    }
+    #[test]
+    fn confirmation_quit_action_is_context_valid() {
+        let quit = [Action::Quit];
+        let quit_editor = [Action::QuitEditor];
+        assert!(!can_quit_from(
+            CurrentWidget::TextArea,
+            EditorMode::Emacs,
+            EdtuiMode::Insert,
+            &quit,
+        ));
+        assert!(can_quit_from(
+            CurrentWidget::TextArea,
+            EditorMode::Emacs,
+            EdtuiMode::Insert,
+            &quit_editor,
+        ));
+        assert!(!can_quit_from(
+            CurrentWidget::TextArea,
+            EditorMode::Vim,
+            EdtuiMode::Insert,
+            &quit,
+        ));
+        assert!(can_quit_from(
+            CurrentWidget::Tree,
+            EditorMode::Emacs,
+            EdtuiMode::Insert,
+            &quit,
+        ));
+    }
+
+    #[test]
+    fn editor_dirty_policy_skips_motion_and_reconciles_undo() {
+        assert_eq!(
+            editor_key_dirty_policy(
+                KeyCode::Char('j'),
+                KeyModifiers::NONE,
+                EditorMode::Vim,
+                EdtuiMode::Normal,
+                false,
+            ),
+            (false, false, false)
+        );
+        assert_eq!(
+            editor_key_dirty_policy(
+                KeyCode::Char('d'),
+                KeyModifiers::NONE,
+                EditorMode::Vim,
+                EdtuiMode::Normal,
+                false,
+            ),
+            (false, false, true)
+        );
+        assert_eq!(
+            editor_key_dirty_policy(
+                KeyCode::Char('w'),
+                KeyModifiers::NONE,
+                EditorMode::Vim,
+                EdtuiMode::Normal,
+                true,
+            ),
+            (true, false, false)
+        );
+        assert_eq!(
+            editor_key_dirty_policy(
+                KeyCode::Char('u'),
+                KeyModifiers::NONE,
+                EditorMode::Vim,
+                EdtuiMode::Normal,
+                false,
+            ),
+            (true, true, false)
+        );
+        assert_eq!(
+            editor_key_dirty_policy(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+                EditorMode::Emacs,
+                EdtuiMode::Insert,
+                false,
+            ),
+            (true, true, false)
+        );
+    }
+
+    #[test]
+    fn visual_mutations_are_not_classified_as_normal_operators() {
+        for character in ['d', 'c', 'x', 'p'] {
+            assert_eq!(
+                editor_key_dirty_policy(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                    EditorMode::Vim,
+                    EdtuiMode::Visual,
+                    false,
+                ),
+                (true, false, false),
+                "Visual {character} mutates immediately",
+            );
+        }
+        assert_eq!(
+            editor_key_dirty_policy(
+                KeyCode::Char('d'),
+                KeyModifiers::NONE,
+                EditorMode::Vim,
+                EdtuiMode::Normal,
+                false,
+            ),
+            (false, false, true),
+            "Normal d still starts an operator",
+        );
+    }
 
     #[test]
     fn base64_matches_rfc4648_padding() {

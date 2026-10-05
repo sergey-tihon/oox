@@ -1,4 +1,3 @@
-use crossterm_keybind::{DisplayFormat, KeyBindTrait};
 use edtui::{EditorStatusLine, EditorTheme, EditorView, LineNumbers, SyntaxHighlighter};
 use ratatui::{
     Frame,
@@ -191,9 +190,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     }
 
     // Content preview with XML syntax highlighting
+    let content_title = content_title(app);
     let editor_block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("[3] {}", content_title(app.preview_kind)))
+        .title(format!("[3] {content_title}"))
         .title_top(Line::from("[Tab]").right_aligned())
         .border_style(if app.current_widget == CurrentWidget::TextArea {
             active_style
@@ -218,7 +218,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     } else if let Some(image_state) = app.image_state.as_mut() {
         let image_block = Block::default()
             .borders(Borders::ALL)
-            .title(format!("[3] {}", content_title(app.preview_kind)))
+            .title(format!("[3] {content_title}"))
             .title_top(Line::from("[Tab]").right_aligned())
             .border_style(if app.current_widget == CurrentWidget::TextArea {
                 active_style
@@ -391,24 +391,40 @@ fn linked_lines(view: &DetailsView, selected_link_line: Option<usize>) -> Vec<Li
         .collect()
 }
 
-fn content_title(kind: PreviewKind) -> &'static str {
-    // Editor-backed previews are view-only: edtui has no read-only mode yet, so
-    // the title makes it explicit that edits are not saved anywhere.
-    match kind {
-        PreviewKind::Xml => "XML content (read-only)",
-        PreviewKind::PlainText => "Text content (read-only)",
-        PreviewKind::Json => "JSON preview (read-only)",
-        PreviewKind::Diff => "Part diff (read-only)",
+fn content_title(app: &App) -> String {
+    let label = match app.preview_kind {
+        PreviewKind::Xml => "XML content",
+        PreviewKind::PlainText => "Text content",
+        PreviewKind::Json => "JSON content",
         PreviewKind::Hex => "Hex dump",
+        PreviewKind::Diff => "Part diff",
         PreviewKind::Image => "Image preview",
         PreviewKind::Summary => "Document summary",
         PreviewKind::Info => "Binary information",
         PreviewKind::Error | PreviewKind::Empty => "File content",
+    };
+    if app.editor_is_dirty() {
+        return format!("{label} [modified]");
+    }
+    // Editor-backed previews that cannot be written back say so, since edtui has
+    // no read-only mode and typing into them is otherwise silently discarded.
+    let editor_backed = matches!(
+        app.preview_kind,
+        PreviewKind::Xml
+            | PreviewKind::PlainText
+            | PreviewKind::Json
+            | PreviewKind::Diff
+            | PreviewKind::Hex
+    );
+    if editor_backed && !app.editor_editable() {
+        format!("{label} (read-only)")
+    } else {
+        label.to_string()
     }
 }
 
 fn help_line(action: &crate::keybindings::Action, description: &str) -> Line<'static> {
-    let bindings = action.key_bindings_display_with_format(&DisplayFormat::Abbreviation);
+    let bindings = crate::keybindings::key_hint(*action);
     Line::from(format!("  {bindings:<14} {description}"))
 }
 
