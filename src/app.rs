@@ -220,6 +220,12 @@ pub struct App {
     save_warnings: Vec<String>,
     save_request_id: u64,
     save_pending: bool,
+    /// Set after the package write succeeds and held until its re-index and
+    /// reselected-part preview complete.
+    save_reloading: bool,
+    /// The preview request that completes `save_reloading`, if a part is being
+    /// reselected after the package open.
+    save_reload_preview_request_id: Option<u64>,
     /// The last path this session wrote, used to choose the default target for
     /// another save. Its previous contents do not authorize future overwrites.
     last_saved: Option<PathBuf>,
@@ -692,6 +698,8 @@ impl App {
             save_warnings: Vec::new(),
             save_request_id: 0,
             save_pending: false,
+            save_reloading: false,
+            save_reload_preview_request_id: None,
             last_saved: None,
             pending_reselect: None,
             pending_cursor: None,
@@ -738,6 +746,11 @@ impl App {
                     self.content_search_pending = false;
                     self.worker_error = Some(error.to_string());
                     self.content_message = Some(format!("Package worker failed: {error}"));
+                    self.save_pending = false;
+                    self.save_reloading = false;
+                    self.save_reload_preview_request_id = None;
+                    self.pending_reselect = None;
+                    self.pending_cursor = None;
                     return true;
                 }
             };
@@ -787,6 +800,8 @@ impl App {
                     selected_path,
                     preview,
                 } => {
+                    let completes_save_reload =
+                        self.save_reload_preview_request_id == Some(request_id);
                     if request_id == self.preview_request_id {
                         self.preview_pending = false;
                     }
@@ -794,6 +809,11 @@ impl App {
                     if !current.as_deref().is_some_and(|path| {
                         accepts_result(request_id, self.preview_request_id, &selected_path, path)
                     }) {
+                        if completes_save_reload {
+                            self.save_reloading = false;
+                            self.save_reload_preview_request_id = None;
+                            self.pending_cursor = None;
+                        }
                         continue;
                     }
                     // A cursor restore is only valid for the part it was taken
@@ -843,6 +863,10 @@ impl App {
                             self.content_message = Some(format!("Could not preview: {error}"));
                             self.forget_external_edit(&selected_path);
                         }
+                    }
+                    if completes_save_reload {
+                        self.save_reloading = false;
+                        self.save_reload_preview_request_id = None;
                     }
                 }
                 ResultMessage::ContentSearch {
@@ -909,10 +933,13 @@ impl App {
                     if request_id != self.save_request_id {
                         continue;
                     }
-                    self.save_pending = false;
                     match result {
-                        Ok(()) => self.after_save(path),
+                        Ok(()) => {
+                            self.save_pending = false;
+                            self.after_save(path);
+                        }
                         Err(error) => {
+                            self.save_pending = false;
                             self.status_message = Some(format!("Save failed: {error}"));
                         }
                     }
@@ -925,13 +952,16 @@ impl App {
                 || self.preview_pending
                 || self.content_search_pending
                 || self.export_pending
-                || self.save_pending)
+                || self.save_pending
+                || self.save_reloading)
         {
             self.loading = false;
             self.preview_pending = false;
             self.content_search_pending = false;
             self.export_pending = false;
             self.save_pending = false;
+            self.save_reloading = false;
+            self.save_reload_preview_request_id = None;
             let message = "Package worker exited before completing the request".to_string();
             self.worker_error = Some(message.clone());
             self.content_message = Some(message);
@@ -979,7 +1009,13 @@ impl App {
                 self.select_path(&reselect.path);
                 self.pending_cursor = Some(reselect);
                 let _ = self.load_selected_file_content();
+                if self.save_reloading && self.preview_pending {
+                    self.save_reload_preview_request_id = Some(self.preview_request_id);
+                }
             }
+        }
+        if self.save_reloading && self.save_reload_preview_request_id.is_none() {
+            self.save_reloading = false;
         }
         if let Some(message) = self.post_load_message.take() {
             self.status_message = Some(message);
@@ -988,6 +1024,10 @@ impl App {
 
     fn fail_load(&mut self, error: String) {
         self.loading = false;
+        self.save_reloading = false;
+        self.save_reload_preview_request_id = None;
+        self.pending_reselect = None;
+        self.pending_cursor = None;
         self.worker_error = Some(error.clone());
         self.content_message = Some(format!("Could not open package: {error}"));
     }
@@ -2229,10 +2269,10 @@ impl App {
         true
     }
 
-    /// A save in flight owns the buffers; editor input would be lost when the
-    /// written package is reloaded, so the event loop is frozen until it lands.
+    /// A save owns the buffers during both the write and the post-save reload;
+    /// input resumes only after the reselected preview has finished installing.
     pub fn is_saving(&self) -> bool {
-        self.save_pending
+        self.save_pending || self.save_reloading
     }
 
     /// Every unsaved edit, ready for the save job: the parts set aside plus the
@@ -2264,7 +2304,7 @@ impl App {
     /// Open the save prompt for the unsaved edits, pre-filled with the default
     /// target so the common case is Enter only.
     pub fn start_save(&mut self) {
-        if self.save_pending {
+        if self.is_saving() {
             self.status_message = Some("Save in progress".to_string());
             return;
         }
@@ -2438,6 +2478,8 @@ impl App {
     /// Install a saved package: the edits are now on disk, so they are dropped
     /// and the package is re-indexed through the worker.
     fn after_save(&mut self, path: PathBuf) {
+        self.save_reloading = true;
+        self.save_reload_preview_request_id = None;
         self.edits.clear();
         self.editor_baseline = None;
         self.editor_editable = false;
@@ -2464,6 +2506,10 @@ impl App {
                 "Saved {}, but reloading it failed: {error}",
                 path.display()
             ));
+            self.save_reloading = false;
+            self.save_reload_preview_request_id = None;
+            self.pending_reselect = None;
+            self.pending_cursor = None;
             return;
         }
         let message = format!("Saved {}", path.display());
@@ -2480,7 +2526,7 @@ impl App {
             self.status_message = Some("Save prompt is active".to_string());
             return Ok(());
         }
-        if self.save_pending {
+        if self.is_saving() {
             self.status_message = Some("Save in progress".to_string());
             return Ok(());
         }
@@ -2511,7 +2557,7 @@ impl App {
 
     /// Whether the requested part is on screen and ready to be handed over.
     pub fn external_edit_ready(&self) -> bool {
-        if self.save_active || self.save_pending {
+        if self.save_active || self.is_saving() {
             return false;
         }
         match self.external_edit_request.as_deref() {
@@ -2589,7 +2635,7 @@ impl App {
     /// Discard the unsaved edits of the selected part. Destructive, so it asks
     /// for a second press like the quit guard does.
     pub fn request_revert(&mut self) {
-        if self.save_pending {
+        if self.is_saving() {
             self.status_message = Some("Save in progress".to_string());
             return;
         }
@@ -4315,6 +4361,61 @@ mod tests {
         app.start_save();
         assert!(!app.save_active);
         assert_eq!(app.status_message.as_deref(), Some("No edits to save"));
+        Ok(())
+    }
+
+    /// The write completing must not unlock input before the newly written
+    /// package and reselected part preview have been installed.
+    #[test]
+    fn save_lock_spans_reindex_and_reselected_preview() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        edit_part(&mut app, "/ppt/slides/slide1.xml", "<a>edited</a>")?;
+        let target = temp_save_path("reload-lock.pptx");
+        let _ = std::fs::remove_file(&target);
+        std::fs::copy("data/sample.pptx", &target)?;
+
+        // Exercise the post-write phase directly: the Open job has not yet
+        // returned, so its old package/buffers are still live.
+        app.after_save(target.clone());
+        assert!(
+            app.is_saving(),
+            "reload must remain covered by the save lock"
+        );
+        app.start_save();
+        assert!(
+            !app.save_active,
+            "a second save cannot start during re-index"
+        );
+        assert_eq!(app.status_message.as_deref(), Some("Save in progress"));
+        app.request_revert();
+        assert_eq!(app.status_message.as_deref(), Some("Save in progress"));
+        app.request_external_edit()?;
+        assert_eq!(app.status_message.as_deref(), Some("Save in progress"));
+        assert!(app.external_edit_request.is_none());
+
+        pump_until(&mut app, |app| {
+            !app.is_saving() && !app.loading && !app.preview_pending
+        });
+        assert_eq!(app.file_path, target.to_string_lossy());
+        assert_eq!(
+            app.previewed_path.as_deref(),
+            Some("/ppt/slides/slide1.xml")
+        );
+        assert!(!app.has_unsaved_edits());
+        std::fs::remove_file(&target)?;
+        Ok(())
+    }
+
+    #[test]
+    fn save_reload_failure_releases_the_input_lock() -> io::Result<()> {
+        let mut app = test_app("data/sample.pptx")?;
+        let missing = temp_save_path("missing-reload.pptx");
+        let _ = std::fs::remove_file(&missing);
+
+        app.after_save(missing);
+        assert!(app.is_saving());
+        pump_until(&mut app, |app| !app.is_saving() && !app.loading);
+        assert!(app.worker_error.is_some());
         Ok(())
     }
 

@@ -771,18 +771,13 @@ fn save_package(
     Ok(())
 }
 
-/// Move `source` onto `target`, refusing to replace anything that is already
-/// there.
+/// Install `source` at `target` without replacing any existing directory entry.
 ///
-/// The last step is a `rename`, which can only succeed while `target` does not
-/// exist, so two saves racing for the same new path cannot lose one another's
-/// write. `source` is a `link`ed copy of the temporary file, not the temporary
-/// file itself, whose removal must stay with `TempPart`.
-///
-/// `hard_link` is what makes the sequence no-clobber: `rename` in its place
-/// would silently replace a file created between the check and the swap. The
-/// link is made in the same directory the target lives in, so it cannot cross a
-/// filesystem boundary.
+/// `hard_link` atomically creates the target link only when that path is free;
+/// if a file or symlink appeared while the package was being written, it returns
+/// `AlreadyExists` and leaves the existing entry untouched. On success, removing
+/// `source` leaves the target link to the same completed file contents. The
+/// temporary file lives beside the target, so the link cannot cross filesystems.
 fn install_without_replacing(source: &Path, target: &Path) -> io::Result<()> {
     match std::fs::hard_link(source, target) {
         Ok(()) => {
