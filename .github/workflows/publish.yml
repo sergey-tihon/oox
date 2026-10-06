@@ -12,7 +12,6 @@ jobs:
   publish:
     name: Validate and publish
     runs-on: ubuntu-latest
-    environment: crates-io
     permissions:
       contents: read
       id-token: write
