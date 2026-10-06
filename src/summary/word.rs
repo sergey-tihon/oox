@@ -95,15 +95,14 @@ fn parse_word_document(xml: &[u8]) -> (usize, usize, Vec<(usize, String)>) {
                 if element_is(name.as_ref(), b"t") {
                     text_element = false;
                 } else if element_is(name.as_ref(), b"p") {
-                    if let Some(style) = paragraph_style.as_deref() {
-                        if let Some(level) = style
+                    if let Some(style) = paragraph_style.as_deref()
+                        && let Some(level) = style
                             .strip_prefix("Heading")
                             .and_then(|value| value.parse::<usize>().ok())
-                        {
-                            let heading = clean_summary_text(&paragraph_text);
-                            if !heading.is_empty() && headings.len() < MAX_SUMMARY_ITEMS {
-                                headings.push((level, heading));
-                            }
+                    {
+                        let heading = clean_summary_text(&paragraph_text);
+                        if !heading.is_empty() && headings.len() < MAX_SUMMARY_ITEMS {
+                            headings.push((level, heading));
                         }
                     }
                     in_paragraph = false;

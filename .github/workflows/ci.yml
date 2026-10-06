@@ -43,3 +43,22 @@ jobs:
 
       - name: Package
         run: cargo package --locked
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust (keep in sync with rust-version in Cargo.toml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --all-targets --locked

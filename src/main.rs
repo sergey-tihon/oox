@@ -34,10 +34,15 @@ mod ui;
 mod worker;
 
 #[derive(Debug, Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    version,
+    about,
+    long_about = None,
+    after_help = "Examples:\n  oox report.docx             Inspect a package\n  oox before.xlsx after.xlsx  Compare two packages\n\nPress ? inside oox to see every key binding."
+)]
 struct Cli {
     /// OOXML document to inspect, optionally with a second document to compare against
-    #[arg(value_name = "FILE", num_args = 1..=2, required = true)]
+    #[arg(value_name = "FILE", num_args = 1..=2, required_unless_present = "generate_config")]
     files: Vec<PathBuf>,
     /// Keybinding and editor configuration file
     #[arg(long, value_name = "PATH")]
@@ -728,10 +733,10 @@ fn run_app(
                     app.confirm_extract()?;
                 } else if actions.contains(&Action::Backspace) {
                     app.export_backspace();
-                } else if let KeyCode::Char(character) = key.code {
-                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                        app.export_input_char(character);
-                    }
+                } else if let KeyCode::Char(character) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    app.export_input_char(character);
                 }
                 continue;
             }
@@ -744,10 +749,10 @@ fn run_app(
                     app.confirm_save()?;
                 } else if actions.contains(&Action::Backspace) {
                     app.save_backspace();
-                } else if let KeyCode::Char(character) = key.code {
-                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                        app.save_input_char(character);
-                    }
+                } else if let KeyCode::Char(character) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    app.save_input_char(character);
                 }
                 continue;
             }
