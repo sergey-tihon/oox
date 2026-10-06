@@ -1,15 +1,15 @@
 [package]
 name = "oox-tui"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
-rust-version = "1.86"
-description = "A terminal UI for inspecting Office Open XML documents"
+rust-version = "1.90"
+description = "Terminal UI for inspecting, comparing, and editing Office Open XML (.docx, .xlsx, .pptx) files"
 readme = "README.md"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/sergey-tihon/oox"
-include = ["Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "src/**/*", "data/sample.pptx"]
-keywords = ["ooxml", "office", "tui", "xml", "terminal"]
-categories = ["command-line-utilities"]
+include = ["Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE-MIT", "LICENSE-APACHE", "src/**/*", "data/sample.pptx"]
+keywords = ["ooxml", "docx", "xlsx", "pptx", "tui"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "oox"

@@ -367,13 +367,12 @@ pub fn canonical_xml(bytes: &[u8]) -> io::Result<String> {
             }
             Ok(Event::End(event)) => {
                 flush_text(&mut output, &mut pending, depth, elements.last_mut());
-                if let Some(element) = elements.pop() {
-                    if element.has_child_elements
-                        && !element.has_non_whitespace_text
-                        && !element.preserve_space
-                    {
-                        formatting_whitespace.extend(element.whitespace_ranges);
-                    }
+                if let Some(element) = elements.pop()
+                    && element.has_child_elements
+                    && !element.has_non_whitespace_text
+                    && !element.preserve_space
+                {
+                    formatting_whitespace.extend(element.whitespace_ranges);
                 }
                 depth = depth.saturating_sub(1);
                 push_indent(&mut output, depth);
@@ -519,19 +518,15 @@ fn flush_text(
         pending.clear();
         return;
     }
-    if !whitespace_only {
-        if let Some(element) = element.as_deref_mut() {
-            element.has_non_whitespace_text = true;
-        }
+    if !whitespace_only && let Some(element) = element.as_deref_mut() {
+        element.has_non_whitespace_text = true;
     }
     let start = output.len();
     push_indent(output, depth);
     output.push_str(pending);
     output.push('\n');
-    if whitespace_only {
-        if let Some(element) = element {
-            element.whitespace_ranges.push((start, output.len()));
-        }
+    if whitespace_only && let Some(element) = element {
+        element.whitespace_ranges.push((start, output.len()));
     }
     pending.clear();
 }

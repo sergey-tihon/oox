@@ -86,14 +86,12 @@ fn parse_ppt_slide_order(xml: &[u8], index: &PackageIndex) -> Vec<String> {
             Ok(Event::Start(event)) | Ok(Event::Empty(event))
                 if element_is(event.name().as_ref(), b"sldId") =>
             {
-                if let Some(relationship_id) = xml_attribute(&event, b"r:id") {
-                    if let Some(path) =
+                if let Some(relationship_id) = xml_attribute(&event, b"r:id")
+                    && let Some(path) =
                         relationship_target_for_id(index, "/ppt/presentation.xml", &relationship_id)
-                    {
-                        if slides.len() < MAX_SUMMARY_ITEMS {
-                            slides.push(path);
-                        }
-                    }
+                    && slides.len() < MAX_SUMMARY_ITEMS
+                {
+                    slides.push(path);
                 }
             }
             Ok(Event::Eof) => break,

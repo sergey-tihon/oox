@@ -34,10 +34,15 @@ mod ui;
 mod worker;
 
 #[derive(Debug, Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    version,
+    about,
+    long_about = None,
+    after_help = "Examples:\n  oox report.docx             Inspect a package\n  oox before.xlsx after.xlsx  Compare two packages\n\nPress ? inside oox to see every key binding."
+)]
 struct Cli {
     /// OOXML document to inspect, optionally with a second document to compare against
-    #[arg(value_name = "FILE", num_args = 1..=2, required = true)]
+    #[arg(value_name = "FILE", num_args = 1..=2, required_unless_present = "generate_config")]
     files: Vec<PathBuf>,
     /// Keybinding and editor configuration file
     #[arg(long, value_name = "PATH")]
@@ -728,10 +733,10 @@ fn run_app(
                     app.confirm_extract()?;
                 } else if actions.contains(&Action::Backspace) {
                     app.export_backspace();
-                } else if let KeyCode::Char(character) = key.code {
-                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                        app.export_input_char(character);
-                    }
+                } else if let KeyCode::Char(character) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    app.export_input_char(character);
                 }
                 continue;
             }
@@ -744,10 +749,10 @@ fn run_app(
                     app.confirm_save()?;
                 } else if actions.contains(&Action::Backspace) {
                     app.save_backspace();
-                } else if let KeyCode::Char(character) = key.code {
-                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                        app.save_input_char(character);
-                    }
+                } else if let KeyCode::Char(character) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    app.save_input_char(character);
                 }
                 continue;
             }
@@ -1016,15 +1021,30 @@ fn run_app(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CLIPBOARD_BYTES, base64_encode, can_quit_from, editor_key_dirty_policy,
+        Cli, MAX_CLIPBOARD_BYTES, base64_encode, can_quit_from, editor_key_dirty_policy,
         ensure_emacs_insert_mode, osc52_sequence,
     };
     use crate::{
         app::CurrentWidget,
         keybindings::{Action, EditorMode},
     };
+    use clap::Parser;
     use crossterm_keybind::event::{KeyCode, KeyModifiers};
     use edtui::EditorMode as EdtuiMode;
+
+    #[test]
+    fn config_generation_does_not_require_a_document() {
+        let cli = Cli::try_parse_from(["oox", "--generate-config", "--config", "config.toml"])
+            .expect("config generation should not require a document");
+
+        assert!(cli.generate_config);
+        assert!(cli.files.is_empty());
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("config.toml"))
+        );
+        assert!(Cli::try_parse_from(["oox"]).is_err());
+    }
 
     #[test]
     fn emacs_editor_starts_in_edtui_insert_mode() {

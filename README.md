@@ -1,172 +1,103 @@
 # oox
 
-A terminal user interface for inspecting Office Open XML (OOXML) documents such as `.pptx`, `.docx`, and `.xlsx`.
+[![Crates.io](https://img.shields.io/crates/v/oox-tui.svg)](https://crates.io/crates/oox-tui)
+[![CI](https://github.com/sergey-tihon/oox/actions/workflows/ci.yml/badge.svg)](https://github.com/sergey-tihon/oox/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/oox-tui.svg)](#license)
 
-## Features
+`oox` is a terminal UI for looking inside Office Open XML files (`.docx`, `.xlsx`, `.pptx`).
+It shows the ZIP package as a tree of parts, pretty-prints the XML, previews embedded images,
+and lets you search, compare, and edit parts without unzipping anything.
 
-- **Tree inspector** — Browse the parts inside an OOXML package as a tree.
-- **XML viewer** — View selected XML parts with syntax highlighting and indentation.
-- **Image preview** — Preview common embedded PNG, JPEG, GIF, BMP, and WebP images.
-- **Raw file previews** — View plain text and JSON, inspect `.bin` files as hex, and see metadata for binary media, fonts, and OLE parts.
-- **Content search** — Grep package-part contents in the background and filter the tree to matching parts.
-- **Export parts** — Extract a part to a file, open it in `$PAGER`/`$EDITOR`, or copy its pretty-printed content to the clipboard (OSC 52).
-- **Edit and save** — The content pane is editable for XML, text, and JSON parts. `Ctrl-s` writes a new package (default `<name>.edited.<ext>`, overwriting only after a second confirm) that preserves every untouched part byte for byte and re-indexes the result; edited parts are marked with `●` in the tree, `q` warns about unsaved edits, and `Ctrl-e`/`F4` can round-trip the part through `$VISUAL`/`$EDITOR`.
-- **Inline relationship jumps** — Follow an `r:id`/`r:embed` reference inside the XML preview with `Ctrl-g` or a mouse click: internal targets open the referenced part (images preview directly), external URLs are reported in the status bar, and `Alt-Left` returns to where you jumped from.
-- **Document summaries** — Press `s` to inspect slide, paragraph, heading, table, sheet, cell, and formula summaries for PowerPoint, Word, and Excel packages; linked part paths navigate back to the tree.
-- **Package integrity** — Phase-1 OPC checks (dangling relationship targets, parts without a content type, orphan parts, duplicate relationship ids, missing required parts) are listed in the metadata panel, marked with `⚠` in the tree, and reachable with `i`/`I`.
-- **Vim-like navigation** — Move through files with `j`/`k` and the editor with Vim bindings.
+![oox browsing a PowerPoint package](https://raw.githubusercontent.com/sergey-tihon/oox/main/docs/demo.gif)
 
-## Tech Stack
-
-- [Rust](https://www.rust-lang.org/)
-- [ratatui](https://github.com/ratatui/ratatui) + [crossterm](https://github.com/crossterm-rs/crossterm) — cross-platform TUI
-- [tui-tree-widget](https://github.com/EdJoPaTo/tui-tree-widget) — tree widget
-- [edtui](https://github.com/preiter93/edtui) — editor widget with Vim mode and syntax highlighting
-- [zip](https://github.com/zip-rs/zip2) — read OOXML ZIP containers (Deflate support)
-- [quick-xml](https://github.com/tafia/quick-xml) — XML parsing and pretty-printing
-- [image](https://github.com/image-rs/image) + [ratatui-image](https://github.com/EdJoPaTo/ratatui-image) — decode and render embedded images
-
-## Installation
-
-Install the published binary from crates.io:
+## Install
 
 ```bash
-cargo install oox-tui
+cargo install oox-tui --locked
 ```
 
-Or install the latest source version:
-
-```bash
-git clone https://github.com/sergey-tihon/oox.git
-cd oox
-cargo install --path .
-```
+The crate is called `oox-tui`; it installs a command called `oox`. Requires Rust 1.90 or newer.
 
 ## Usage
 
 ```bash
-# Inspect a specific OOXML file
-oox path/to/document.pptx
-
-# Compare two packages part by part
-# The tree marks parts as added (`+`), removed (`-`), or changed (`~`); the
-# content pane shows a unified diff of normalized XML for the selected part.
-oox before.docx after.docx
-
-# Inspect the bundled sample file from a source checkout
-cargo run -- data/sample.pptx
-
-# Show command-line help and version
-oox --help
-oox --version
+oox report.docx              # inspect a package
+oox before.xlsx after.xlsx   # compare two packages part by part
 ```
 
-## Keybindings
+## Features
 
-| Key       | Action                                    |
-| --------- | ----------------------------------------- |
-| `j` / `↓` | Move down in the tree                       |
-| `k` / `↑` | Move up in the tree                         |
-| `Ctrl-d` / `Ctrl-u` | Scroll down / up in the tree       |
-| `g` / `G` | Select the first / last visible item        |
-| `E` / `C` | Expand / collapse all tree nodes              |
-| `e`       | Extract the selected part to a file         |
-| `o`       | Open the selected part in `$PAGER`/`$EDITOR` |
-| `y`       | Copy pretty-printed content to the clipboard |
-| `Ctrl-s` / `F2` | Save edited parts to a new package       |
-| `Ctrl-e` / `F4` | Edit the part in `$VISUAL`/`$EDITOR`, then return |
-| `/`       | Search and live-filter package paths          |
-| `Ctrl-f`  | Search part contents in the background       |
-| `n` / `N` | Select the next / previous search match     |
-| `i` / `I` | Jump to the next / previous part with a package issue |
-| `Ctrl-g`  | Follow the `r:id`/`r:embed` reference under the content cursor |
-| `Esc`     | Cancel search / clear the applied filter    |
-| `Enter`   | Toggle directory / preview file content     |
-| `1` / `2` / `3` | Focus tree / metadata / content panels  |
-| `Tab`     | Cycle tree / metadata / content focus       |
-| `?` / `F1` | Show the help screen                        |
-| `d`       | Toggle the metadata panel                   |
-| `s`       | Toggle the document-specific summary        |
-| Mouse       | Select/expand tree; scroll tree/metadata; click relationship targets |
-| `q`       | Quit from tree / Vim normal mode             |
-| `Ctrl-q`  | Quit from Emacs editor                       |
-| `Alt-Left` / `Alt-Right` | Previous / next opened part       |
+- Browse every part in the package. XML and JSON are pretty-printed and syntax-highlighted.
+- Preview embedded PNG, JPEG, GIF, BMP, and WebP images. Other binary parts get a hex dump or a metadata summary.
+- Follow relationships: jump from an `r:id` in the XML to the part it points to, and back.
+- Search part names (`/`) or part contents (`Ctrl-f`).
+- Check package structure. Dangling relationships, parts without a content type, orphan parts, duplicate relationship ids, and missing required parts are flagged with `⚠`.
+- Summarize the document: slides, headings, tables, sheets, and formulas (`s`).
+- Compare two files. Parts are marked added (`+`), removed (`-`), or changed (`~`), and the diff ignores attribute order and whitespace-only changes.
+- Edit XML, JSON, and text parts in place or in `$EDITOR`, then save a copy of the package (`<name>.edited.<ext>` by default). Untouched parts are copied byte for byte.
+- Extract a part to a file, open it in `$PAGER`, or copy it to the clipboard.
 
-## Package safety and loading
+Untrusted files are safe to open: archive size, entry count, part reads, and image dimensions are capped, and embedded content is never executed.
 
-Package metadata uses one canonical normalized path model. ZIP entries with traversal-like names, colliding normalized paths, and malformed relationships/content types are retained as structured diagnostics and are not allowed to overwrite another part. Archives exceeding 100,000 entries or 256 MiB of declared uncompressed content are rejected as failed opens; individual reads are bounded while data is decompressed (32 MiB per part and 4 MiB for indexing metadata), and declared ZIP sizes are not trusted as a substitute for the streaming limit. Hex previews are capped at 1 MiB and images are limited to 8192×8192 and 16 million pixels.
+## Keys
 
-Archive indexing, document summaries, and selected-part preview work run on a bounded background worker after the loading screen is entered. Messages contain owned package metadata/preview payloads; request IDs and selected canonical paths discard stale results. The UI remains the sole owner of editor state and creates ratatui image protocols on the UI thread. Loading and malformed/limited-part failures are shown in the status area rather than panicking. Terminal mode is restored on normal exits and unwinding errors on a best-effort basis.
+| Key                  | Action                                  |
+| -------------------- | --------------------------------------- |
+| `j` `k`, `Up` `Down` | Move in the tree                 |
+| `Enter`              | Open part / expand folder               |
+| `Tab`, `1` `2` `3`   | Switch panel                            |
+| `/`, `Ctrl-f`        | Search names, search contents           |
+| `n` `N`              | Next / previous match                   |
+| `Ctrl-g`, `Alt-Left` | Follow relationship, go back            |
+| `i` `I`              | Next / previous structure issue         |
+| `s`, `d`             | Toggle summary, toggle metadata panel   |
+| `u`                  | Hide unchanged parts (compare mode)     |
+| `x`, `o`, `y`        | Extract, open externally, copy          |
+| `Ctrl-s`, `Ctrl-e`   | Save package, edit part in `$EDITOR`    |
+| `R`                  | Revert unsaved edits to the selected part |
+| `?`                  | Show all keys                           |
+| `q`                  | Quit                                    |
 
-The initial package is not indexed synchronously: the tree and summary appear when the worker finishes, and tree/content actions are ignored while loading. Summary XML parser failures are retained as structured diagnostics in package metadata instead of displaying a partial summary; summary output and extracted item/text collections are bounded to prevent oversized documents from consuming unbounded memory.
-
-Phase-1 package integrity is structural only (no schema validation): internal relationship targets that do not resolve (URI fragments are ignored), parts with no content type, parts unreachable from `/_rels/.rels`, duplicate relationship ids within one `.rels` part, and missing required parts (`[Content_Types].xml`, root rels, the `officeDocument` main part). Explicitly external relationships are never dangling; relationship parts (`_rels/.rels` and `.../_rels/*.rels`) are exempt from the reachability rule because OPC resolves them implicitly rather than through relationships, but they still need a content type, so a manifest without a `rels` default is reported; OPC-reserved bracket names such as `[Content_Types].xml` and `[trash]` are exempt from both rules.
-
-## Terminal image support
-
-Image previews work in all terminals using a Unicode half-block fallback. For sharper previews, use a terminal with Kitty graphics, iTerm2, or Sixel support, such as Ghostty, Kitty, WezTerm, or iTerm2.
+The mouse selects, scrolls, and follows relationship links. The content pane uses Vim keys by default.
 
 ## Configuration
 
-Generate a documented configuration file in the system config directory:
+`oox --generate-config` writes a commented config file to:
 
-```bash
-oox --generate-config
-```
+- Linux: `$XDG_CONFIG_HOME/oox/config.toml` (default `~/.config/oox/config.toml` when `XDG_CONFIG_HOME` is unset)
+- macOS: `~/Library/Application Support/oox/config.toml`
+- Windows: `%APPDATA%\oox\config.toml`
 
-Run with the automatically discovered configuration:
-
-```bash
-oox data/sample.pptx
-```
-
-Use `--config` only when you want to load a different file:
-
-```bash
-oox --config /path/to/config.toml data/sample.pptx
-```
-
-The generated file contains editor mode and application keybindings. Each binding
-is an array of alternative single-key shortcuts:
+It is loaded automatically; `--config <path>` loads a different one. Every key can be rebound, and the editor can be switched to Emacs mode:
 
 ```toml
 [editor]
-mode = "vim" # or "emacs"
+mode = "emacs" # default: "vim"
 
 [keybindings]
 help = ["?", "F1"]
 move_down = ["j", "Down"]
-show_metadata = ["d"]
-show_summary = ["s"]
 ```
 
-The keybinding help screen is generated from the active configuration.
+## Image previews
 
-## Debugging
+Images render in any terminal using Unicode half blocks. Terminals with Kitty graphics, iTerm2, or Sixel support (Ghostty, Kitty, WezTerm, iTerm2) can use native graphics protocols for sharper previews; images remain fitted to the content pane.
 
-Enable key and event logging while troubleshooting terminal input:
+## Troubleshooting
 
-```bash
-OOX_DEBUG=1 cargo run -- data/sample.pptx
-```
+`OOX_DEBUG=1 oox file.pptx` logs key and terminal events to `/tmp/oox-debug.log`.
 
-Debug messages are written to `/tmp/oox-debug.log`, so they do not corrupt the TUI:
+## Contributing
 
-```bash
-tail -f /tmp/oox-debug.log
-```
-
-## Development
-
-```bash
-cargo fmt --all -- --check
-cargo check --all-targets --locked
-cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --all-targets --locked
-cargo build --all-targets --locked
-cargo package --locked
-```
+Issues and pull requests are welcome. From a checkout, `cargo run -- data/sample.pptx` opens the bundled sample. CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`.
 
 ## License
 
-See [LICENSE](LICENSE).
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

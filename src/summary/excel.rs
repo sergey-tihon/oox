@@ -110,10 +110,9 @@ fn parse_excel_workbook(xml: &[u8]) -> Vec<(String, String)> {
                 if let (Some(name), Some(relationship_id)) = (
                     xml_attribute(&event, b"name"),
                     xml_attribute(&event, b"r:id"),
-                ) {
-                    if sheets.len() < MAX_SUMMARY_ITEMS {
-                        sheets.push((name, relationship_id));
-                    }
+                ) && sheets.len() < MAX_SUMMARY_ITEMS
+                {
+                    sheets.push((name, relationship_id));
                 }
             }
             Ok(Event::Eof) => break,
@@ -270,19 +269,19 @@ fn parse_excel_worksheet(xml: &[u8], shared_strings: &[String]) -> ExcelWorkshee
                     || element_is(name.as_ref(), b"t")
                 {
                     active_field = None;
-                } else if element_is(name.as_ref(), b"c") {
-                    if let Some(mut cell) = current_cell.take() {
-                        if cell.cell_type.as_deref() == Some("s") {
-                            if let Ok(index) = cell.value.parse::<usize>() {
-                                cell.value = shared_strings.get(index).cloned().unwrap_or_default();
-                            }
-                        }
-                        if cell.formula.is_some() {
-                            summary.formula_count += 1;
-                        }
-                        if summary.cells.len() < MAX_SUMMARY_ITEMS {
-                            summary.cells.push(cell);
-                        }
+                } else if element_is(name.as_ref(), b"c")
+                    && let Some(mut cell) = current_cell.take()
+                {
+                    if cell.cell_type.as_deref() == Some("s")
+                        && let Ok(index) = cell.value.parse::<usize>()
+                    {
+                        cell.value = shared_strings.get(index).cloned().unwrap_or_default();
+                    }
+                    if cell.formula.is_some() {
+                        summary.formula_count += 1;
+                    }
+                    if summary.cells.len() < MAX_SUMMARY_ITEMS {
+                        summary.cells.push(cell);
                     }
                 }
             }

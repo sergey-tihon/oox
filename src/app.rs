@@ -828,10 +828,10 @@ impl App {
                             self.preview_kind = kind;
                             let lines = Lines::from(text.as_str());
                             self.editor_state = EditorState::new(lines.clone());
-                            if let Some(reselect) = restore {
-                                if reselect.path == selected_path {
-                                    place_cursor(&mut self.editor_state, reselect.spot);
-                                }
+                            if let Some(reselect) = restore
+                                && reselect.path == selected_path
+                            {
+                                place_cursor(&mut self.editor_state, reselect.spot);
                             }
                             self.editor_baseline = Some(lines);
                             self.editor_editable = editable;
@@ -1004,14 +1004,14 @@ impl App {
             "Select a package part or press Enter to preview content".to_string()
         });
         // After a save the saved part is shown again, now from the new package.
-        if let Some(reselect) = self.pending_reselect.take() {
-            if self.index().parts.contains_key(&reselect.path) {
-                self.select_path(&reselect.path);
-                self.pending_cursor = Some(reselect);
-                let _ = self.load_selected_file_content();
-                if self.save_reloading && self.preview_pending {
-                    self.save_reload_preview_request_id = Some(self.preview_request_id);
-                }
+        if let Some(reselect) = self.pending_reselect.take()
+            && self.index().parts.contains_key(&reselect.path)
+        {
+            self.select_path(&reselect.path);
+            self.pending_cursor = Some(reselect);
+            let _ = self.load_selected_file_content();
+            if self.save_reloading && self.preview_pending {
+                self.save_reload_preview_request_id = Some(self.preview_request_id);
             }
         }
         if self.save_reloading && self.save_reload_preview_request_id.is_none() {
@@ -1850,10 +1850,10 @@ impl App {
         };
 
         let mut status = format!("Part: {display_name} | Type: {part_type}");
-        if let Some(compare) = self.compare.as_ref() {
-            if let Some(diff) = compare.comparison.status_of(selected) {
-                status.push_str(&format!(" | Diff: {}", diff.label()));
-            }
+        if let Some(compare) = self.compare.as_ref()
+            && let Some(diff) = compare.comparison.status_of(selected)
+        {
+            status.push_str(&format!(" | Diff: {}", diff.label()));
         }
         if self.content_search_active {
             status.push_str(&format!(
@@ -2290,13 +2290,13 @@ impl App {
             .collect();
         if let (Some(path), Some(baseline)) =
             (self.previewed_path.as_ref(), self.editor_baseline.as_ref())
+            && self.editor_editable
+            && self.editor_state.lines != *baseline
         {
-            if self.editor_editable && self.editor_state.lines != *baseline {
-                edits.insert(
-                    path.clone(),
-                    lines_to_text(&self.editor_state.lines).into_bytes(),
-                );
-            }
+            edits.insert(
+                path.clone(),
+                lines_to_text(&self.editor_state.lines).into_bytes(),
+            );
         }
         edits.into_iter().collect()
     }
@@ -2348,13 +2348,13 @@ impl App {
             if !is_xml {
                 continue;
             }
-            if let Ok(text) = std::str::from_utf8(bytes) {
-                if let Err(problem) = crate::preview::xml_well_formed(text) {
-                    warnings.push(format!(
-                        "{} is not well-formed XML ({problem})",
-                        path.trim_start_matches('/')
-                    ));
-                }
+            if let Ok(text) = std::str::from_utf8(bytes)
+                && let Err(problem) = crate::preview::xml_well_formed(text)
+            {
+                warnings.push(format!(
+                    "{} is not well-formed XML ({problem})",
+                    path.trim_start_matches('/')
+                ));
             }
         }
         warnings
@@ -2795,10 +2795,10 @@ impl App {
         for path in self.edits.keys() {
             add_marker(&mut markers, path, EDIT_MARKER);
         }
-        if self.editor_dirty {
-            if let Some(path) = self.previewed_path.as_deref() {
-                add_marker(&mut markers, path, EDIT_MARKER);
-            }
+        if self.editor_dirty
+            && let Some(path) = self.previewed_path.as_deref()
+        {
+            add_marker(&mut markers, path, EDIT_MARKER);
         }
         let Some(compare) = self.compare.as_ref() else {
             return markers;
