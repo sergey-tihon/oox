@@ -1021,15 +1021,30 @@ fn run_app(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CLIPBOARD_BYTES, base64_encode, can_quit_from, editor_key_dirty_policy,
+        Cli, MAX_CLIPBOARD_BYTES, base64_encode, can_quit_from, editor_key_dirty_policy,
         ensure_emacs_insert_mode, osc52_sequence,
     };
     use crate::{
         app::CurrentWidget,
         keybindings::{Action, EditorMode},
     };
+    use clap::Parser;
     use crossterm_keybind::event::{KeyCode, KeyModifiers};
     use edtui::EditorMode as EdtuiMode;
+
+    #[test]
+    fn config_generation_does_not_require_a_document() {
+        let cli = Cli::try_parse_from(["oox", "--generate-config", "--config", "config.toml"])
+            .expect("config generation should not require a document");
+
+        assert!(cli.generate_config);
+        assert!(cli.files.is_empty());
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("config.toml"))
+        );
+        assert!(Cli::try_parse_from(["oox"]).is_err());
+    }
 
     #[test]
     fn emacs_editor_starts_in_edtui_insert_mode() {

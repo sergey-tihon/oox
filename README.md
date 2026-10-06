@@ -64,7 +64,7 @@ The mouse selects, scrolls, and follows relationship links. The content pane use
 
 `oox --generate-config` writes a commented config file to:
 
-- Linux: `~/.config/oox/config.toml`
+- Linux: `$XDG_CONFIG_HOME/oox/config.toml` (default `~/.config/oox/config.toml` when `XDG_CONFIG_HOME` is unset)
 - macOS: `~/Library/Application Support/oox/config.toml`
 - Windows: `%APPDATA%\oox\config.toml`
 
@@ -81,7 +81,7 @@ move_down = ["j", "Down"]
 
 ## Image previews
 
-Images render in any terminal using Unicode half blocks. Terminals with Kitty graphics, iTerm2, or Sixel support (Ghostty, Kitty, WezTerm, iTerm2) show full-resolution images.
+Images render in any terminal using Unicode half blocks. Terminals with Kitty graphics, iTerm2, or Sixel support (Ghostty, Kitty, WezTerm, iTerm2) can use native graphics protocols for sharper previews; images remain fitted to the content pane.
 
 ## Troubleshooting
 

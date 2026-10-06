@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Minimum supported Rust version is now 1.90; 1.86 was declared but never built with the locked dependencies.
 - Rewrote the README and added a demo; refreshed the crate description, keywords, and categories.
 - `oox --help` lists usage examples.
+- Clarified the XDG-aware configuration path and image preview scaling in the README.
 
 ### Fixed
 
