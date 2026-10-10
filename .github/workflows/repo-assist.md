@@ -45,6 +45,10 @@ if: needs.pre_activation.outputs.check_result == 'success'
 
 timeout-minutes: 60
 
+engine:
+  id: copilot
+  model: gpt-5.4
+
 permissions:
   actions: read
   attestations: read
@@ -224,20 +228,15 @@ steps:
       MEMORY_DIR: /tmp/gh-aw/repo-memory/default
     run: |
       if [[ ! -f "$MEMORY_DIR/notes.json" ]]; then
-        cat > "$MEMORY_DIR/notes.json" <<'EOF'
-      {
-        "version": 1,
-        "cursors": {
-          "labelling_after": null,
-          "investigation_after": null
-        },
-        "issues": [],
-        "fixes": [],
-        "checks": [],
-        "completed_actions": [],
-        "priorities": []
-      }
-      EOF
+        jq -n '{
+          version: 1,
+          cursors: {labelling_after: null, investigation_after: null},
+          issues: [],
+          fixes: [],
+          checks: [],
+          completed_actions: [],
+          priorities: []
+        }' > "$MEMORY_DIR/notes.json"
       fi
 
   - name: Fetch repo data for task weighting
