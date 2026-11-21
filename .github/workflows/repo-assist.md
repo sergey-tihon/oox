@@ -77,7 +77,6 @@ checkout:
   fetch-depth: 0   # fetch full history
 
 tools:
-  web-fetch:
   github:
     toolsets: [all]
     allowed-repos: all
@@ -188,7 +187,7 @@ safe-outputs:
     draft: true
     title-prefix: "[repo-assist] "
     protected-files:
-      policy: request_review
+      policy: request-review
       exclude:
         - CHANGELOG.md
         - README.md
