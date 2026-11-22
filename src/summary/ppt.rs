@@ -4,28 +4,28 @@ use std::io::{self, Read};
 use quick_xml::{Reader, events::Event};
 
 use super::{
-    DetailsView, MAX_SUMMARY_ITEMS, MAX_SUMMARY_TEXT_CHARS, append_decoded_reference,
-    append_decoded_text, clean_summary_text, element_is, push_summary_line, read_part,
-    relationship_count, relationship_target_for_id, validate_xml_bytes,
+    DetailsView, MAX_SUMMARY_ITEMS, SummaryBuilder, SummaryText, clean_summary_text, element_is,
+    read_part, relationship_count, relationship_target_for_id, validate_xml_bytes,
 };
+use crate::cancel::Cancel;
 use crate::package::{PackageIndex, xml_attribute};
 
 pub(super) fn build_ppt_summary<R: Read + io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     index: &PackageIndex,
+    main: &str,
+    cancel: &Cancel,
 ) -> io::Result<DetailsView> {
-    let presentation = read_part(archive, index, "/ppt/presentation.xml")?;
-    validate_xml_bytes(&presentation, "/ppt/presentation.xml")?;
-    let slide_paths = parse_ppt_slide_order(&presentation, index);
-    let mut summary = DetailsView {
-        text: String::new(),
-        links: Vec::new(),
-    };
-    push_summary_line(&mut summary, "PowerPoint summary", None);
-    push_summary_line(&mut summary, "", None);
-    push_summary_line(&mut summary, format!("Slides: {}", slide_paths.len()), None);
+    let presentation = read_part(archive, index, main)?;
+    validate_xml_bytes(&presentation, main)?;
+    let slide_paths = parse_ppt_slide_order(&presentation, index, main);
+    let mut summary = SummaryBuilder::new();
+    summary.push_line("PowerPoint summary", None);
+    summary.push_line("", None);
+    summary.push_line(format!("Slides: {}", slide_paths.len()), None);
 
     for (number, slide_path) in slide_paths.iter().enumerate() {
+        cancel.check()?;
         let slide = read_part(archive, index, slide_path)?;
         validate_xml_bytes(&slide, slide_path)?;
         let title = extract_ppt_title(&slide).unwrap_or_else(|| "(untitled)".to_string());
@@ -50,33 +50,25 @@ pub(super) fn build_ppt_summary<R: Read + io::Seek>(
             None => None,
         };
 
-        push_summary_line(&mut summary, "", None);
-        push_summary_line(&mut summary, format!("{}. {}", number + 1, title), None);
-        push_summary_line(
-            &mut summary,
-            format!("   Part: {slide_path}"),
-            Some(slide_path),
-        );
-        push_summary_line(&mut summary, format!("   Images: {image_count}"), None);
+        summary.push_line("", None);
+        summary.push_line(format!("{}. {}", number + 1, title), None);
+        summary.push_line(format!("   Part: {slide_path}"), Some(slide_path));
+        summary.push_line(format!("   Images: {image_count}"), None);
         match notes_path {
             Some(path) => {
                 let suffix = notes_text
                     .as_deref()
                     .map_or_else(String::new, |text| format!(" — {text}"));
-                push_summary_line(
-                    &mut summary,
-                    format!("   Notes: {path}{suffix}"),
-                    Some(&path),
-                );
+                summary.push_line(format!("   Notes: {path}{suffix}"), Some(&path));
             }
-            None => push_summary_line(&mut summary, "   Notes: none", None),
+            None => summary.push_line("   Notes: none", None),
         }
     }
 
-    Ok(summary)
+    Ok(summary.finish())
 }
 
-fn parse_ppt_slide_order(xml: &[u8], index: &PackageIndex) -> Vec<String> {
+fn parse_ppt_slide_order(xml: &[u8], index: &PackageIndex, main: &str) -> Vec<String> {
     let mut reader = Reader::from_reader(xml);
     let mut buffer = Vec::new();
     let mut slides = Vec::new();
@@ -87,8 +79,7 @@ fn parse_ppt_slide_order(xml: &[u8], index: &PackageIndex) -> Vec<String> {
                 if element_is(event.name().as_ref(), b"sldId") =>
             {
                 if let Some(relationship_id) = xml_attribute(&event, b"r:id")
-                    && let Some(path) =
-                        relationship_target_for_id(index, "/ppt/presentation.xml", &relationship_id)
+                    && let Some(path) = relationship_target_for_id(index, main, &relationship_id)
                     && slides.len() < MAX_SUMMARY_ITEMS
                 {
                     slides.push(path);
@@ -109,7 +100,7 @@ fn extract_ppt_title(xml: &[u8]) -> Option<String> {
     let mut buffer = Vec::new();
     let mut shape_depth = 0usize;
     let mut title_shape = false;
-    let mut text = String::new();
+    let mut text = SummaryText::new();
 
     loop {
         match reader.read_event_into(&mut buffer) {
@@ -140,15 +131,11 @@ fn extract_ppt_title(xml: &[u8]) -> Option<String> {
             {
                 title_shape = true;
             }
-            Ok(Event::Text(event)) if title_shape => {
-                append_decoded_text(&mut text, &event, MAX_SUMMARY_TEXT_CHARS);
-            }
-            Ok(Event::GeneralRef(event)) if title_shape => {
-                append_decoded_reference(&mut text, &event, MAX_SUMMARY_TEXT_CHARS);
-            }
+            Ok(Event::Text(event)) if title_shape => text.push_text(&event),
+            Ok(Event::GeneralRef(event)) if title_shape => text.push_reference(&event),
             Ok(Event::End(event)) if element_is(event.name().as_ref(), b"sp") => {
                 if shape_depth == 1 && title_shape {
-                    let title = clean_summary_text(&text);
+                    let title = clean_summary_text(text.as_str());
                     if !title.is_empty() {
                         return Some(title);
                     }
@@ -168,16 +155,12 @@ fn extract_ppt_title(xml: &[u8]) -> Option<String> {
 pub(super) fn extract_all_text(xml: &[u8]) -> String {
     let mut reader = Reader::from_reader(xml);
     let mut buffer = Vec::new();
-    let mut text = String::new();
+    let mut text = SummaryText::new();
 
     loop {
         match reader.read_event_into(&mut buffer) {
-            Ok(Event::Text(event)) => {
-                append_decoded_text(&mut text, &event, MAX_SUMMARY_TEXT_CHARS);
-            }
-            Ok(Event::GeneralRef(event)) => {
-                append_decoded_reference(&mut text, &event, MAX_SUMMARY_TEXT_CHARS);
-            }
+            Ok(Event::Text(event)) => text.push_text(&event),
+            Ok(Event::GeneralRef(event)) => text.push_reference(&event),
             Ok(Event::Eof) => break,
             Ok(_) => {}
             Err(_) => break,
@@ -185,5 +168,5 @@ pub(super) fn extract_all_text(xml: &[u8]) -> String {
         buffer.clear();
     }
 
-    text
+    text.into_string()
 }

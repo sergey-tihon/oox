@@ -8,6 +8,8 @@ use ratatui::{
 };
 use ratatui_image::{Resize, StatefulImage};
 use tui_tree_widget::Tree;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{App, CurrentWidget},
@@ -40,7 +42,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    let snapshot = LayoutSnapshot::new(area, app.details_visible);
+    let snapshot = LayoutSnapshot::new(area, app.details.visible);
     let chunks = [snapshot.header, snapshot.body, snapshot.status];
 
     let accent_color = Color::LightGreen;
@@ -124,7 +126,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     } else {
         // `visible_tree_items` borrows `app` immutably, so the tree state is moved
         // out for the duration of the render and put back afterwards.
-        let mut tree_state = std::mem::take(&mut app.tree_state);
+        let mut tree_state = std::mem::take(&mut app.tree.state);
         match Tree::new(app.visible_tree_items()) {
             Ok(tree_widget) => {
                 let tree_widget = tree_widget
@@ -149,15 +151,15 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                 f.render_widget(message, left_sections[0]);
             }
         }
-        app.tree_state = tree_state;
+        app.tree.state = tree_state;
     }
 
-    if app.details_visible {
+    if app.details.visible {
         // Copy scalars out first: `details_view` borrows `app` mutably to update
         // the cache, so no other `app` access is allowed while the view is alive.
         let details_focused = app.current_widget == CurrentWidget::Details;
-        let raw_scroll = app.details_scroll;
-        let raw_cursor = app.details_cursor;
+        let raw_scroll = app.details.scroll;
+        let raw_cursor = app.details.cursor;
         let details = app.details_view();
         let details_block = Block::bordered()
             .title("[2] Metadata")
@@ -168,12 +170,11 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                 normal_style
             });
         let details_inner = details_block.inner(left_sections[1]);
-        let max_scroll = details
-            .text
-            .lines()
-            .count()
-            .saturating_sub(details_inner.height as usize) as u16;
-        let details_scroll = raw_scroll.min(max_scroll);
+        let details_scroll = clamped_scroll(
+            raw_scroll,
+            details.text.lines().count(),
+            details_inner.height,
+        );
         let details_cursor = if details.links.is_empty() {
             None
         } else {
@@ -201,21 +202,20 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             normal_style
         });
 
-    if app.summary_visible {
-        if let Some(summary) = app.document_summary.as_ref() {
+    if app.summary.visible {
+        if let Some(summary) = app.summary.view.as_ref() {
             let summary_inner = editor_block.inner(sections[1]);
-            let max_scroll = summary
-                .text
-                .lines()
-                .count()
-                .saturating_sub(summary_inner.height as usize) as u16;
-            let summary_scroll = app.summary_scroll.min(max_scroll);
+            let summary_scroll = clamped_scroll(
+                app.summary.scroll,
+                summary.text.lines().count(),
+                summary_inner.height,
+            );
             let summary = Paragraph::new(Text::from(linked_lines(summary, None)))
                 .block(editor_block)
                 .scroll((summary_scroll, 0));
             f.render_widget(summary, sections[1]);
         }
-    } else if let Some(image_state) = app.image_state.as_mut() {
+    } else if let Some(image_state) = app.preview.image_state.as_mut() {
         let image_block = Block::default()
             .borders(Borders::ALL)
             .title(format!("[3] {content_title}"))
@@ -231,7 +231,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         let image = StatefulImage::default().resize(Resize::Fit(None));
         f.render_stateful_widget(image, image_area, image_state);
     } else if let Some(message) = app.content_message.as_deref() {
-        let color = if app.preview_kind == PreviewKind::Info {
+        let color = if app.preview.kind == PreviewKind::Info {
             Color::White
         } else {
             Color::Yellow
@@ -254,18 +254,18 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             .line_numbers_style(Style::default().fg(Color::DarkGray))
             .status_line(status_line);
 
-        let syntax_highlighter = match app.preview_kind {
+        let syntax_highlighter = match app.preview.kind {
             PreviewKind::Xml => SyntaxHighlighter::new("dracula", "xml").ok(),
             PreviewKind::Json => SyntaxHighlighter::new("dracula", "json").ok(),
             PreviewKind::Diff => SyntaxHighlighter::new("dracula", "diff").ok(),
             _ => None,
         };
-        let line_numbers = if app.preview_kind == PreviewKind::Hex {
+        let line_numbers = if app.preview.kind == PreviewKind::Hex {
             LineNumbers::None
         } else {
             LineNumbers::Absolute
         };
-        let editor_view = EditorView::new(&mut app.editor_state)
+        let editor_view = EditorView::new(&mut app.editor.state)
             .theme(theme)
             .line_numbers(line_numbers)
             .syntax_highlighter(syntax_highlighter);
@@ -305,11 +305,11 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 }
 
 pub fn tree_area_contains(area: Rect, app: &App, x: u16, y: u16) -> bool {
-    LayoutSnapshot::contains(LayoutSnapshot::new(area, app.details_visible).tree, x, y)
+    LayoutSnapshot::contains(LayoutSnapshot::new(area, app.details.visible).tree, x, y)
 }
 
 pub fn content_area_contains(area: Rect, app: &App, x: u16, y: u16) -> bool {
-    LayoutSnapshot::contains(LayoutSnapshot::new(area, app.details_visible).content, x, y)
+    LayoutSnapshot::contains(LayoutSnapshot::new(area, app.details.visible).content, x, y)
 }
 
 /// Whether the point is inside the editor's text area: the content pane minus
@@ -318,40 +318,82 @@ pub fn content_area_contains(area: Rect, app: &App, x: u16, y: u16) -> bool {
 /// so cursor-based actions (following a relationship reference) must ignore
 /// clicks outside it; otherwise a border click reuses the stale cursor.
 pub fn content_text_area_contains(area: Rect, app: &App, x: u16, y: u16) -> bool {
-    let mut text = LayoutSnapshot::new(area, app.details_visible).content_inner;
+    let mut text = LayoutSnapshot::new(area, app.details.visible).content_inner;
     text.height = text.height.saturating_sub(1);
     // Keep the gutter in sync with the editor render below and edtui's
     // `line_number_width` (digits + 1); hex previews hide line numbers.
-    let gutter = if app.preview_kind == PreviewKind::Hex {
+    let gutter = if app.preview.kind == PreviewKind::Hex {
         0
     } else {
-        app.editor_state.lines.len().max(1).to_string().len() as u16 + 1
+        app.editor.state.lines.len().max(1).to_string().len() as u16 + 1
     };
     text.x = text.x.saturating_add(gutter);
     text.width = text.width.saturating_sub(gutter);
     LayoutSnapshot::contains(text, x, y)
 }
 
-pub fn summary_line_at(area: Rect, app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
-    if !app.summary_visible {
-        return None;
+fn char_index_at_column(line: &str, column: usize) -> Option<usize> {
+    let mut cells = 0usize;
+    let mut chars = 0usize;
+    for (_, grapheme) in line.grapheme_indices(true) {
+        let width = UnicodeWidthStr::width(grapheme);
+        if column < cells + width {
+            return Some(chars);
+        }
+        cells += width;
+        chars += grapheme.chars().count();
     }
-    LayoutSnapshot::new(area, app.details_visible).content_line(app.summary_scroll, x, y)
+    None
 }
 
-pub fn metadata_line_at(area: Rect, app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
-    if !app.details_visible {
+fn clamped_scroll(raw: u16, line_count: usize, height: u16) -> u16 {
+    raw.min(line_count.saturating_sub(usize::from(height)) as u16)
+}
+
+pub fn summary_line_at(area: Rect, app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
+    if !app.summary.visible {
         return None;
     }
-    let snapshot = LayoutSnapshot::new(area, true);
-    let details = snapshot.details?;
-    let inner = Block::bordered().inner(details);
-    LayoutSnapshot::contains(inner, x, y).then(|| {
-        (
-            usize::from(y - inner.y) + usize::from(app.details_scroll),
-            usize::from(x - inner.x),
-        )
-    })
+    let summary = app.summary.view.as_ref()?;
+    let inner = LayoutSnapshot::new(area, app.details.visible).content_inner;
+    if !LayoutSnapshot::contains(inner, x, y) {
+        return None;
+    }
+    let scroll = clamped_scroll(
+        app.summary.scroll,
+        summary.text.lines().count(),
+        inner.height,
+    );
+    let line = usize::from(y - inner.y) + usize::from(scroll);
+    let column = summary
+        .text
+        .lines()
+        .nth(line)
+        .and_then(|text| char_index_at_column(text, usize::from(x - inner.x)))
+        .unwrap_or(usize::MAX);
+    Some((line, column))
+}
+
+pub fn metadata_line_at(area: Rect, app: &mut App, x: u16, y: u16) -> Option<(usize, usize)> {
+    if !app.details.visible {
+        return None;
+    }
+    let details_area = LayoutSnapshot::new(area, true).details?;
+    let inner = Block::bordered().inner(details_area);
+    if !LayoutSnapshot::contains(inner, x, y) {
+        return None;
+    }
+    let raw_scroll = app.details.scroll;
+    let details = app.details_view();
+    let scroll = clamped_scroll(raw_scroll, details.text.lines().count(), inner.height);
+    let line = usize::from(y - inner.y) + usize::from(scroll);
+    let column = details
+        .text
+        .lines()
+        .nth(line)
+        .and_then(|text| char_index_at_column(text, usize::from(x - inner.x)))
+        .unwrap_or(usize::MAX);
+    Some((line, column))
 }
 
 /// Render a details/summary view, highlighting link targets. When
@@ -392,7 +434,7 @@ fn linked_lines(view: &DetailsView, selected_link_line: Option<usize>) -> Vec<Li
 }
 
 fn content_title(app: &App) -> String {
-    let label = match app.preview_kind {
+    let label = match app.preview.kind {
         PreviewKind::Xml => "XML content",
         PreviewKind::PlainText => "Text content",
         PreviewKind::Json => "JSON content",
@@ -409,7 +451,7 @@ fn content_title(app: &App) -> String {
     // Editor-backed previews that cannot be written back say so, since edtui has
     // no read-only mode and typing into them is otherwise silently discarded.
     let editor_backed = matches!(
-        app.preview_kind,
+        app.preview.kind,
         PreviewKind::Xml
             | PreviewKind::PlainText
             | PreviewKind::Json
@@ -456,5 +498,20 @@ mod tests {
     #[test]
     fn diff_syntax_is_available() {
         assert!(SyntaxHighlighter::new("dracula", "diff").is_ok());
+    }
+    #[test]
+    fn char_index_at_column_counts_cells() {
+        assert_eq!(super::char_index_at_column("a界b", 0), Some(0));
+        assert_eq!(super::char_index_at_column("a界b", 1), Some(1));
+        assert_eq!(super::char_index_at_column("a界b", 2), Some(1));
+        assert_eq!(super::char_index_at_column("a界b", 3), Some(2));
+        assert_eq!(super::char_index_at_column("a界b", 4), None);
+    }
+
+    #[test]
+    fn char_index_at_column_handles_joined_emoji() {
+        assert_eq!(super::char_index_at_column("👩‍💻x", 0), Some(0));
+        assert_eq!(super::char_index_at_column("👩‍💻x", 1), Some(0));
+        assert_eq!(super::char_index_at_column("👩‍💻x", 2), Some(3));
     }
 }

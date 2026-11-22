@@ -6,7 +6,9 @@
 //! No XML schema validation happens here.
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::package::{Diagnostic, PackageIndex, PartKind, TargetMode, relationship_source};
+use crate::package::{
+    Diagnostic, OFFICE_DOCUMENT_REL_TYPES, PackageIndex, PartKind, TargetMode, relationship_source,
+};
 
 const CONTENT_TYPES_PART: &str = "/[Content_Types].xml";
 const ROOT_RELS_PART: &str = "/_rels/.rels";
@@ -14,14 +16,14 @@ const ROOT_RELS_PART: &str = "/_rels/.rels";
 /// Every structural problem found in a loaded package, in a stable order.
 pub fn check(index: &PackageIndex) -> Vec<Diagnostic> {
     let mut issues = Vec::new();
-    if !index.parts.contains_key(CONTENT_TYPES_PART) {
+    if index.find_part(CONTENT_TYPES_PART).is_none() {
         issues.push(Diagnostic::error(
             "integrity",
             None,
             format!("package is missing {CONTENT_TYPES_PART}"),
         ));
     }
-    let has_root_rels = index.parts.contains_key(ROOT_RELS_PART);
+    let has_root_rels = index.find_part(ROOT_RELS_PART).is_some();
     if !has_root_rels {
         issues.push(Diagnostic::error(
             "integrity",
@@ -45,22 +47,16 @@ pub fn check(index: &PackageIndex) -> Vec<Diagnostic> {
 }
 
 fn has_office_document(index: &PackageIndex) -> bool {
-    relationships_from(index, "/").any(|relationship| {
-        relationship.target_mode == TargetMode::Internal
-            && relationship.relationship_type.rsplit('/').next() == Some("officeDocument")
-            && relationship
-                .resolved_target
-                .as_deref()
-                .is_some_and(|target| is_part(index, target))
-    })
+    index
+        .related_part("/", &OFFICE_DOCUMENT_REL_TYPES)
+        .is_some()
 }
 
 /// A relationship target must be a packaged part. Explicit ZIP directory
 /// entries live in `parts` too, but resolving to one is still dangling.
 pub(crate) fn is_part(index: &PackageIndex, path: &str) -> bool {
     index
-        .parts
-        .get(path)
+        .find_part(path)
         .is_some_and(|part| part.kind != PartKind::Directory)
 }
 
@@ -194,11 +190,11 @@ fn owner_part(index: &PackageIndex, source: &str) -> Option<String> {
     } else {
         source.to_string()
     };
-    if is_part(index, &candidate) {
-        return Some(candidate);
+    if let Some(part) = index.find_part(&candidate) {
+        return Some(part.path.clone());
     }
     let rels = rels_part(source);
-    index.parts.contains_key(&rels).then_some(rels)
+    index.find_part(&rels).map(|part| part.path.clone())
 }
 
 fn rels_part(source: &str) -> String {
@@ -256,6 +252,36 @@ mod tests {
             .iter()
             .find(|issue| issue.message.contains(needle))
             .and_then(|issue| issue.part.clone())
+    }
+
+    #[test]
+    fn office_document_requires_a_known_relationship_type() {
+        let invalid = package(&[
+            ("[Content_Types].xml", CONTENT_TYPES),
+            (
+                "_rels/.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://example.com/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>"#,
+            ),
+            ("ppt/presentation.xml", "<p/>"),
+        ]);
+        assert!(
+            messages(&invalid).iter().any(
+                |message| message == "root relationships point to no valid officeDocument part"
+            )
+        );
+
+        let valid = package(&[
+            ("[Content_Types].xml", CONTENT_TYPES),
+            ("_rels/.rels", ROOT_RELS),
+            ("ppt/presentation.xml", "<p/>"),
+        ]);
+        assert!(
+            !messages(&valid).iter().any(
+                |message| message == "root relationships point to no valid officeDocument part"
+            )
+        );
     }
 
     #[test]

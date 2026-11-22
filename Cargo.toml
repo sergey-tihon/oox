@@ -19,6 +19,9 @@ path = "src/main.rs"
 crossterm = "0.29"
 crossterm-keybind = "0.4.3"
 dirs = "7.0"
+memchr = "2"
+unicode-segmentation = "1"
+unicode-width = "0.2"
 serde = { version = "1", features = ["derive"] }
 # `preserve_order`/`arbitrary_precision` keep an edited JSON part byte-faithful:
 # key order and number literals (`1.10`) survive the pretty-print round trip.

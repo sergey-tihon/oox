@@ -1,7 +1,7 @@
 use std::{
     error::Error,
     fs::OpenOptions,
-    io::{self, Write},
+    io::{self, Read as _, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -10,6 +10,7 @@ use clap::Parser;
 
 use app::{App, CurrentWidget, PendingExport};
 use crossterm::{
+    cursor::Show,
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -23,6 +24,7 @@ use ratatui_image::picker::Picker;
 use worker::Worker;
 
 mod app;
+mod cancel;
 mod clipboard;
 mod compare;
 mod integrity;
@@ -53,6 +55,20 @@ struct Cli {
     generate_config: bool,
 }
 
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stderr(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            Show
+        );
+        previous(info);
+    }));
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     if cli.generate_config {
@@ -77,6 +93,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let stderr = io::stderr();
     let backend = CrosstermBackend::new(stderr);
     let mut terminal = Terminal::new(backend)?;
+    install_panic_hook();
     enable_raw_mode()?;
     if let Err(error) = execute!(
         terminal.backend_mut(),
@@ -225,7 +242,12 @@ fn run_external_edit(
     // A stale `$VISUAL`/`$EDITOR` must not take the session down with it, so the
     // failure is reported the same way the external viewer reports it.
     match with_terminal_suspended(terminal, || run_external(&editor, &path)) {
-        Ok(status) => match std::fs::read(&path) {
+        Ok(status) => match std::fs::File::open(&path).and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(crate::package::MAX_ENTRY_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }) {
             Ok(bytes) => app.apply_external_edit(&pending.written, &bytes, status.success()),
             Err(error) => {
                 app.status_message = Some(format!("Could not read the edited part: {error}"));
@@ -495,6 +517,11 @@ fn ensure_emacs_insert_mode(state: &mut EditorState, editor_mode: keybindings::E
     }
 }
 
+fn is_noop_event(event: &Event) -> bool {
+    matches!(event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved)
+        || matches!(event, Event::Key(key) if key.kind == event::KeyEventKind::Release)
+}
+
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
     app: &mut App,
@@ -509,9 +536,9 @@ fn run_app(
         if app.poll_worker() {
             redraw = true;
         }
-        ensure_emacs_insert_mode(&mut app.editor_state, editor_mode);
+        ensure_emacs_insert_mode(&mut app.editor.state, editor_mode);
         // The requested part has to be on screen before the editor can take over.
-        if !app.save_active && !app.is_saving() && app.external_edit_ready() {
+        if !app.save.active && !app.is_saving() && app.external_edit_ready() {
             redraw = true;
             run_external_edit(terminal, app)?;
         }
@@ -528,8 +555,11 @@ fn run_app(
             continue;
         }
         let event = event::read()?;
-        redraw = true;
         debug_log(format!("event={event:?}"));
+        if is_noop_event(&event) {
+            continue;
+        }
+        redraw = true;
 
         // A save in flight owns `previewed_path` and the buffers: navigation
         // would move the edit into `edits` and make the reload reselect the
@@ -542,9 +572,7 @@ fn run_app(
         if let Event::Mouse(mouse) = &event {
             // Any-motion tracking fires while the pointer merely moves; that is
             // not the user answering a confirmation, so only real gestures disarm.
-            if !matches!(mouse.kind, MouseEventKind::Moved) {
-                app.disarm_confirmation();
-            }
+            app.disarm_confirmation();
             if app.show_help {
                 continue;
             }
@@ -588,7 +616,7 @@ fn run_app(
                                 mouse.column,
                                 mouse.row,
                             );
-                    editor_handler.on_event(event, &mut app.editor_state);
+                    editor_handler.on_event(event, &mut app.editor.state);
                     // Mouse handling changes cursor/viewport/selection, not text.
                     vim_operator_pending = false;
                     if follows_reference {
@@ -605,17 +633,17 @@ fn run_app(
                 app.current_widget = CurrentWidget::Tree;
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
-                        app.tree_state.scroll_up(3);
+                        app.tree.state.scroll_up(3);
                     }
                     MouseEventKind::ScrollDown => {
-                        app.tree_state.scroll_down(3);
+                        app.tree.state.scroll_down(3);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         let position = Position {
                             x: mouse.column,
                             y: mouse.row,
                         };
-                        if app.tree_state.click_at(position) {
+                        if app.tree.state.click_at(position) {
                             app.load_selected_file_content()?;
                         }
                     }
@@ -626,30 +654,24 @@ fn run_app(
         }
 
         let dispatched_actions = match &event {
-            Event::Key(key) if key.kind != event::KeyEventKind::Release => {
-                Some(Action::dispatch(key))
-            }
+            Event::Key(key) => Some(Action::dispatch(key)),
             _ => None,
         };
         if let Event::Key(key) = &event {
-            if key.kind == event::KeyEventKind::Release {
-                continue;
-            }
-
             let actions = dispatched_actions.as_deref().unwrap_or(&[]);
             // Only preserve a confirmation for an action that can actually
             // answer it here. In Emacs, plain `q` is text; only `QuitEditor`
             // can confirm quit. Revert is valid only from Tree/Details.
             let modal_active = app.show_help
-                || app.search_active
-                || app.content_search_active
-                || app.export_active
-                || app.save_active;
+                || app.search.active
+                || app.content_search.active
+                || app.export.active
+                || app.save.active;
             let can_quit = !modal_active
                 && can_quit_from(
                     app.current_widget,
                     editor_mode,
-                    app.editor_state.mode,
+                    app.editor.state.mode,
                     actions,
                 );
             let can_revert = !modal_active
@@ -665,9 +687,9 @@ fn run_app(
                 key.code,
                 key.modifiers,
                 app.current_widget,
-                app.editor_state.mode,
+                app.editor.state.mode,
                 app.show_help,
-                app.search_active,
+                app.search.active,
             ));
 
             if app.show_help {
@@ -678,14 +700,14 @@ fn run_app(
                 continue;
             }
 
-            if app.content_search_active && app.current_widget == CurrentWidget::Tree {
+            if app.content_search.active && app.current_widget == CurrentWidget::Tree {
                 if actions.contains(&Action::Cancel) {
                     debug_log("canceling content search");
                     app.cancel_content_search();
                 } else if actions.contains(&Action::Confirm) {
                     debug_log(format!(
                         "finishing content search query={:?}",
-                        app.content_search_query
+                        app.content_search.query
                     ));
                     app.finish_content_search();
                 } else if actions.contains(&Action::Backspace) {
@@ -703,12 +725,12 @@ fn run_app(
                 continue;
             }
 
-            if app.search_active && app.current_widget == CurrentWidget::Tree {
+            if app.search.active && app.current_widget == CurrentWidget::Tree {
                 if actions.contains(&Action::Cancel) {
                     debug_log("canceling search");
                     app.cancel_search();
                 } else if actions.contains(&Action::Confirm) {
-                    debug_log(format!("finishing search query={:?}", app.search_query));
+                    debug_log(format!("finishing search query={:?}", app.search.query));
                     app.finish_search();
                 } else if actions.contains(&Action::Backspace) {
                     app.search_backspace();
@@ -725,12 +747,12 @@ fn run_app(
                 continue;
             }
 
-            if app.export_active {
+            if app.export.active {
                 if actions.contains(&Action::Cancel) {
                     debug_log("canceling extract");
                     app.cancel_extract();
                 } else if actions.contains(&Action::Confirm) {
-                    debug_log(format!("confirming extract path={:?}", app.export_query));
+                    debug_log(format!("confirming extract path={:?}", app.export.query));
                     app.confirm_extract()?;
                 } else if actions.contains(&Action::Backspace) {
                     app.export_backspace();
@@ -742,11 +764,11 @@ fn run_app(
                 continue;
             }
 
-            if app.save_active {
+            if app.save.active {
                 if actions.contains(&Action::Cancel) {
                     app.cancel_save();
                 } else if actions.contains(&Action::Confirm) {
-                    debug_log(format!("confirming save path={:?}", app.save_query));
+                    debug_log(format!("confirming save path={:?}", app.save.query));
                     app.confirm_save()?;
                 } else if actions.contains(&Action::Backspace) {
                     app.save_backspace();
@@ -817,7 +839,7 @@ fn run_app(
                 CurrentWidget::Tree | CurrentWidget::Details => true,
                 CurrentWidget::TextArea => {
                     editor_mode == keybindings::EditorMode::Vim
-                        && app.editor_state.mode == EdtuiMode::Normal
+                        && app.editor.state.mode == EdtuiMode::Normal
                 }
             };
             if can_focus_panel && actions.contains(&Action::FocusTree) {
@@ -825,7 +847,7 @@ fn run_app(
                 continue;
             }
             if can_focus_panel && actions.contains(&Action::FocusDetails) {
-                app.details_visible = true;
+                app.details.visible = true;
                 app.current_widget = CurrentWidget::Details;
                 continue;
             }
@@ -848,7 +870,7 @@ fn run_app(
             let can_show_help = match app.current_widget {
                 CurrentWidget::Tree | CurrentWidget::Details => true,
                 CurrentWidget::TextArea => match editor_mode {
-                    keybindings::EditorMode::Vim => app.editor_state.mode == EdtuiMode::Normal,
+                    keybindings::EditorMode::Vim => app.editor.state.mode == EdtuiMode::Normal,
                     // Emacs mode is modeless: character keys insert text, so only
                     // function keys (e.g. F1) can open help from the editor.
                     keybindings::EditorMode::Emacs => matches!(key.code, KeyCode::F(_)),
@@ -875,12 +897,12 @@ fn run_app(
                 CurrentWidget::Tree | CurrentWidget::Details => true,
                 CurrentWidget::TextArea => {
                     editor_mode == keybindings::EditorMode::Emacs
-                        || app.editor_state.mode == EdtuiMode::Normal
+                        || app.editor.state.mode == EdtuiMode::Normal
                 }
             };
             if actions.contains(&Action::ToggleFocus) && can_switch {
                 let backwards = key.code == KeyCode::BackTab;
-                app.current_widget = next_focus(app.current_widget, app.details_visible, backwards);
+                app.current_widget = next_focus(app.current_widget, app.details.visible, backwards);
                 continue;
             }
         }
@@ -894,25 +916,25 @@ fn run_app(
                 if let Event::Key(_key) = &event {
                     let actions = dispatched_actions.as_deref().unwrap_or(&[]);
                     if actions.contains(&Action::MoveDown) {
-                        app.tree_state.key_down();
+                        app.tree.state.key_down();
                     } else if actions.contains(&Action::MoveUp) {
-                        app.tree_state.key_up();
+                        app.tree.state.key_up();
                     } else if actions.contains(&Action::PageDown) {
-                        app.tree_state.scroll_down(10);
+                        app.tree.state.scroll_down(10);
                     } else if actions.contains(&Action::PageUp) {
-                        app.tree_state.scroll_up(10);
+                        app.tree.state.scroll_up(10);
                     } else if actions.contains(&Action::First) {
-                        app.tree_state.select_first();
+                        app.tree.state.select_first();
                     } else if actions.contains(&Action::Last) {
-                        app.tree_state.select_last();
+                        app.tree.state.select_last();
                     } else if actions.contains(&Action::ToggleUnchangedParts) {
                         app.toggle_unchanged_parts()?;
                     } else if actions.contains(&Action::ExpandAll) {
                         app.expand_all();
                     } else if actions.contains(&Action::ToggleSelected) {
-                        app.tree_state.toggle_selected();
+                        app.tree.state.toggle_selected();
                     } else if actions.contains(&Action::OpenContent) {
-                        app.tree_state.toggle_selected();
+                        app.tree.state.toggle_selected();
                         app.load_selected_file_content()?;
                     } else if actions.contains(&Action::ShowMetadata) {
                         app.toggle_details();
@@ -947,7 +969,7 @@ fn run_app(
                     } else if actions.contains(&Action::RevertPart) {
                         app.request_revert();
                     } else if actions.contains(&Action::Cancel)
-                        && (!app.search_query.is_empty() || app.has_content_search_query())
+                        && (!app.search.query.is_empty() || app.has_content_search_query())
                     {
                         // Esc with an applied (but inactive) search clears the filter
                         // and restores the pre-search tree state.
@@ -972,7 +994,7 @@ fn run_app(
                         app.activate_current_detail_link()?;
                     } else if actions.contains(&Action::ShowMetadata) {
                         app.toggle_details();
-                        if !app.details_visible {
+                        if !app.details.visible {
                             app.current_widget = CurrentWidget::Tree;
                         }
                     } else if actions.contains(&Action::NextIssue) {
@@ -997,7 +1019,7 @@ fn run_app(
                             key.code,
                             key.modifiers,
                             editor_mode,
-                            app.editor_state.mode,
+                            app.editor.state.mode,
                             vim_operator_pending,
                         );
                         vim_operator_pending = pending;
@@ -1012,7 +1034,7 @@ fn run_app(
                         (false, false)
                     }
                 };
-                editor_handler.on_event(event, &mut app.editor_state);
+                editor_handler.on_event(event, &mut app.editor.state);
                 app.refresh_editor_dirty_after_input(may_change_content, may_restore_baseline);
             }
         }
@@ -1023,15 +1045,45 @@ fn run_app(
 mod tests {
     use super::{
         Cli, MAX_CLIPBOARD_BYTES, base64_encode, can_quit_from, editor_key_dirty_policy,
-        ensure_emacs_insert_mode, osc52_sequence,
+        ensure_emacs_insert_mode, is_noop_event, osc52_sequence,
     };
     use crate::{
         app::CurrentWidget,
         keybindings::{Action, EditorMode},
     };
     use clap::Parser;
-    use crossterm_keybind::event::{KeyCode, KeyModifiers};
+    use crossterm_keybind::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
     use edtui::EditorMode as EdtuiMode;
+
+    #[test]
+    fn motion_and_release_events_are_noops() {
+        let moved = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        let released = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        let clicked = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        let pressed = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        assert!(is_noop_event(&moved));
+        assert!(is_noop_event(&released));
+        assert!(!is_noop_event(&clicked));
+        assert!(!is_noop_event(&pressed));
+    }
 
     #[test]
     fn config_generation_does_not_require_a_document() {

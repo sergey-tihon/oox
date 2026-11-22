@@ -4,48 +4,37 @@ use std::io::{self, Read};
 use quick_xml::{Reader, events::Event};
 
 use super::{
-    DetailsView, MAX_SUMMARY_ITEMS, MAX_SUMMARY_TEXT_CHARS, append_decoded_reference,
-    append_decoded_text, clean_summary_text, element_is, push_summary_line, read_part,
-    relationship_count, validate_xml_bytes,
+    DetailsView, MAX_SUMMARY_ITEMS, SummaryBuilder, SummaryText, clean_summary_text, element_is,
+    read_part, relationship_count, validate_xml_bytes,
 };
 use crate::package::{PackageIndex, xml_attribute};
 
 pub(super) fn build_word_summary<R: Read + io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     index: &PackageIndex,
+    main: &str,
 ) -> io::Result<DetailsView> {
-    let document = read_part(archive, index, "/word/document.xml")?;
-    validate_xml_bytes(&document, "/word/document.xml")?;
+    let document = read_part(archive, index, main)?;
+    validate_xml_bytes(&document, main)?;
     let (paragraph_count, table_count, headings) = parse_word_document(&document);
-    let image_count = relationship_count(index, "/word/document.xml", "/image");
-    let mut summary = DetailsView {
-        text: String::new(),
-        links: Vec::new(),
-    };
-    push_summary_line(&mut summary, "Word summary", None);
-    push_summary_line(&mut summary, "", None);
-    push_summary_line(
-        &mut summary,
-        "Document: /word/document.xml",
-        Some("/word/document.xml"),
-    );
-    push_summary_line(&mut summary, format!("Paragraphs: {paragraph_count}"), None);
-    push_summary_line(&mut summary, format!("Tables: {table_count}"), None);
-    push_summary_line(&mut summary, format!("Images: {image_count}"), None);
-    push_summary_line(&mut summary, "", None);
-    push_summary_line(&mut summary, "Heading outline", None);
+    let image_count = relationship_count(index, main, "/image");
+    let mut summary = SummaryBuilder::new();
+    summary.push_line("Word summary", None);
+    summary.push_line("", None);
+    summary.push_line(format!("Document: {main}"), Some(main));
+    summary.push_line(format!("Paragraphs: {paragraph_count}"), None);
+    summary.push_line(format!("Tables: {table_count}"), None);
+    summary.push_line(format!("Images: {image_count}"), None);
+    summary.push_line("", None);
+    summary.push_line("Heading outline", None);
     if headings.is_empty() {
-        push_summary_line(&mut summary, "  (none)", None);
+        summary.push_line("  (none)", None);
     } else {
         for (level, heading) in headings {
-            push_summary_line(
-                &mut summary,
-                format!("  {}{}", "  ".repeat(level), heading),
-                None,
-            );
+            summary.push_line(format!("  {}{}", "  ".repeat(level), heading), None);
         }
     }
-    Ok(summary)
+    Ok(summary.finish())
 }
 
 fn parse_word_document(xml: &[u8]) -> (usize, usize, Vec<(usize, String)>) {
@@ -55,7 +44,7 @@ fn parse_word_document(xml: &[u8]) -> (usize, usize, Vec<(usize, String)>) {
     let mut table_count = 0;
     let mut headings = Vec::new();
     let mut in_paragraph = false;
-    let mut paragraph_text = String::new();
+    let mut paragraph_text = SummaryText::new();
     let mut paragraph_style = None;
     let mut text_element = false;
 
@@ -84,11 +73,9 @@ fn parse_word_document(xml: &[u8]) -> (usize, usize, Vec<(usize, String)>) {
                     table_count += 1;
                 }
             }
-            Ok(Event::Text(event)) if text_element => {
-                append_decoded_text(&mut paragraph_text, &event, MAX_SUMMARY_TEXT_CHARS);
-            }
+            Ok(Event::Text(event)) if text_element => paragraph_text.push_text(&event),
             Ok(Event::GeneralRef(event)) if text_element => {
-                append_decoded_reference(&mut paragraph_text, &event, MAX_SUMMARY_TEXT_CHARS);
+                paragraph_text.push_reference(&event);
             }
             Ok(Event::End(event)) => {
                 let name = event.name();
@@ -100,7 +87,7 @@ fn parse_word_document(xml: &[u8]) -> (usize, usize, Vec<(usize, String)>) {
                             .strip_prefix("Heading")
                             .and_then(|value| value.parse::<usize>().ok())
                     {
-                        let heading = clean_summary_text(&paragraph_text);
+                        let heading = clean_summary_text(paragraph_text.as_str());
                         if !heading.is_empty() && headings.len() < MAX_SUMMARY_ITEMS {
                             headings.push((level, heading));
                         }
