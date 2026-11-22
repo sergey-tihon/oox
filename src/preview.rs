@@ -299,7 +299,11 @@ fn verbatim_elements(xml: &str) -> io::Result<Vec<bool>> {
                 let preserve = start
                     .try_get_attribute("xml:space")
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-                    .is_some_and(|attribute| attribute.value.as_ref() == "preserve");
+                    .is_some_and(|attribute| {
+                        attribute
+                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                            .is_ok_and(|value| value == "preserve")
+                    });
                 let ordinal = flags.len();
                 flags.push(preserve);
                 stack.push(ordinal);
@@ -590,6 +594,12 @@ mod tests {
         assert!(
             formatted.contains(r#"<t xml:space="preserve"><x/><y/></t>"#),
             "{formatted}"
+        );
+        let escaped =
+            pretty_print_xml(r#"<r><t xml:space="pres&#x65;rve"><x/><y/></t></r>"#).unwrap();
+        assert!(
+            escaped.contains(r#"<t xml:space="pres&#x65;rve"><x/><y/></t>"#),
+            "{escaped}"
         );
     }
 
