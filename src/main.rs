@@ -23,6 +23,7 @@ use ratatui_image::picker::Picker;
 use worker::Worker;
 
 mod app;
+mod clipboard;
 mod compare;
 mod integrity;
 mod keybindings;

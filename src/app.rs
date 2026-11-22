@@ -149,6 +149,8 @@ pub struct App {
     /// Open/closed tree state from before the filter, restored when it clears.
     opened_before_search: Option<Vec<Vec<String>>>,
     pub editor_state: EditorState,
+    /// Clipboard shared by every editor buffer (and the OS clipboard).
+    clipboard: edtui::clipboard::Clipboard,
     /// The text the part had when it was loaded: an edited buffer differs from
     /// it. `None` while the pane shows something other than an editable preview.
     editor_baseline: Option<Lines>,
@@ -637,6 +639,10 @@ impl App {
         picker: Picker,
         worker: Worker,
     ) -> io::Result<Self> {
+        let clipboard = crate::clipboard::shared();
+        let mut editor_state = EditorState::default();
+        editor_state.set_clipboard(clipboard.clone());
+
         let app = Self {
             file_path: path.clone(),
             compare_path: compare_path.clone(),
@@ -644,7 +650,8 @@ impl App {
             tree_items: Vec::new(),
             filtered_tree_items: None,
             opened_before_search: None,
-            editor_state: EditorState::default(),
+            editor_state,
+            clipboard,
             editor_baseline: None,
             editor_editable: false,
             editor_dirty: false,
@@ -720,6 +727,13 @@ impl App {
             },
         })?;
         Ok(app)
+    }
+
+    /// A fresh editor buffer wired to the shared clipboard.
+    fn new_editor_state(&self, lines: Lines) -> EditorState {
+        let mut state = EditorState::new(lines);
+        state.set_clipboard(self.clipboard.clone());
+        state
     }
 
     /// The package index of the loaded package, or a shared empty index while loading.
@@ -827,7 +841,7 @@ impl App {
                         }) => {
                             self.preview_kind = kind;
                             let lines = Lines::from(text.as_str());
-                            self.editor_state = EditorState::new(lines.clone());
+                            self.editor_state = self.new_editor_state(lines.clone());
                             if let Some(reselect) = restore
                                 && reselect.path == selected_path
                             {
@@ -982,7 +996,7 @@ impl App {
         self.hide_unchanged_parts = compare.is_some();
         self.compare = compare;
         self.details_generation = self.details_generation.wrapping_add(1);
-        self.editor_state = EditorState::default();
+        self.editor_state = self.new_editor_state(Lines::default());
         self.editor_baseline = None;
         self.editor_editable = false;
         self.editor_dirty = false;
@@ -1070,7 +1084,7 @@ impl App {
         // The buffer is set aside rather than discarded, so an unsaved edit
         // survives a detour through the summary view.
         self.stash_current_edit();
-        self.editor_state = EditorState::default();
+        self.editor_state = self.new_editor_state(Lines::default());
         self.editor_baseline = None;
         self.editor_editable = false;
         self.preview_kind = PreviewKind::Summary;
@@ -1947,7 +1961,7 @@ impl App {
         // previously selected XML file or image from remaining visible when a
         // directory or unsupported package part is selected.
         self.image_state = None;
-        self.editor_state = EditorState::default();
+        self.editor_state = self.new_editor_state(Lines::default());
         self.editor_baseline = None;
         self.editor_editable = false;
         self.editor_dirty = false;
@@ -2241,10 +2255,12 @@ impl App {
             }
             return;
         }
+        let blank = self.new_editor_state(Lines::default());
+        let state = std::mem::replace(&mut self.editor_state, blank);
         self.edits.insert(
             path,
             EditedPart {
-                state: std::mem::take(&mut self.editor_state),
+                state,
                 baseline,
                 kind: self.preview_kind,
             },
@@ -2615,7 +2631,7 @@ impl App {
             Ok(None) => self.status_message = Some("No changes from the external editor".into()),
             Ok(Some(text)) => {
                 let spot = CursorSpot::of(&self.editor_state);
-                self.editor_state = EditorState::new(Lines::from(text.as_str()));
+                self.editor_state = self.new_editor_state(Lines::from(text.as_str()));
                 place_cursor(&mut self.editor_state, spot);
                 self.refresh_editor_dirty();
                 self.status_message = Some(format!(
@@ -2662,7 +2678,7 @@ impl App {
         if on_screen {
             if let Some(baseline) = self.editor_baseline.as_ref() {
                 let spot = CursorSpot::of(&self.editor_state);
-                self.editor_state = EditorState::new(baseline.clone());
+                self.editor_state = self.new_editor_state(baseline.clone());
                 place_cursor(&mut self.editor_state, spot);
             }
             self.editor_dirty = false;
@@ -3085,6 +3101,43 @@ mod tests {
 
     fn preview_loaded(app: &mut App) {
         pump_until(app, |app| !app.preview_pending);
+    }
+
+    #[test]
+    fn yank_survives_switching_parts() -> io::Result<()> {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let key =
+            |character| Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        let second_row = |app: &App| {
+            lines_to_text(&app.editor_state.lines)
+                .lines()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let mut app = test_app("data/sample.pptx")?;
+        let mut handler = edtui::EditorEventHandler::vim_mode();
+
+        app.tree_state
+            .select(vec!["/[Content_Types].xml".to_string()]);
+        app.load_selected_file_content()?;
+        preview_loaded(&mut app);
+        handler.on_event(key('j'), &mut app.editor_state);
+        let yanked = second_row(&app);
+        assert!(!yanked.is_empty());
+        handler.on_event(key('y'), &mut app.editor_state);
+        handler.on_event(key('y'), &mut app.editor_state);
+
+        app.tree_state
+            .select(vec!["/ppt/presentation.xml".to_string()]);
+        app.load_selected_file_content()?;
+        preview_loaded(&mut app);
+        assert_ne!(second_row(&app), yanked);
+        handler.on_event(key('p'), &mut app.editor_state);
+        let text = lines_to_text(&app.editor_state.lines);
+        assert_eq!(text.lines().nth(1), Some(yanked.as_str()));
+        Ok(())
     }
 
     #[test]
