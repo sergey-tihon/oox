@@ -546,6 +546,17 @@ impl Worker {
         }
     }
 
+    /// Cancel an in-flight content search and discard any queued searches.
+    pub fn cancel_search(&self) {
+        let generation = &self.generations[JobClass::Search.slot()];
+        let Ok(mut queue) = self.queue.lock() else {
+            generation.fetch_add(1, Ordering::AcqRel);
+            return;
+        };
+        generation.fetch_add(1, Ordering::AcqRel);
+        queue.retain(|pending| pending.job.class() != Some(JobClass::Search));
+    }
+
     pub fn try_recv(&self) -> io::Result<Option<ResultMessage>> {
         match self.receiver.try_recv() {
             Ok(message) => Ok(Some(message)),
@@ -1038,6 +1049,44 @@ mod tests {
             query: "needle".to_string(),
             index: Arc::clone(&package.index),
         }
+    }
+
+    #[test]
+    fn cancel_search_invalidates_running_and_removes_queued_searches() {
+        let generation = Arc::new(AtomicU64::new(7));
+        let running_search = Cancel::new(Arc::clone(&generation), 7);
+        let queue = Arc::new(std::sync::Mutex::new(VecDeque::from([
+            queued(search_job(1)),
+            queued(export_job(2, ExportMode::Clipboard)),
+        ])));
+        let generations = std::array::from_fn(|slot| {
+            if slot == super::JobClass::Search.slot() {
+                Arc::clone(&generation)
+            } else {
+                Arc::new(AtomicU64::new(0))
+            }
+        });
+        let (wake, _wake_receiver) = std::sync::mpsc::sync_channel(1);
+        let (_result_sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = Worker {
+            queue: Arc::clone(&queue),
+            generations,
+            wake: Some(wake),
+            receiver,
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            thread: None,
+        };
+
+        worker.cancel_search();
+
+        assert!(running_search.is_cancelled());
+        let queue = queue.lock().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert!(matches!(
+            queue.front().map(|queued| &queued.job),
+            Some(Job::ExportPart { .. })
+        ));
     }
 
     fn preview_job(request_id: u64) -> Job {

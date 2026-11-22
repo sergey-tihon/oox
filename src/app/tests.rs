@@ -1002,6 +1002,24 @@ fn tree_builder_merges_directory_entries_with_their_children() -> io::Result<()>
     Ok(())
 }
 
+#[test]
+fn tree_paths_sort_by_components_before_grouping() -> io::Result<()> {
+    let mut paths = ["a/", "a.xml", "a/b.xml"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    super::tree::sort_tree_paths(&mut paths);
+    assert_eq!(paths, ["a/", "a/b.xml", "a.xml"]);
+
+    let items = create_tree(&paths, &Default::default())?;
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].identifier(), "/a");
+    assert_eq!(items[0].children().len(), 2);
+    assert_eq!(items[0].children()[1].identifier(), "/a/b.xml");
+    assert_eq!(items[1].identifier(), "/a.xml");
+    Ok(())
+}
+
 fn write_zip(name: &str, entries: &[(&str, &str)]) -> io::Result<std::path::PathBuf> {
     use std::io::Write as _;
 

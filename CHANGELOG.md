@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ignore mouse motion for focus changes, clamp metadata-link navigation, and restore the terminal after panics.
 - Bound external-editor reads, tolerate unreadable content-search parts, and report successful no-clobber saves correctly.
 - Require a known OPC `officeDocument` relationship type.
+- Keep directory paths grouped in package trees, summary links aligned across embedded newlines, and cancel content searches when cleared or dismissed.
 - Discover Word, Excel, and PowerPoint summaries and Excel shared strings through OPC relationships and content types.
 - Bound central-directory checks, diff computation, and summary parsing; narrow live path filtering without lowercasing every part.
 - Reject malformed editor modes and conflicting keybindings, and hit-test metadata links using rendered scroll and terminal display cells.

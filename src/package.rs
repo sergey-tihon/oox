@@ -478,9 +478,11 @@ pub(crate) fn check_central_directory<R: Read + Seek>(reader: &mut R) -> io::Res
         const EOCD_MIN_BYTES: usize = 22;
         const MAX_COMMENT_BYTES: usize = u16::MAX as usize;
         const ZIP64_EOCD_BYTES: usize = 56;
+        const ZIP64_LOCATOR_BYTES: usize = 20;
 
         let length = reader.seek(SeekFrom::End(0))?;
-        let tail_len = length.min((EOCD_MIN_BYTES + MAX_COMMENT_BYTES) as u64) as usize;
+        let tail_len =
+            length.min((EOCD_MIN_BYTES + MAX_COMMENT_BYTES + ZIP64_LOCATOR_BYTES) as u64) as usize;
         let tail_start = length - tail_len as u64;
         let mut tail = vec![0; tail_len];
         reader.seek(SeekFrom::Start(tail_start))?;
@@ -1028,7 +1030,7 @@ mod tests {
 
     #[test]
     fn central_directory_check_rejects_zip64_entry_count() {
-        fn zip64_archive(total_entries: u64) -> std::io::Cursor<Vec<u8>> {
+        fn zip64_archive(total_entries: u64, comment_len: u16) -> std::io::Cursor<Vec<u8>> {
             let mut bytes = vec![0; 56];
             bytes[..4].copy_from_slice(b"PK\x06\x06");
             bytes[4..12].copy_from_slice(&44u64.to_le_bytes());
@@ -1046,11 +1048,12 @@ mod tests {
             bytes.extend_from_slice(&u16::MAX.to_le_bytes());
             bytes.extend_from_slice(&u32::MAX.to_le_bytes());
             bytes.extend_from_slice(&u32::MAX.to_le_bytes());
-            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&comment_len.to_le_bytes());
+            bytes.resize(bytes.len() + usize::from(comment_len), 0);
             std::io::Cursor::new(bytes)
         }
 
-        let mut oversized = zip64_archive(100_001);
+        let mut oversized = zip64_archive(100_001, 0);
         let error = check_central_directory(&mut oversized).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(
@@ -1058,8 +1061,16 @@ mod tests {
             "archive has 100001 entries; limit is 100000"
         );
 
-        let mut at_limit = zip64_archive(100_000);
+        let mut at_limit = zip64_archive(100_000, 0);
         assert!(check_central_directory(&mut at_limit).is_ok());
+
+        let mut oversized_with_full_comment = zip64_archive(100_001, u16::MAX);
+        let error = check_central_directory(&mut oversized_with_full_comment).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "archive has 100001 entries; limit is 100000"
+        );
     }
 
     #[test]

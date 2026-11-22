@@ -208,6 +208,18 @@ fn clean_summary_text(text: &str) -> String {
     compact.chars().take(MAX_SUMMARY_TEXT_CHARS).collect()
 }
 
+fn normalized_line_char_count(text: &str) -> usize {
+    let mut characters = text.chars().peekable();
+    let mut count = 0;
+    while let Some(character) = characters.next() {
+        if character == '\r' && characters.peek() == Some(&'\n') {
+            characters.next();
+        }
+        count += 1;
+    }
+    count
+}
+
 pub(super) struct SummaryBuilder {
     view: DetailsView,
     lines: usize,
@@ -231,13 +243,24 @@ impl SummaryBuilder {
         let line = line.as_ref();
         let remaining = MAX_SUMMARY_CHARS.saturating_sub(self.view.text.len() + 1);
         let mut bounded = String::new();
-        for character in line.chars() {
+        let mut characters = line.chars().peekable();
+        let mut truncated = false;
+        while let Some(mut character) = characters.next() {
+            if character == '\r' {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                character = ' ';
+            } else if character == '\n' {
+                character = ' ';
+            }
             if bounded.len() + character.len_utf8() > remaining {
+                truncated = true;
                 break;
             }
             bounded.push(character);
         }
-        if bounded.chars().count() < line.chars().count() {
+        if truncated {
             bounded.push('…');
         }
         let line_number = self.lines;
@@ -250,11 +273,11 @@ impl SummaryBuilder {
         let Some(byte_start) = line.find(target) else {
             return;
         };
-        let start = line[..byte_start].chars().count();
+        let start = normalized_line_char_count(&line[..byte_start]);
         self.view.links.push(DetailLink {
             line: line_number,
             start,
-            end: start + target.chars().count(),
+            end: start + normalized_line_char_count(target),
             target: target.to_string(),
         });
     }
@@ -318,6 +341,35 @@ mod tests {
         assert_eq!(text.chars, MAX_SUMMARY_TEXT_CHARS);
         assert_eq!(text.as_str().chars().count(), MAX_SUMMARY_TEXT_CHARS);
     }
+
+    #[test]
+    fn summary_builder_normalizes_embedded_newlines() {
+        let mut builder = SummaryBuilder::new();
+        builder.push_line("A1: first\r\nB1: second\nthird", Some("B1"));
+        builder.push_line("C1: value\nmore", Some("C1"));
+        let view = builder.finish();
+
+        assert_eq!(view.text, "A1: first B1: second third\nC1: value more\n");
+        assert_eq!(view.text.lines().count(), 2);
+        assert_eq!(
+            view.links.iter().map(|link| link.line).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        let first_line = view.text.lines().next().unwrap();
+        assert_eq!(
+            first_line
+                .chars()
+                .skip(view.links[0].start)
+                .take(2)
+                .collect::<String>(),
+            "B1"
+        );
+
+        let mut builder = SummaryBuilder::new();
+        builder.push_line("\n".repeat(MAX_SUMMARY_LINES + 1), None);
+        assert_eq!(builder.finish().text.lines().count(), 1);
+    }
+
     #[test]
     fn summary_finds_main_part_through_root_relationship() -> io::Result<()> {
         let (index, mut archive) = indexed_package(&[

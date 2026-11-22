@@ -57,7 +57,7 @@ impl App {
         if let Some(compare) = self.compare.as_ref() {
             paths.extend(compare.package.index.parts.keys());
         }
-        let paths: Vec<String> = paths
+        let mut paths: Vec<String> = paths
             .into_iter()
             .filter(|path| {
                 !self.hide_unchanged_parts
@@ -71,6 +71,7 @@ impl App {
             .filter(|path| !path.is_empty())
             .map(str::to_string)
             .collect();
+        sort_tree_paths(&mut paths);
         // Parts with an integrity issue, a comparison difference, or unsaved
         // edits are marked in the tree so they can be spotted without reading
         // the metadata panel.
@@ -174,6 +175,11 @@ impl App {
         self.tree.filtered.is_some()
     }
 }
+
+pub(super) fn sort_tree_paths(paths: &mut [String]) {
+    paths.sort_unstable_by(|left, right| left.split('/').cmp(right.split('/')));
+}
+
 /// Build tree items directly from sorted, normalized package paths (no leading
 /// slash) without an intermediate node structure.
 pub(super) fn create_tree(

@@ -172,6 +172,7 @@ impl App {
 
     pub fn cancel_content_search(&mut self) {
         self.content_search.active = false;
+        self.worker.cancel_search();
         self.content_search.request_id = self.content_search.request_id.wrapping_add(1);
         self.content_search.pending = false;
         self.content_search.query.clear();
@@ -224,6 +225,7 @@ impl App {
         self.content_search.index = None;
         self.tree.filtered = None;
         if self.content_search.query.is_empty() {
+            self.worker.cancel_search();
             return;
         }
         let Some((package_source, index)) = self
