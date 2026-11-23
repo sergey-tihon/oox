@@ -85,6 +85,28 @@ fn details_cursor_survives_selection_with_fewer_links() -> io::Result<()> {
 }
 
 #[test]
+fn activating_detail_link_clamps_a_stale_cursor() -> io::Result<()> {
+    let mut app = test_app("data/sample.pptx")?;
+    let paths = app.index().parts.keys().cloned().collect::<Vec<_>>();
+    paths
+        .into_iter()
+        .find(|path| {
+            app.tree.state.select(vec![path.clone()]);
+            let target = app
+                .details_view()
+                .links
+                .last()
+                .map(|link| link.target.clone());
+            target.is_some_and(|target| app.index().parts.contains_key(&target))
+        })
+        .expect("sample should have metadata links to indexed parts");
+
+    app.details.cursor = usize::MAX;
+    assert!(app.activate_current_detail_link()?);
+    Ok(())
+}
+
+#[test]
 fn loading_constructor_installs_worker_package_result() -> io::Result<()> {
     let worker = Worker::start()?;
     let mut app = App::new_loading(

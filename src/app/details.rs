@@ -497,12 +497,13 @@ impl App {
 
     pub fn activate_current_detail_link(&mut self) -> io::Result<bool> {
         let cursor = self.details.cursor;
-        let Some((line, start)) = self
-            .details_view()
-            .links
-            .get(cursor)
-            .map(|link| (link.line, link.start))
-        else {
+        let link = {
+            let links = &self.details_view().links;
+            links
+                .get(cursor.min(links.len().saturating_sub(1)))
+                .map(|link| (link.line, link.start))
+        };
+        let Some((line, start)) = link else {
             return Ok(false);
         };
         self.activate_detail_link(line, start)
