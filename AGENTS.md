@@ -7,13 +7,14 @@
 ## Architecture
 
 - `src/main.rs` — Entry point, terminal setup/teardown, event loop.
-- `src/app.rs` — `App` state: zip tree, tree selection, editor state, file loading, navigation history, search, cached metadata view.
+- `src/app/` — App state and feature modules: `mod.rs` (core state and loading), `tree.rs` (tree construction and filtering), `search.rs` (path/content search), `edit.rs` (editor buffers and external-editor round trip), `save.rs` (save workflow), `export.rs` (extract/copy/external open), `details.rs` (metadata and document summary), `navigation.rs` (history), and `tests.rs` (App integration tests).
 - `src/package.rs` — Canonical package model (`Package`, `PackageIndex`), bounded ZIP access, content-type/relationship parsing, the single source of truth for extension- and content-type-based part classification, and `write_edited` for rewriting a package with parts replaced.
 - `src/integrity.rs` — Phase-1 OPC package integrity checks over an indexed package (dangling targets, missing content types, orphans, duplicate relationship ids, missing required parts).
 - `src/compare.rs` — Part-level comparison of two packages; XML-normalized (attribute order/whitespace) equality and unified diffs.
 - `src/preview.rs` — Part-preview classification and formatters (XML/JSON pretty-print, hex dump, binary info), with bounded output writers; `editable` on `Preview::Editor` says whether the text can be written back, and `xml_well_formed` is the advisory check used before saving.
 - `src/summary/` — Document summary view model (`mod.rs`) and per-format parsers (`ppt.rs`, `word.rs`, `excel.rs`).
 - `src/worker.rs` — Background worker thread; owns a cached `ZipArchive` handle and receives the shared `Arc<PackageIndex>`. `Job::SavePackage` builds a validated sibling temporary package, then installs it with a no-clobber hard link for new targets or an atomic replacing rename for confirmed overwrites.
+- `src/cancel.rs` — Shared cooperative cancellation token used to stop superseded worker requests.
 - `src/keybindings.rs` — Configurable `Action` bindings, editor mode, and generated help-overlay content.
 - `src/layout.rs` — Shared layout geometry used by both rendering and mouse hit testing.
 - `src/ui.rs` — Ratatui layout and widgets (tree + metadata + content + help).
@@ -56,6 +57,6 @@ cargo run -- data/sample.pptx
 - **Add OOXML semantics** → extend `src/summary/`; consider higher-level OOXML crates before hand-rolling parsers.
 - **Add a package integrity rule** → `src/integrity.rs` (`check`), then surface it via `PackageIndex::integrity` consumers (metadata panel, tree marker).
 - **Switch XML engine** → `pretty_print_xml` in `src/preview.rs` is the only XML formatting site.
-- **Change the edit/save flow** → `App` holds unsaved buffers (`edits`, `editor_baseline`, `editor_dirty`) and collects them in `collect_edits`; the write itself is `package::write_edited` driven by `worker::save_package`; the external-editor round trip is `run_external_edit` in `src/main.rs` plus `pick_up_external` in `src/app.rs`.
+- **Change the edit/save flow** → `App.editor` holds unsaved buffers (`edits`, `baseline`, `dirty`); `collect_edits` lives in `src/app/save.rs`; `pick_up_external` lives in `src/app/edit.rs`. The write remains `package::write_edited` driven by `worker::save_package`; the external-editor round trip remains `run_external_edit` in `src/main.rs`.
 - **Change image support** → update `is_image_name`/`image_format` in `src/package.rs` and the `image` features in `Cargo.toml` together.
 - **Release** → bump `version` in `Cargo.toml`, rename the top `CHANGELOG.md` heading to `## [X.Y.Z] - YYYY-MM-DD` and add its compare link at the bottom, keep `rust-version` and the `msrv` job in `.github/workflows/ci.yml` in sync; pushing tag `vX.Y.Z` runs `.github/workflows/publish.yml`.

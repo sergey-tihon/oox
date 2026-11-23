@@ -4,97 +4,70 @@ use std::io::{self, Read};
 use quick_xml::{Reader, events::Event};
 
 use super::{
-    DetailsView, MAX_SHARED_STRINGS, MAX_SUMMARY_ITEMS, MAX_SUMMARY_TEXT_CHARS,
-    append_decoded_reference, append_decoded_text, element_is, push_summary_line, read_part,
-    relationship_target_for_id, validate_xml_bytes,
+    DetailsView, MAX_SHARED_STRINGS, MAX_SUMMARY_ITEMS, SummaryBuilder, SummaryText, element_is,
+    read_part, relationship_target_for_id, validate_xml_bytes,
 };
-use crate::package::{PackageIndex, xml_attribute};
-
+use crate::cancel::Cancel;
+use crate::package::{PackageIndex, SHARED_STRINGS_REL_TYPES, xml_attribute};
 pub(super) fn build_excel_summary<R: Read + io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     index: &PackageIndex,
+    main: &str,
+    cancel: &Cancel,
 ) -> io::Result<DetailsView> {
-    let workbook = read_part(archive, index, "/xl/workbook.xml")?;
-    validate_xml_bytes(&workbook, "/xl/workbook.xml")?;
+    let workbook = read_part(archive, index, main)?;
+    validate_xml_bytes(&workbook, main)?;
     let sheets = parse_excel_workbook(&workbook);
-    let shared_strings = index
-        .parts
-        .contains_key("/xl/sharedStrings.xml")
-        .then(|| read_part(archive, index, "/xl/sharedStrings.xml"))
-        .transpose()?
-        .map(|bytes| {
-            validate_xml_bytes(&bytes, "/xl/sharedStrings.xml")?;
-            Ok::<Vec<String>, io::Error>(parse_shared_strings(&bytes))
-        })
-        .transpose()?;
-    let shared_strings = shared_strings.unwrap_or_default();
-
-    let mut summary = DetailsView {
-        text: String::new(),
-        links: Vec::new(),
+    let shared_strings = match index.related_part(main, &SHARED_STRINGS_REL_TYPES) {
+        Some(part) => {
+            let bytes = read_part(archive, index, &part.path)?;
+            validate_xml_bytes(&bytes, &part.path)?;
+            parse_shared_strings(&bytes)
+        }
+        None => Vec::new(),
     };
-    push_summary_line(&mut summary, "Excel summary", None);
-    push_summary_line(&mut summary, "", None);
-    push_summary_line(
-        &mut summary,
-        "Workbook: /xl/workbook.xml",
-        Some("/xl/workbook.xml"),
-    );
-    push_summary_line(&mut summary, format!("Sheets: {}", sheets.len()), None);
+
+    let mut summary = SummaryBuilder::new();
+    summary.push_line("Excel summary", None);
+    summary.push_line("", None);
+    summary.push_line(format!("Workbook: {main}"), Some(main));
+    summary.push_line(format!("Sheets: {}", sheets.len()), None);
     for (name, relationship_id) in sheets {
-        push_summary_line(&mut summary, "", None);
-        push_summary_line(&mut summary, format!("- {name}"), None);
-        let Some(path) = relationship_target_for_id(index, "/xl/workbook.xml", &relationship_id)
-        else {
-            push_summary_line(&mut summary, "  Worksheet part: unavailable", None);
+        cancel.check()?;
+        summary.push_line("", None);
+        summary.push_line(format!("- {name}"), None);
+        let Some(path) = relationship_target_for_id(index, main, &relationship_id) else {
+            summary.push_line("  Worksheet part: unavailable", None);
             continue;
         };
         let worksheet = read_part(archive, index, &path)?;
         validate_xml_bytes(&worksheet, &path)?;
         let sheet_summary = parse_excel_worksheet(&worksheet, &shared_strings);
-        push_summary_line(&mut summary, format!("  Worksheet: {path}"), Some(&path));
-        push_summary_line(
-            &mut summary,
+        summary.push_line(format!("  Worksheet: {path}"), Some(&path));
+        summary.push_line(
             format!(
                 "  Range: {}",
                 sheet_summary.range.as_deref().unwrap_or("unknown")
             ),
             None,
         );
-        push_summary_line(
-            &mut summary,
-            format!("  Cells: {}", sheet_summary.cells.len()),
-            None,
-        );
-        push_summary_line(
-            &mut summary,
-            format!("  Formulas: {}", sheet_summary.formula_count),
-            None,
-        );
+        summary.push_line(format!("  Cells: {}", sheet_summary.cells.len()), None);
+        summary.push_line(format!("  Formulas: {}", sheet_summary.formula_count), None);
         for cell in sheet_summary.cells.iter().take(20) {
             if let Some(formula) = cell.formula.as_deref() {
-                push_summary_line(
-                    &mut summary,
-                    format!("  {} = {formula}", cell.reference),
-                    None,
-                );
+                summary.push_line(format!("  {} = {formula}", cell.reference), None);
             } else if !cell.value.is_empty() {
-                push_summary_line(
-                    &mut summary,
-                    format!("  {} = {}", cell.reference, cell.value),
-                    None,
-                );
+                summary.push_line(format!("  {} = {}", cell.reference, cell.value), None);
             }
         }
         if sheet_summary.cells.len() > 20 {
-            push_summary_line(
-                &mut summary,
+            summary.push_line(
                 format!("  ... {} more cells", sheet_summary.cells.len() - 20),
                 None,
             );
         }
     }
-    Ok(summary)
+    Ok(summary.finish())
 }
 
 fn parse_excel_workbook(xml: &[u8]) -> Vec<(String, String)> {
@@ -129,7 +102,7 @@ fn parse_shared_strings(xml: &[u8]) -> Vec<String> {
     let mut reader = Reader::from_reader(xml);
     let mut buffer = Vec::new();
     let mut values = Vec::new();
-    let mut current = String::new();
+    let mut current = SummaryText::new();
     let mut in_string = false;
     let mut in_text = false;
 
@@ -143,18 +116,14 @@ fn parse_shared_strings(xml: &[u8]) -> Vec<String> {
                     in_text = true;
                 }
             }
-            Ok(Event::Text(event)) if in_text => {
-                append_decoded_text(&mut current, &event, MAX_SUMMARY_TEXT_CHARS);
-            }
-            Ok(Event::GeneralRef(event)) if in_text => {
-                append_decoded_reference(&mut current, &event, MAX_SUMMARY_TEXT_CHARS);
-            }
+            Ok(Event::Text(event)) if in_text => current.push_text(&event),
+            Ok(Event::GeneralRef(event)) if in_text => current.push_reference(&event),
             Ok(Event::End(event)) => {
                 if element_is(event.name().as_ref(), b"t") {
                     in_text = false;
                 } else if element_is(event.name().as_ref(), b"si") {
                     if values.len() < MAX_SHARED_STRINGS {
-                        values.push(current.clone());
+                        values.push(current.as_str().to_string());
                     }
                     in_string = false;
                 }
@@ -195,6 +164,8 @@ fn parse_excel_worksheet(xml: &[u8], shared_strings: &[String]) -> ExcelWorkshee
     let mut buffer = Vec::new();
     let mut summary = ExcelWorksheetSummary::default();
     let mut current_cell = None;
+    let mut value = SummaryText::new();
+    let mut formula: Option<SummaryText> = None;
     let mut active_field = None;
 
     loop {
@@ -204,6 +175,8 @@ fn parse_excel_worksheet(xml: &[u8], shared_strings: &[String]) -> ExcelWorkshee
                 if element_is(name.as_ref(), b"dimension") {
                     summary.range = xml_attribute(&event, b"ref");
                 } else if element_is(name.as_ref(), b"c") {
+                    value.clear();
+                    formula = None;
                     current_cell = Some(ExcelCell {
                         reference: xml_attribute(&event, b"r").unwrap_or_default(),
                         cell_type: xml_attribute(&event, b"t"),
@@ -231,34 +204,24 @@ fn parse_excel_worksheet(xml: &[u8], shared_strings: &[String]) -> ExcelWorkshee
                 }
             }
             Ok(Event::Text(event)) => {
-                if let (Some(cell), Some(field)) = (current_cell.as_mut(), active_field) {
-                    match field {
-                        ExcelField::Value => {
-                            append_decoded_text(&mut cell.value, &event, MAX_SUMMARY_TEXT_CHARS)
-                        }
-                        ExcelField::Formula => {
-                            append_decoded_text(
-                                cell.formula.get_or_insert_with(String::new),
-                                &event,
-                                MAX_SUMMARY_TEXT_CHARS,
-                            );
-                        }
+                if current_cell.is_some() {
+                    match active_field {
+                        Some(ExcelField::Value) => value.push_text(&event),
+                        Some(ExcelField::Formula) => formula
+                            .get_or_insert_with(SummaryText::new)
+                            .push_text(&event),
+                        None => {}
                     }
                 }
             }
             Ok(Event::GeneralRef(event)) => {
-                if let (Some(cell), Some(field)) = (current_cell.as_mut(), active_field) {
-                    match field {
-                        ExcelField::Value => append_decoded_reference(
-                            &mut cell.value,
-                            &event,
-                            MAX_SUMMARY_TEXT_CHARS,
-                        ),
-                        ExcelField::Formula => append_decoded_reference(
-                            cell.formula.get_or_insert_with(String::new),
-                            &event,
-                            MAX_SUMMARY_TEXT_CHARS,
-                        ),
+                if current_cell.is_some() {
+                    match active_field {
+                        Some(ExcelField::Value) => value.push_reference(&event),
+                        Some(ExcelField::Formula) => formula
+                            .get_or_insert_with(SummaryText::new)
+                            .push_reference(&event),
+                        None => {}
                     }
                 }
             }
@@ -272,6 +235,8 @@ fn parse_excel_worksheet(xml: &[u8], shared_strings: &[String]) -> ExcelWorkshee
                 } else if element_is(name.as_ref(), b"c")
                     && let Some(mut cell) = current_cell.take()
                 {
+                    cell.value = std::mem::replace(&mut value, SummaryText::new()).into_string();
+                    cell.formula = formula.take().map(SummaryText::into_string);
                     if cell.cell_type.as_deref() == Some("s")
                         && let Ok(index) = cell.value.parse::<usize>()
                     {

@@ -1,7 +1,7 @@
 //! Canonical OOXML package metadata and bounded archive access.
 use std::{
     collections::BTreeMap,
-    io::{self, Read, Seek, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -18,6 +18,14 @@ pub const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_TOTAL_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_ENTRY_COUNT: usize = 100_000;
 pub const MAX_PATH_DEPTH: usize = 64;
+pub const OFFICE_DOCUMENT_REL_TYPES: [&str; 2] = [
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument",
+];
+pub const SHARED_STRINGS_REL_TYPES: [&str; 2] = [
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/sharedStrings",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
@@ -114,6 +122,7 @@ pub struct PackageIndex {
     /// OPC structural problems found by [`crate::integrity::check`].
     pub integrity: Vec<Diagnostic>,
     pub source: Option<PathBuf>,
+    part_keys: BTreeMap<String, String>,
     content_types: ContentTypes,
 }
 
@@ -161,7 +170,8 @@ impl PackageIndex {
                 continue;
             }
             let path = format!("/{normalized_path}");
-            if index.parts.contains_key(&path) {
+            let canonical_path = canonical_part_name(&path);
+            if index.part_keys.contains_key(&canonical_path) {
                 index.record(Diagnostic::error(
                     "index",
                     Some(path.clone()),
@@ -194,6 +204,7 @@ impl PackageIndex {
                     kind,
                 },
             );
+            index.part_keys.insert(canonical_path, path.clone());
             if normalized_path.eq_ignore_ascii_case("[Content_Types].xml") {
                 match read_limited(&mut entry, MAX_METADATA_BYTES, size) {
                     Ok(bytes) => content_types_bytes = Some(bytes),
@@ -224,6 +235,15 @@ impl PackageIndex {
                 )),
             }
         }
+        let mut overrides = BTreeMap::new();
+        for (name, content_type) in std::mem::take(&mut index.content_types.overrides) {
+            let name = index
+                .find_part(&name)
+                .map(|part| part.path.clone())
+                .unwrap_or(name);
+            overrides.insert(name, content_type);
+        }
+        index.content_types.overrides = overrides;
         for part in index.parts.values_mut() {
             let content_type = index.content_types.content_type_for(&part.path);
             // Refine extension-based classification with the declared content type so
@@ -249,8 +269,20 @@ impl PackageIndex {
                 ));
                 continue;
             };
+            let source = index
+                .find_part(&source)
+                .map_or_else(|| source.clone(), |part| part.path.clone());
             match parse_relationships(&bytes, &source) {
-                Ok(mut relationships) => index.relationships.append(&mut relationships),
+                Ok(mut relationships) => {
+                    for relationship in &mut relationships {
+                        if let Some(target) = relationship.resolved_target.as_mut()
+                            && let Some(part) = index.find_part(target)
+                        {
+                            *target = part.path.clone();
+                        }
+                    }
+                    index.relationships.append(&mut relationships);
+                }
                 Err(error) => index.record(Diagnostic::error(
                     "relationships",
                     Some(format!("/{relationship_path}")),
@@ -276,6 +308,31 @@ impl PackageIndex {
         Ok(index)
     }
 
+    pub fn find_part(&self, path: &str) -> Option<&PartInfo> {
+        self.parts.get(path).or_else(|| {
+            let canonical = canonical_part_name(path);
+            self.part_keys
+                .get(&canonical)
+                .and_then(|display_path| self.parts.get(display_path))
+        })
+    }
+
+    pub fn related_part(&self, source: &str, types: &[&str]) -> Option<&PartInfo> {
+        self.outgoing
+            .get(source)?
+            .iter()
+            .find_map(|relationship_index| {
+                let relationship = self.relationships.get(*relationship_index)?;
+                if relationship.target_mode != TargetMode::Internal
+                    || !types.contains(&relationship.relationship_type.as_str())
+                {
+                    return None;
+                }
+                self.find_part(relationship.resolved_target.as_deref()?)
+                    .filter(|part| part.kind != PartKind::Directory)
+            })
+    }
+
     pub(crate) fn record(&mut self, diagnostic: Diagnostic) {
         self.warnings
             .push(format!("{}: {}", diagnostic.stage, diagnostic.message));
@@ -288,7 +345,7 @@ impl PackageIndex {
         path: &str,
         limit: u64,
     ) -> io::Result<Vec<u8>> {
-        let part = self.parts.get(path).ok_or_else(|| {
+        let part = self.find_part(path).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("part not found: {path}"))
         })?;
         let mut entry = archive
@@ -397,7 +454,8 @@ pub struct Package {
 impl Package {
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         let source = path.into();
-        let file = std::fs::File::open(&source)?;
+        let mut file = std::fs::File::open(&source)?;
+        check_central_directory(&mut file)?;
         let mut index = PackageIndex::from_archive(&mut zip::ZipArchive::new(file)?)?;
         index.source = Some(source.clone());
         Ok(Self {
@@ -407,12 +465,210 @@ impl Package {
     }
 }
 
+fn too_many_entries(count: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("archive has {count} entries; limit is {MAX_ENTRY_COUNT}"),
+    )
+}
+
+fn central_directory_candidate_is_plausible<R: Read + Seek>(
+    reader: &mut R,
+    start: u64,
+    size: u64,
+    entries: u64,
+) -> io::Result<bool> {
+    const FILE_HEADER_BYTES: u64 = 46;
+    let entries_to_check = entries.min(MAX_ENTRY_COUNT as u64 + 1);
+    let Some(minimum_size) = entries_to_check.checked_mul(FILE_HEADER_BYTES) else {
+        return Ok(false);
+    };
+    if size < minimum_size {
+        return Ok(false);
+    }
+    if entries_to_check == 0 {
+        return Ok(true);
+    }
+    let Some(end) = start.checked_add(size) else {
+        return Ok(false);
+    };
+
+    reader.seek(SeekFrom::Start(start))?;
+    let mut position = start;
+    let mut header = [0; FILE_HEADER_BYTES as usize];
+    for _ in 0..entries_to_check {
+        if end.saturating_sub(position) < FILE_HEADER_BYTES {
+            return Ok(false);
+        }
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        if &header[..4] != b"PK\x01\x02" {
+            return Ok(false);
+        }
+
+        let variable_bytes = u64::from(u16::from_le_bytes([header[28], header[29]]))
+            + u64::from(u16::from_le_bytes([header[30], header[31]]))
+            + u64::from(u16::from_le_bytes([header[32], header[33]]));
+        let Some(next) = position
+            .checked_add(FILE_HEADER_BYTES)
+            .and_then(|position| position.checked_add(variable_bytes))
+        else {
+            return Ok(false);
+        };
+        if next > end {
+            return Ok(false);
+        }
+        reader.seek(SeekFrom::Start(next))?;
+        position = next;
+    }
+    Ok(true)
+}
+
+pub(crate) fn check_central_directory<R: Read + Seek>(reader: &mut R) -> io::Result<()> {
+    let original = reader.stream_position()?;
+    let result = (|| {
+        const EOCD_MIN_BYTES: usize = 22;
+        const MAX_COMMENT_BYTES: usize = u16::MAX as usize;
+        const ZIP64_EOCD_BYTES: usize = 56;
+        const ZIP64_LOCATOR_BYTES: usize = 20;
+
+        let length = reader.seek(SeekFrom::End(0))?;
+        let tail_len =
+            length.min((EOCD_MIN_BYTES + MAX_COMMENT_BYTES + ZIP64_LOCATOR_BYTES) as u64) as usize;
+        let tail_start = length - tail_len as u64;
+        let mut tail = vec![0; tail_len];
+        reader.seek(SeekFrom::Start(tail_start))?;
+        reader.read_exact(&mut tail)?;
+        if tail.len() < EOCD_MIN_BYTES {
+            return Ok(());
+        }
+
+        let mut reader = io::BufReader::new(&mut *reader);
+        for position in (0..=tail.len() - EOCD_MIN_BYTES).rev() {
+            if &tail[position..position + 4] != b"PK\x05\x06" {
+                continue;
+            }
+            let comment_len =
+                u16::from_le_bytes([tail[position + 20], tail[position + 21]]) as usize;
+            if position + EOCD_MIN_BYTES + comment_len > tail.len() {
+                continue;
+            }
+
+            let eocd_offset = tail_start + position as u64;
+            let mut entries = u16::from_le_bytes([tail[position + 10], tail[position + 11]]) as u64;
+            let has_sentinel = entries == u16::MAX as u64
+                || u32::from_le_bytes(tail[position + 12..position + 16].try_into().unwrap())
+                    == u32::MAX
+                || u32::from_le_bytes(tail[position + 16..position + 20].try_into().unwrap())
+                    == u32::MAX;
+            let mut directory_size =
+                u32::from_le_bytes(tail[position + 12..position + 16].try_into().unwrap()) as u64;
+            let mut directory_offset =
+                u32::from_le_bytes(tail[position + 16..position + 20].try_into().unwrap()) as u64;
+            let mut directory_end = eocd_offset;
+
+            if has_sentinel {
+                if position < ZIP64_LOCATOR_BYTES {
+                    continue;
+                }
+                let locator = position - ZIP64_LOCATOR_BYTES;
+                if &tail[locator..locator + 4] != b"PK\x06\x07" {
+                    continue;
+                }
+                let locator_disk =
+                    u32::from_le_bytes(tail[locator + 4..locator + 8].try_into().unwrap());
+                let zip64_offset =
+                    u64::from_le_bytes(tail[locator + 8..locator + 16].try_into().unwrap());
+                let disk_count =
+                    u32::from_le_bytes(tail[locator + 16..locator + 20].try_into().unwrap());
+                let locator_offset = tail_start + locator as u64;
+                if locator_disk != 0
+                    || disk_count > 1
+                    || zip64_offset
+                        .checked_add(ZIP64_EOCD_BYTES as u64)
+                        .is_none_or(|minimum_end| minimum_end > locator_offset)
+                {
+                    continue;
+                }
+
+                reader.seek(SeekFrom::Start(zip64_offset))?;
+                let mut record = [0; ZIP64_EOCD_BYTES];
+                match reader.read_exact(&mut record) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => continue,
+                    Err(error) => return Err(error),
+                }
+                let record_size = u64::from_le_bytes(record[4..12].try_into().unwrap());
+                let Some(record_end) = zip64_offset
+                    .checked_add(12)
+                    .and_then(|start| start.checked_add(record_size))
+                else {
+                    continue;
+                };
+                if &record[..4] != b"PK\x06\x06"
+                    || record_size < (ZIP64_EOCD_BYTES - 12) as u64
+                    || record_end != locator_offset
+                {
+                    continue;
+                }
+
+                let record_disk = u32::from_le_bytes(record[16..20].try_into().unwrap());
+                let record_directory_disk = u32::from_le_bytes(record[20..24].try_into().unwrap());
+                let entries_on_disk = u64::from_le_bytes(record[24..32].try_into().unwrap());
+                entries = u64::from_le_bytes(record[32..40].try_into().unwrap());
+                if record_disk != 0
+                    || record_directory_disk != locator_disk
+                    || entries_on_disk != entries
+                {
+                    continue;
+                }
+                directory_size = u64::from_le_bytes(record[40..48].try_into().unwrap());
+                directory_offset = u64::from_le_bytes(record[48..56].try_into().unwrap());
+                directory_end = zip64_offset;
+            } else {
+                let disk = u16::from_le_bytes([tail[position + 4], tail[position + 5]]);
+                let directory_disk = u16::from_le_bytes([tail[position + 6], tail[position + 7]]);
+                let entries_on_disk =
+                    u16::from_le_bytes([tail[position + 8], tail[position + 9]]) as u64;
+                if disk != 0 || directory_disk != 0 || entries_on_disk != entries {
+                    continue;
+                }
+            }
+
+            let Some(directory_start) = directory_end.checked_sub(directory_size) else {
+                continue;
+            };
+            if directory_start < directory_offset
+                || !central_directory_candidate_is_plausible(
+                    &mut reader,
+                    directory_start,
+                    directory_size,
+                    entries,
+                )?
+            {
+                continue;
+            }
+            if entries > MAX_ENTRY_COUNT as u64 {
+                return Err(too_many_entries(entries));
+            }
+            return Ok(());
+        }
+        Ok(())
+    })();
+    let restored = reader.seek(SeekFrom::Start(original));
+    match (result, restored) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(_)) => Ok(()),
+    }
+}
+
 fn check_archive_limits(entry_count: usize, declared_total: u64) -> io::Result<()> {
     if entry_count > MAX_ENTRY_COUNT {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("archive has {entry_count} entries; limit is {MAX_ENTRY_COUNT}"),
-        ));
+        return Err(too_many_entries(entry_count as u64));
     }
     if declared_total > MAX_TOTAL_UNCOMPRESSED_BYTES {
         return Err(io::Error::new(
@@ -579,19 +835,30 @@ fn local_name(name: &str) -> &str {
 /// `.rels`; [`crate::integrity`] relies on this to tell implicit parts apart
 /// from ordinary ones.
 pub(crate) fn relationship_source(path: &str) -> Option<String> {
-    if path == "_rels/.rels" {
+    let lower = path.to_ascii_lowercase();
+    if lower == "_rels/.rels" || lower == "/_rels/.rels" {
         return Some("/".into());
     }
-    if let Some(name) = path.strip_prefix("_rels/") {
-        return name
-            .strip_suffix(".rels")
-            .map(|s| format!("/{}", normalize_package_path(s)));
+
+    let (directory, name) = if lower.starts_with("_rels/") {
+        ("", &path["_rels/".len()..])
+    } else if lower.starts_with("/_rels/") {
+        ("", &path["/_rels/".len()..])
+    } else {
+        let marker = lower.rfind("/_rels/")?;
+        (&path[..marker], &path[marker + "/_rels/".len()..])
+    };
+    if !lower.ends_with(".rels") {
+        return None;
     }
-    let (directory, name) = path.rsplit_once("/_rels/")?;
-    let name = name.strip_suffix(".rels")?;
-    // A nested `foo/_rels/.rels` names no source part and is not a valid
-    // relationship part.
-    (!name.is_empty()).then(|| format!("/{directory}/{name}"))
+    let name = &name[..name.len() - ".rels".len()];
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "/{}",
+        normalize_package_path(&format!("{directory}/{name}"))
+    ))
 }
 fn resolve_relationship_target(source: &str, target: &str) -> Option<String> {
     // A target is a URI reference, so only the part URI is resolved: a fragment
@@ -626,6 +893,45 @@ pub fn normalize_package_path(path: &str) -> String {
     }
     components.join("/")
 }
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// OPC part names compare by ASCII case and decode percent-escapes for
+/// unreserved URI bytes while retaining escapes for reserved bytes.
+pub(crate) fn canonical_part_name(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut decoded = String::with_capacity(path.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
+        {
+            let value = high * 16 + low;
+            if value.is_ascii_alphanumeric() || matches!(value, b'-' | b'.' | b'_' | b'~') {
+                decoded.push(value as char);
+            } else {
+                decoded.push_str(&path[index..index + 3]);
+            }
+            index += 3;
+        } else {
+            let Some(character) = path[index..].chars().next() else {
+                break;
+            };
+            decoded.push(character);
+            index += character.len_utf8();
+        }
+    }
+    format!("/{}", normalize_package_path(&decoded)).to_ascii_lowercase()
+}
+
 /// Single source of truth for extension-based part classification. Used both for
 /// `PartKind` assignment during indexing and for preview selection.
 pub(crate) fn is_xml_name(path: &str) -> bool {
@@ -691,11 +997,98 @@ mod tests {
     fn normalizes_traversal_and_separators() {
         assert_eq!(normalize_package_path(r"/a\\b/../c"), "a/c");
     }
+    #[test]
+    fn find_part_ignores_ascii_case_and_unreserved_escapes() {
+        let bytes = archive_with_declared_sizes(&["word/document.xml", "a~b.xml"], 1);
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let index = PackageIndex::from_archive(&mut archive).unwrap();
+
+        assert_eq!(
+            index
+                .find_part("/WORD/Document.XML")
+                .map(|part| part.path.as_str()),
+            Some("/word/document.xml")
+        );
+        assert_eq!(
+            index.find_part("/a%7Eb.xml").map(|part| part.path.as_str()),
+            Some("/a~b.xml")
+        );
+        assert_eq!(
+            index.find_part("/a%7eb.xml").map(|part| part.path.as_str()),
+            Some("/a~b.xml")
+        );
+        assert!(index.find_part("/a%2Fb.xml").is_none());
+    }
+
+    #[test]
+    fn case_variant_archive_names_collide() {
+        let bytes = archive_with_declared_sizes(&["a.xml", "A.xml"], 1);
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let index = PackageIndex::from_archive(&mut archive).unwrap();
+
+        assert_eq!(index.parts.len(), 1);
+        assert!(index.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "archive path collides with 'A.xml'; entry ignored"
+        }));
+    }
+
+    #[test]
+    fn metadata_paths_resolve_to_indexed_spelling() {
+        use std::io::Write as _;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, contents) in [
+            (
+                "[Content_Types].xml",
+                r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Override PartName="/WORD/DOCUMENT.XML" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="Word/Document.xml"/>
+</Relationships>"#,
+            ),
+            ("word/document.xml", "<document/>"),
+        ] {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(contents.as_bytes()).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let index = PackageIndex::from_archive(&mut archive).unwrap();
+
+        assert_eq!(
+            index.relationships[0].resolved_target.as_deref(),
+            Some("/word/document.xml")
+        );
+        assert!(index.incoming.contains_key("/word/document.xml"));
+        assert_eq!(
+            index.parts["/word/document.xml"].content_type.as_deref(),
+            Some(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
+            )
+        );
+        assert!(!index.integrity.iter().any(|issue| {
+            issue.message.contains("dangling")
+                || issue.message.contains("not reachable")
+                || issue.message.contains("no valid officeDocument")
+        }));
+    }
 
     #[test]
     fn relationship_source_rejects_names_without_a_source_part() {
         assert_eq!(relationship_source("foo/_rels/.rels"), None);
         assert_eq!(relationship_source("custom/data.rels"), None);
+        assert_eq!(relationship_source("_RELS/.RELS").as_deref(), Some("/"));
+        assert_eq!(
+            relationship_source("WORD/_RELS/DOCUMENT.XML.RELS").as_deref(),
+            Some("/WORD/DOCUMENT.XML")
+        );
     }
 
     #[test]
@@ -754,6 +1147,132 @@ mod tests {
             other => panic!("expected empty element, got {other:?}"),
         };
         assert_eq!(xml_attribute(&event, b"id").as_deref(), Some("fallback"));
+    }
+
+    #[test]
+    fn central_directory_check_rejects_zip64_entry_count() {
+        fn zip64_archive(total_entries: u64, comment_len: u16) -> std::io::Cursor<Vec<u8>> {
+            let directory_size = total_entries * 46;
+            let directory_size_usize = directory_size as usize;
+            let mut bytes = vec![0; directory_size_usize + 56];
+            for entry in bytes[..directory_size_usize].as_chunks_mut::<46>().0 {
+                entry[..4].copy_from_slice(b"PK\x01\x02");
+            }
+            let record = directory_size_usize;
+            bytes[record..record + 4].copy_from_slice(b"PK\x06\x06");
+            bytes[record + 4..record + 12].copy_from_slice(&44u64.to_le_bytes());
+            bytes[record + 24..record + 32].copy_from_slice(&total_entries.to_le_bytes());
+            bytes[record + 32..record + 40].copy_from_slice(&total_entries.to_le_bytes());
+            bytes[record + 40..record + 48].copy_from_slice(&directory_size.to_le_bytes());
+
+            bytes.extend_from_slice(b"PK\x06\x07");
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&directory_size.to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+
+            bytes.extend_from_slice(b"PK\x05\x06");
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+            bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+            bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+            bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+            bytes.extend_from_slice(&comment_len.to_le_bytes());
+            bytes.resize(bytes.len() + usize::from(comment_len), 0);
+            std::io::Cursor::new(bytes)
+        }
+
+        let mut oversized = zip64_archive(100_001, 0);
+        let error = check_central_directory(&mut oversized).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "archive has 100001 entries; limit is 100000"
+        );
+
+        let mut at_limit = zip64_archive(100_000, 0);
+        assert!(check_central_directory(&mut at_limit).is_ok());
+
+        let mut oversized_with_full_comment = zip64_archive(100_001, u16::MAX);
+        let error = check_central_directory(&mut oversized_with_full_comment).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "archive has 100001 entries; limit is 100000"
+        );
+    }
+
+    fn fake_zip64_eocd(entries: u64, zip64_offset: u64) -> Vec<u8> {
+        let mut bytes = vec![0; 98];
+        bytes[..4].copy_from_slice(b"PK\x06\x06");
+        bytes[4..12].copy_from_slice(&44u64.to_le_bytes());
+        bytes[24..32].copy_from_slice(&entries.to_le_bytes());
+        bytes[32..40].copy_from_slice(&entries.to_le_bytes());
+        bytes[56..60].copy_from_slice(b"PK\x06\x07");
+        bytes[64..72].copy_from_slice(&zip64_offset.to_le_bytes());
+        bytes[72..76].copy_from_slice(&1u32.to_le_bytes());
+        bytes[76..80].copy_from_slice(b"PK\x05\x06");
+        bytes[84..86].copy_from_slice(&u16::MAX.to_le_bytes());
+        bytes[86..88].copy_from_slice(&u16::MAX.to_le_bytes());
+        bytes[88..92].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[92..96].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn central_directory_check_ignores_embedded_zip64_records() {
+        use std::io::Write as _;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "embedded.bin",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        let zip64_offset = writer.get_ref().unwrap().position();
+        let fake = fake_zip64_eocd(100_001, zip64_offset);
+        writer.write_all(&fake).unwrap();
+        let mut archive = std::io::Cursor::new(writer.finish().unwrap().into_inner());
+
+        check_central_directory(&mut archive).unwrap();
+    }
+
+    #[test]
+    fn central_directory_check_skips_fake_zip64_records_in_comments() {
+        use std::io::Write as _;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("part.xml", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"<p/>").unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+        let eocd = bytes.len() - 22;
+        let fake_offset = bytes.len() as u64;
+        let fake = fake_zip64_eocd(100_001, fake_offset);
+        bytes.extend_from_slice(&fake);
+        bytes[eocd + 20..eocd + 22].copy_from_slice(&(fake.len() as u16).to_le_bytes());
+        let mut archive = std::io::Cursor::new(bytes);
+
+        check_central_directory(&mut archive).unwrap();
+    }
+
+    #[test]
+    fn central_directory_check_restores_position() {
+        use std::io::Write as _;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("part.xml", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"<p/>").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut archive = std::io::Cursor::new(bytes);
+        archive.set_position(5);
+
+        check_central_directory(&mut archive).unwrap();
+        assert_eq!(archive.position(), 5);
     }
 
     #[test]

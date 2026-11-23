@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
@@ -14,6 +14,7 @@ use std::{
 };
 
 use crate::{
+    cancel::Cancel,
     compare::{self, Comparison},
     package::{self, Diagnostic, MAX_ENTRY_BYTES, Package, PackageIndex, PartInfo, PartKind},
     preview::{Preview, PreviewKind, build_preview},
@@ -80,6 +81,23 @@ pub enum Job {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobClass {
+    Load,
+    Preview,
+    Search,
+}
+
+impl JobClass {
+    fn slot(self) -> usize {
+        match self {
+            Self::Load => 0,
+            Self::Preview => 1,
+            Self::Search => 2,
+        }
+    }
+}
+
 /// How a selected part leaves `oox`.
 #[derive(Clone, Debug)]
 pub enum ExportMode {
@@ -123,6 +141,12 @@ pub struct SummaryPayload {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Debug)]
+pub struct ContentSearchResult {
+    pub matches: Vec<String>,
+    pub skipped_parts: usize,
+}
+
 /// Two open packages plus their comparison, ready for the UI.
 #[derive(Debug)]
 pub struct ComparedPackages {
@@ -154,7 +178,7 @@ pub enum ResultMessage {
     ContentSearch {
         request_id: u64,
         query: String,
-        matches: Result<Vec<String>, String>,
+        result: Result<ContentSearchResult, String>,
     },
     Exported {
         request_id: u64,
@@ -193,7 +217,8 @@ fn ensure_cached(cache: &mut ArchiveCache, path: &Path) -> io::Result<()> {
         cache.push(entry);
         return Ok(());
     }
-    let file = File::open(path)?;
+    let mut file = File::open(path)?;
+    package::check_central_directory(&mut file)?;
     let archive = zip::ZipArchive::new(file)?;
     if cache.len() >= ARCHIVE_CACHE_CAPACITY {
         cache.remove(0);
@@ -247,9 +272,9 @@ fn cached_archives<'a>(
 }
 
 pub struct Worker {
-    /// Newest-job-wins queue of pending work. Replaceable jobs are superseded by
-    /// later ones, while side-effecting jobs are never dropped.
-    queue: Arc<Mutex<VecDeque<Job>>>,
+    /// Jobs are coalesced only with pending jobs of the same class.
+    queue: Arc<Mutex<VecDeque<QueuedJob>>>,
+    generations: [Arc<AtomicU64>; 3],
     /// Signals that `queue` is non-empty; it carries no job identity of its own.
     wake: Option<SyncSender<()>>,
     receiver: Receiver<ResultMessage>,
@@ -258,23 +283,27 @@ pub struct Worker {
     thread: Option<JoinHandle<()>>,
 }
 
+struct QueuedJob {
+    job: Job,
+    cancel: Cancel,
+}
+
 impl Job {
-    /// A transient job only describes a selection the user may have already
-    /// moved past, so a newer request makes it obsolete. Exports have side
-    /// effects (files, clipboard) and must run exactly once.
-    fn is_replaceable(&self) -> bool {
-        !matches!(self, Job::ExportPart { .. } | Job::SavePackage { .. })
+    fn class(&self) -> Option<JobClass> {
+        match self {
+            Job::Open { .. } | Job::Compare { .. } => Some(JobClass::Load),
+            Job::ReadPart { .. } | Job::DiffPart { .. } => Some(JobClass::Preview),
+            Job::SearchContent { .. } => Some(JobClass::Search),
+            Job::ExportPart { .. } | Job::SavePackage { .. } => None,
+        }
     }
 }
 
-/// Queue policy: a newer transient job supersedes older transient jobs, but
-/// side-effecting exports are never displaced, so an export cannot be lost to a
-/// selection change or a background search.
-fn enqueue(queue: &mut VecDeque<Job>, job: Job) {
-    if job.is_replaceable() {
-        queue.retain(|queued| !queued.is_replaceable());
+fn enqueue(queue: &mut VecDeque<QueuedJob>, queued: QueuedJob) {
+    if let Some(class) = queued.job.class() {
+        queue.retain(|pending| pending.job.class() != Some(class));
     }
-    queue.push_back(job);
+    queue.push_back(queued);
 }
 
 impl Worker {
@@ -283,7 +312,8 @@ impl Worker {
         let (wake, wake_receiver) = mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let queue = Arc::new(Mutex::new(VecDeque::<QueuedJob>::new()));
+        let generations = std::array::from_fn(|_| Arc::new(AtomicU64::new(0)));
         let worker_stop = Arc::clone(&stop);
         let worker_alive = Arc::clone(&alive);
         let worker_queue = Arc::clone(&queue);
@@ -293,11 +323,11 @@ impl Worker {
                 let _alive_guard = AliveGuard(worker_alive);
                 let mut archive_cache: ArchiveCache = Vec::new();
                 'worker: while !worker_stop.load(Ordering::Acquire) {
-                    let job = match worker_queue.lock() {
+                    let queued = match worker_queue.lock() {
                         Ok(mut queue) => queue.pop_front(),
                         Err(_) => break 'worker,
                     };
-                    let Some(job) = job else {
+                    let Some(QueuedJob { job, cancel }) = queued else {
                         // No work: sleep until a submit wakes us. The timeout is a
                         // stop-check backstop, not a polling interval.
                         match wake_receiver.recv_timeout(Duration::from_millis(10)) {
@@ -305,11 +335,18 @@ impl Worker {
                             Err(mpsc::RecvTimeoutError::Disconnected) => break 'worker,
                         }
                     };
+                    if cancel.is_cancelled() {
+                        continue 'worker;
+                    }
                     let result = match job {
                         Job::Open { request_id, path } => {
                             let (package, summary) = match Package::open(path.clone()) {
                                 Ok(mut package) => {
-                                    let summary = build_summary(&mut archive_cache, &package);
+                                    if cancel.is_cancelled() {
+                                        continue 'worker;
+                                    }
+                                    let summary =
+                                        build_summary(&mut archive_cache, &package, &cancel);
                                     // Summary diagnostics belong to the package's
                                     // diagnostic log; merge them before publishing.
                                     for diagnostic in &summary.diagnostics {
@@ -338,7 +375,8 @@ impl Worker {
                             path,
                             compare_path,
                         } => {
-                            let result = compare_packages(&mut archive_cache, &path, &compare_path);
+                            let result =
+                                compare_packages(&mut archive_cache, &path, &compare_path, &cancel);
                             ResultMessage::Compared {
                                 request_id,
                                 path,
@@ -361,6 +399,7 @@ impl Worker {
                                 &index_a,
                                 &index_b,
                                 &part_path,
+                                &cancel,
                             )
                             .map_err(|error| error.to_string());
                             ResultMessage::PartRead {
@@ -390,13 +429,18 @@ impl Worker {
                             query,
                             index,
                         } => {
-                            let matches =
-                                search_content(&mut archive_cache, &package_path, &index, &query)
-                                    .map_err(|error| error.to_string());
+                            let result = search_content(
+                                &mut archive_cache,
+                                &package_path,
+                                &index,
+                                &query,
+                                &cancel,
+                            )
+                            .map_err(|error| error.to_string());
                             ResultMessage::ContentSearch {
                                 request_id,
                                 query,
-                                matches,
+                                result,
                             }
                         }
                         Job::ExportPart {
@@ -438,6 +482,9 @@ impl Worker {
                             }
                         }
                     };
+                    if cancel.is_cancelled() {
+                        continue 'worker;
+                    }
                     // Do not strand the worker when the UI is busy. A bounded,
                     // cooperative retry also lets Drop interrupt shutdown.
                     let mut result = Some(result);
@@ -458,6 +505,7 @@ impl Worker {
             })?;
         Ok(Self {
             queue,
+            generations,
             wake: Some(wake),
             receiver,
             stop,
@@ -466,9 +514,8 @@ impl Worker {
         })
     }
 
-    /// Queue work without ever waiting on the worker. Only replaceable jobs are
-    /// dropped; a newer request supersedes the stale ones instead of growing the
-    /// queue.
+    /// Queue work without waiting on the worker. Replaceable work is coalesced
+    /// only with pending jobs of the same class.
     pub fn submit(&self, job: Job) -> io::Result<()> {
         let wake = self
             .wake
@@ -478,12 +525,36 @@ impl Worker {
             .queue
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker queue is poisoned"))?;
-        enqueue(&mut queue, job);
-        drop(queue);
-        // A full wake channel already has an outstanding signal, and the worker
-        // pops one job per iteration, so a dropped signal is not a lost job.
-        let _ = wake.try_send(());
-        Ok(())
+        let cancel = match job.class() {
+            Some(class) => {
+                let generation = Arc::clone(&self.generations[class.slot()]);
+                let expected = generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+                Cancel::new(generation, expected)
+            }
+            None => Cancel::never(),
+        };
+        enqueue(&mut queue, QueuedJob { job, cancel });
+        match wake.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(())) => {
+                queue.clear();
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "worker has stopped",
+                ))
+            }
+        }
+    }
+
+    /// Cancel an in-flight content search and discard any queued searches.
+    pub fn cancel_search(&self) {
+        let generation = &self.generations[JobClass::Search.slot()];
+        let Ok(mut queue) = self.queue.lock() else {
+            generation.fetch_add(1, Ordering::AcqRel);
+            return;
+        };
+        generation.fetch_add(1, Ordering::AcqRel);
+        queue.retain(|pending| pending.job.class() != Some(JobClass::Search));
     }
 
     pub fn try_recv(&self) -> io::Result<Option<ResultMessage>> {
@@ -524,9 +595,9 @@ impl Drop for Worker {
     }
 }
 
-fn build_summary(cache: &mut ArchiveCache, package: &Package) -> SummaryPayload {
+fn build_summary(cache: &mut ArchiveCache, package: &Package, cancel: &Cancel) -> SummaryPayload {
     let result = cached_archive(cache, &package.source)
-        .and_then(|archive| build_document_summary(archive, &package.index));
+        .and_then(|archive| build_document_summary(archive, &package.index, cancel));
     match result {
         Ok(view) => SummaryPayload {
             view,
@@ -550,9 +621,12 @@ fn compare_packages(
     cache: &mut ArchiveCache,
     path_a: &Path,
     path_b: &Path,
+    cancel: &Cancel,
 ) -> Result<ComparedPackages, String> {
     let mut a = Package::open(path_a).map_err(|error| error.to_string())?;
-    let summary = build_summary(cache, &a);
+    cancel.check().map_err(|error| error.to_string())?;
+    let summary = build_summary(cache, &a, cancel);
+    cancel.check().map_err(|error| error.to_string())?;
     for diagnostic in &summary.diagnostics {
         Arc::make_mut(&mut a.index).record(diagnostic.clone());
     }
@@ -567,10 +641,11 @@ fn compare_packages(
     }
 
     let b = Package::open(path_b).map_err(|error| error.to_string())?;
+    cancel.check().map_err(|error| error.to_string())?;
     let mut comparison = {
         let (archive_a, archive_b) =
             cached_archives(cache, path_a, path_b).map_err(|error| error.to_string())?;
-        compare::compare(&a.index, archive_a, &b.index, archive_b)
+        compare::compare(&a.index, archive_a, &b.index, archive_b, cancel)
     };
     for diagnostic in &comparison.diagnostics {
         Arc::make_mut(&mut a.index).record(diagnostic.clone());
@@ -594,6 +669,7 @@ fn diff_part(
     index_a: &PackageIndex,
     index_b: &PackageIndex,
     part_path: &str,
+    cancel: &Cancel,
 ) -> io::Result<Preview> {
     if package_a == package_b {
         return Ok(Preview::Editor {
@@ -603,7 +679,7 @@ fn diff_part(
         });
     }
     let (archive_a, archive_b) = cached_archives(cache, package_a, package_b)?;
-    compare::diff_part(index_a, archive_a, index_b, archive_b, part_path)
+    compare::diff_part(index_a, archive_a, index_b, archive_b, part_path, cancel)
 }
 
 fn read_preview(
@@ -628,29 +704,41 @@ fn search_content(
     package_path: &Path,
     index: &PackageIndex,
     query: &str,
-) -> io::Result<Vec<String>> {
+    cancel: &Cancel,
+) -> io::Result<ContentSearchResult> {
     if query.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ContentSearchResult {
+            matches: Vec::new(),
+            skipped_parts: 0,
+        });
     }
-    let needle = query.as_bytes();
+    let finder = memchr::memmem::Finder::new(query.as_bytes());
     let archive = cached_archive(cache, package_path)?;
-    let mut matches = Vec::new();
+    let mut result = ContentSearchResult {
+        matches: Vec::new(),
+        skipped_parts: 0,
+    };
 
     for part in index.parts.values() {
-        if matches.len() >= MAX_CONTENT_SEARCH_RESULTS {
+        cancel.check()?;
+        if result.matches.len() >= MAX_CONTENT_SEARCH_RESULTS {
             break;
         }
         if part.kind == PartKind::Directory || part.size > MAX_ENTRY_BYTES {
             continue;
         }
         let Ok(mut entry) = archive.by_name(&part.archive_name) else {
+            result.skipped_parts += 1;
             continue;
         };
-        if stream_contains(&mut entry, needle)? {
-            matches.push(part.path.clone());
+        match stream_contains(&mut entry, &finder, cancel) {
+            Ok(true) => result.matches.push(part.path.clone()),
+            Ok(false) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+            Err(_) => result.skipped_parts += 1,
         }
     }
-    Ok(matches)
+    Ok(result)
 }
 
 /// Read the raw part bytes under the same bound as previews, so export honors
@@ -783,8 +871,8 @@ fn save_package(
 ///
 /// `hard_link` atomically creates the target link only when that path is free;
 /// if a file or symlink appeared while the package was being written, it returns
-/// `AlreadyExists` and leaves the existing entry untouched. On success, removing
-/// `source` leaves the target link to the same completed file contents. The
+/// `AlreadyExists` and leaves the existing entry untouched. On success, the
+/// source remains owned by `TempPart` and is removed best-effort on drop. The
 /// temporary file lives beside the target, so the link cannot cross filesystems.
 fn hard_link_install_error(target: &Path, error: io::Error) -> io::Error {
     io::Error::new(
@@ -798,10 +886,7 @@ fn hard_link_install_error(target: &Path, error: io::Error) -> io::Error {
 
 fn install_without_replacing(source: &Path, target: &Path) -> io::Result<()> {
     match std::fs::hard_link(source, target) {
-        Ok(()) => {
-            std::fs::remove_file(source)?;
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!(
@@ -865,14 +950,22 @@ pub(crate) fn write_temp_file(archive_name: &str, bytes: &[u8]) -> io::Result<Te
     Err(io::Error::other("could not allocate a temporary file"))
 }
 
-fn stream_contains<R: io::Read>(reader: &mut R, needle: &[u8]) -> io::Result<bool> {
+fn stream_contains<R: io::Read>(
+    reader: &mut R,
+    finder: &memchr::memmem::Finder<'_>,
+    cancel: &Cancel,
+) -> io::Result<bool> {
+    let needle = finder.needle();
     if needle.is_empty() {
         return Ok(true);
     }
-    let mut window = Vec::with_capacity(needle.len());
+    let carry_len = needle.len() - 1;
+    let mut carry = Vec::with_capacity(carry_len);
+    let mut window = Vec::with_capacity(SEARCH_BUFFER_BYTES + carry_len);
     let mut buffer = [0u8; SEARCH_BUFFER_BYTES];
     let mut total = 0u64;
     loop {
+        cancel.check()?;
         let count = reader.read(&mut buffer)?;
         if count == 0 {
             return Ok(false);
@@ -881,15 +974,15 @@ fn stream_contains<R: io::Read>(reader: &mut R, needle: &[u8]) -> io::Result<boo
         if total > MAX_ENTRY_BYTES {
             return Ok(false);
         }
-        for byte in &buffer[..count] {
-            window.push(*byte);
-            if window.len() > needle.len() {
-                window.remove(0);
-            }
-            if window == needle {
-                return Ok(true);
-            }
+        window.clear();
+        window.extend_from_slice(&carry);
+        window.extend_from_slice(&buffer[..count]);
+        if finder.find(&window).is_some() {
+            return Ok(true);
         }
+        carry.clear();
+        let carry_start = window.len().saturating_sub(carry_len);
+        carry.extend_from_slice(&window[carry_start..]);
     }
 }
 
@@ -909,12 +1002,18 @@ mod tests {
     use super::{
         ExportMode, ExportOutcome, Job, ResultMessage, Worker, accepts_result, stream_contains,
     };
-    use crate::package::Package;
+    use crate::{
+        cancel::Cancel,
+        package::{Package, PartKind},
+    };
     use std::{
         collections::VecDeque,
-        io::Cursor,
+        io::{self, Cursor},
         path::PathBuf,
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -933,6 +1032,93 @@ mod tests {
             part: Box::new(part),
             index: Arc::clone(&package.index),
             mode,
+        }
+    }
+    fn queued(job: Job) -> super::QueuedJob {
+        super::QueuedJob {
+            job,
+            cancel: Cancel::never(),
+        }
+    }
+
+    fn search_job(request_id: u64) -> Job {
+        let package = Package::open("data/sample.pptx").expect("sample package should open");
+        Job::SearchContent {
+            request_id,
+            package_path: package.source.clone(),
+            query: "needle".to_string(),
+            index: Arc::clone(&package.index),
+        }
+    }
+
+    #[test]
+    fn cancel_search_invalidates_running_and_removes_queued_searches() {
+        let generation = Arc::new(AtomicU64::new(7));
+        let running_search = Cancel::new(Arc::clone(&generation), 7);
+        let queue = Arc::new(std::sync::Mutex::new(VecDeque::from([
+            queued(search_job(1)),
+            queued(export_job(2, ExportMode::Clipboard)),
+        ])));
+        let generations = std::array::from_fn(|slot| {
+            if slot == super::JobClass::Search.slot() {
+                Arc::clone(&generation)
+            } else {
+                Arc::new(AtomicU64::new(0))
+            }
+        });
+        let (wake, _wake_receiver) = std::sync::mpsc::sync_channel(1);
+        let (_result_sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = Worker {
+            queue: Arc::clone(&queue),
+            generations,
+            wake: Some(wake),
+            receiver,
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            thread: None,
+        };
+
+        worker.cancel_search();
+
+        assert!(running_search.is_cancelled());
+        let queue = queue.lock().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert!(matches!(
+            queue.front().map(|queued| &queued.job),
+            Some(Job::ExportPart { .. })
+        ));
+    }
+
+    fn preview_job(request_id: u64) -> Job {
+        let package = Package::open("data/sample.pptx").expect("sample package should open");
+        let part = package
+            .index
+            .parts
+            .values()
+            .find(|part| part.kind != PartKind::Directory)
+            .expect("sample package should contain a file part")
+            .clone();
+        Job::ReadPart {
+            request_id,
+            package_path: package.source.clone(),
+            part: Box::new(part),
+            index: Arc::clone(&package.index),
+        }
+    }
+
+    struct SupersedingReader {
+        bytes: Cursor<Vec<u8>>,
+        generation: Arc<AtomicU64>,
+        supersede_on_read: bool,
+    }
+
+    impl io::Read for SupersedingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.supersede_on_read {
+                self.generation.fetch_add(1, Ordering::AcqRel);
+                self.supersede_on_read = false;
+            }
+            io::Read::read(&mut self.bytes, buffer)
         }
     }
 
@@ -965,12 +1151,86 @@ mod tests {
     fn content_search_matches_exact_bytes_across_buffer_boundaries() {
         let mut bytes = vec![b'x'; super::SEARCH_BUFFER_BYTES - 2];
         bytes.extend_from_slice(b"needle");
-        let found = stream_contains(&mut Cursor::new(bytes), b"needle")
+        let finder = memchr::memmem::Finder::new(b"needle");
+        let found = stream_contains(&mut Cursor::new(bytes), &finder, &Cancel::never())
             .expect("stream search should not fail");
         assert!(found);
 
         let mut input = Cursor::new(b"some text".to_vec());
-        assert!(!stream_contains(&mut input, b"missing").unwrap());
+        let finder = memchr::memmem::Finder::new(b"missing");
+        assert!(!stream_contains(&mut input, &finder, &Cancel::never()).unwrap());
+    }
+
+    #[test]
+    fn content_search_finds_needle_longer_than_a_chunk() {
+        let needle = vec![b'a'; super::SEARCH_BUFFER_BYTES + 100];
+        let mut bytes = vec![b'x'; 10];
+        bytes.extend_from_slice(&needle);
+        let finder = memchr::memmem::Finder::new(&needle);
+
+        assert!(stream_contains(&mut Cursor::new(bytes), &finder, &Cancel::never()).unwrap());
+    }
+
+    #[test]
+    fn content_search_stops_after_a_newer_request() {
+        let generation = Arc::new(AtomicU64::new(4));
+        let cancel = Cancel::new(Arc::clone(&generation), 4);
+        let mut reader = SupersedingReader {
+            bytes: Cursor::new(vec![b'x'; super::SEARCH_BUFFER_BYTES + 1]),
+            generation,
+            supersede_on_read: true,
+        };
+        let finder = memchr::memmem::Finder::new(b"missing");
+
+        let error = stream_contains(&mut reader, &finder, &cancel).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn replaceable_jobs_coalesce_independently_by_class() {
+        let mut queue = VecDeque::new();
+        super::enqueue(&mut queue, queued(export_job(7, ExportMode::Clipboard)));
+        super::enqueue(
+            &mut queue,
+            queued(Job::Open {
+                request_id: 1,
+                path: PathBuf::from("/old-package"),
+            }),
+        );
+        super::enqueue(&mut queue, queued(search_job(2)));
+        super::enqueue(&mut queue, queued(preview_job(3)));
+        super::enqueue(
+            &mut queue,
+            queued(Job::Compare {
+                request_id: 4,
+                path: PathBuf::from("/new-package"),
+                compare_path: PathBuf::from("/other-package"),
+            }),
+        );
+        super::enqueue(&mut queue, queued(search_job(5)));
+        super::enqueue(&mut queue, queued(preview_job(6)));
+
+        assert_eq!(
+            queue.len(),
+            4,
+            "each replaceable class keeps only its newest job"
+        );
+        assert!(matches!(
+            queue.front().map(|queued| &queued.job),
+            Some(Job::ExportPart { request_id: 7, .. })
+        ));
+        assert!(matches!(
+            queue.get(1).map(|queued| &queued.job),
+            Some(Job::Compare { request_id: 4, .. })
+        ));
+        assert!(matches!(
+            queue.get(2).map(|queued| &queued.job),
+            Some(Job::SearchContent { request_id: 5, .. })
+        ));
+        assert!(matches!(
+            queue.get(3).map(|queued| &queued.job),
+            Some(Job::ReadPart { request_id: 6, .. })
+        ));
     }
 
     #[test]
@@ -986,29 +1246,6 @@ mod tests {
                 .expect("worker should retain the newest pending job");
         }
         assert!(started.elapsed().as_millis() < 500, "submission blocked");
-    }
-
-    #[test]
-    fn export_jobs_survive_replaceable_coalescing() {
-        let mut queue = VecDeque::new();
-        super::enqueue(&mut queue, export_job(7, ExportMode::Clipboard));
-        // A burst of replaceable jobs must never displace a queued export.
-        for request_id in 0..500 {
-            super::enqueue(
-                &mut queue,
-                Job::Open {
-                    request_id,
-                    path: PathBuf::from("/missing-package"),
-                },
-            );
-        }
-
-        assert_eq!(queue.len(), 2, "transient jobs coalesce, exports do not");
-        assert!(matches!(
-            queue.front(),
-            Some(Job::ExportPart { request_id: 7, .. })
-        ));
-        assert!(matches!(queue.back(), Some(Job::Open { .. })));
     }
 
     #[cfg(unix)]
@@ -1079,11 +1316,12 @@ mod tests {
             "the refused install must leave the source alone"
         );
 
-        // With the path free, the install succeeds and consumes the source.
+        // The source remains owned by its temporary-file guard in production.
         std::fs::remove_file(&target).expect("clear target");
         super::install_without_replacing(&source, &target).expect("a free path installs");
         assert_eq!(std::fs::read(&target).expect("target readable"), b"new");
-        assert!(!source.exists(), "the source is moved onto the target");
+        assert!(source.exists(), "the temporary guard retains its source");
+        std::fs::remove_file(&source).expect("clean up source");
 
         std::fs::remove_file(&target).expect("clean up");
     }

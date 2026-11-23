@@ -57,15 +57,6 @@ impl LayoutSnapshot {
             && y >= rect.y
             && y < rect.y.saturating_add(rect.height)
     }
-
-    pub fn content_line(&self, scroll: u16, x: u16, y: u16) -> Option<(usize, usize)> {
-        Self::contains(self.content_inner, x, y).then(|| {
-            (
-                usize::from(y - self.content_inner.y) + usize::from(scroll),
-                usize::from(x - self.content_inner.x),
-            )
-        })
-    }
 }
 
 #[cfg(test)]
@@ -88,10 +79,10 @@ mod tests {
             layout.tree.y
         ));
         assert!(!LayoutSnapshot::contains(layout.tree, 99, 29));
-        assert!(
-            layout
-                .content_line(2, layout.content_inner.x, layout.content_inner.y)
-                .is_some()
-        );
+        assert!(LayoutSnapshot::contains(
+            layout.content_inner,
+            layout.content_inner.x,
+            layout.content_inner.y
+        ));
     }
 }

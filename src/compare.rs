@@ -9,6 +9,7 @@ use std::{
     collections::BTreeMap,
     fmt::{self, Write as _},
     io::{self, Read, Seek},
+    time::Duration,
 };
 
 use quick_xml::{
@@ -17,6 +18,7 @@ use quick_xml::{
 };
 
 use crate::{
+    cancel::Cancel,
     package::{Diagnostic, MAX_ENTRY_BYTES, PackageIndex, PartInfo, PartKind},
     preview::{MAX_XML_PREVIEW_BYTES, Preview, PreviewKind},
 };
@@ -24,6 +26,7 @@ use crate::{
 /// Unified diff output is bounded so an extreme pair of parts cannot balloon
 /// the content pane.
 pub const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
+const DIFF_TIMEOUT: Duration = Duration::from_millis(500);
 /// Canonical indentation stops growing past this depth, so deeply nested XML
 /// cannot amplify a small part into a huge comparison string.
 const MAX_INDENT_DEPTH: usize = 32;
@@ -111,9 +114,13 @@ pub fn compare<R: Read + Seek, S: Read + Seek>(
     archive_a: &mut zip::ZipArchive<R>,
     index_b: &PackageIndex,
     archive_b: &mut zip::ZipArchive<S>,
+    cancel: &Cancel,
 ) -> Comparison {
     let mut comparison = Comparison::default();
     for (path, part_b) in &index_b.parts {
+        if cancel.is_cancelled() {
+            return comparison;
+        }
         if part_b.kind == PartKind::Directory {
             continue;
         }
@@ -132,6 +139,9 @@ pub fn compare<R: Read + Seek, S: Read + Seek>(
         comparison.record(path, status);
     }
     for (path, part_a) in &index_a.parts {
+        if cancel.is_cancelled() {
+            return comparison;
+        }
         if part_a.kind == PartKind::Directory
             || index_b
                 .parts
@@ -198,6 +208,7 @@ pub fn diff_part<R: Read + Seek, S: Read + Seek>(
     index_b: &PackageIndex,
     archive_b: &mut zip::ZipArchive<S>,
     path: &str,
+    cancel: &Cancel,
 ) -> io::Result<Preview> {
     let part_a = file_part(index_a, path);
     let part_b = file_part(index_b, path);
@@ -235,6 +246,7 @@ pub fn diff_part<R: Read + Seek, S: Read + Seek>(
     if old == new {
         return Ok(no_differences(path));
     }
+    cancel.check()?;
     let text = unified_diff(&old, &new, &label(index_a), &label(index_b), path);
     Ok(Preview::Editor {
         kind: PreviewKind::Diff,
@@ -302,7 +314,9 @@ fn unified_diff(old: &str, new: &str, label_a: &str, label_b: &str, path: &str) 
     }
     let mut output = BoundedText::new(MAX_DIFF_BYTES);
     let (a, b) = (format!("{label_a}: {path}"), format!("{label_b}: {path}"));
-    let diff = similar::TextDiff::from_lines(old, new);
+    let mut config = similar::TextDiff::configure();
+    config.timeout(DIFF_TIMEOUT);
+    let diff = config.diff_lines(old, new);
     let _ = write!(
         output,
         "{}",
@@ -611,7 +625,13 @@ mod tests {
         let index_a = PackageIndex::from_archive(&mut archive_a)?;
         let index_b = PackageIndex::from_archive(&mut archive_b)?;
 
-        let comparison = compare(&index_a, &mut archive_a, &index_b, &mut archive_b);
+        let comparison = compare(
+            &index_a,
+            &mut archive_a,
+            &index_b,
+            &mut archive_b,
+            &Cancel::never(),
+        );
         assert_eq!(comparison.status_of("/foo"), Some(PartStatus::Removed));
         assert_eq!(
             comparison.status_of("/foo/child.xml"),
@@ -661,7 +681,13 @@ mod tests {
         let index_a = PackageIndex::from_archive(&mut archive_a)?;
         let index_b = PackageIndex::from_archive(&mut archive_b)?;
 
-        let comparison = compare(&index_a, &mut archive_a, &index_b, &mut archive_b);
+        let comparison = compare(
+            &index_a,
+            &mut archive_a,
+            &index_b,
+            &mut archive_b,
+            &Cancel::never(),
+        );
         assert_eq!(comparison.status_of("/bad.xml"), Some(PartStatus::Changed));
         assert_eq!(comparison.diagnostics.len(), 1);
         Ok(())

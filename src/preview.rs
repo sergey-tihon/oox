@@ -207,11 +207,13 @@ pub(crate) fn build_preview(
 
 /// Format XML for display and for editing.
 ///
-/// The formatter may only add whitespace between two tags. Everything else is
-/// written back exactly as it appeared, because the result is what gets saved
-/// into the package: an entity reference moved onto its own line, or a line
-/// break inserted into `<w:t></w:t>`, silently changes element text.
+/// Whitespace is added only inside elements whose content has no character
+/// data, and never inside an `xml:space="preserve"` subtree. Everything else is
+/// written back exactly as it appeared, because the result is what gets saved.
 pub fn pretty_print_xml(xml: &str) -> io::Result<String> {
+    let verbatim = verbatim_elements(xml)?;
+    let mut next_start = 0usize;
+    let mut context: Vec<bool> = Vec::new();
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
 
@@ -232,6 +234,7 @@ pub fn pretty_print_xml(xml: &str) -> io::Result<String> {
             Ok(event) => event,
             Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
         };
+        let inside = context.last().copied().unwrap_or(false);
         match event {
             // An entity reference is text. The writer treats it as markup and
             // would break the line before it when it starts an element.
@@ -239,8 +242,19 @@ pub fn pretty_print_xml(xml: &str) -> io::Result<String> {
                 write_xml_text(&mut writer, &format!("&{};", reference.into_inner()))?;
                 open_tag = false;
             }
+            Event::Start(start) => {
+                if inside {
+                    write_xml_text(&mut writer, "")?;
+                }
+                context.push(inside || verbatim[next_start]);
+                next_start += 1;
+                open_tag = true;
+                writer
+                    .write_event(Event::Start(start))
+                    .map_err(io::Error::other)?;
+            }
             Event::End(end) => {
-                if open_tag {
+                if open_tag || context.last() == Some(&true) {
                     // An empty text event writes nothing but tells the writer not
                     // to break the line before this end tag.
                     write_xml_text(&mut writer, "")?;
@@ -249,8 +263,18 @@ pub fn pretty_print_xml(xml: &str) -> io::Result<String> {
                     .write_event(Event::End(end))
                     .map_err(io::Error::other)?;
                 open_tag = false;
+                context.pop();
+            }
+            Event::Text(text) => {
+                writer
+                    .write_event(Event::Text(text))
+                    .map_err(io::Error::other)?;
+                open_tag = false;
             }
             event => {
+                if inside {
+                    write_xml_text(&mut writer, "")?;
+                }
                 open_tag = matches!(event, Event::Start(_));
                 writer.write_event(event).map_err(io::Error::other)?;
             }
@@ -259,6 +283,55 @@ pub fn pretty_print_xml(xml: &str) -> io::Result<String> {
     }
 
     output.into_string()
+}
+
+fn verbatim_elements(xml: &str) -> io::Result<Vec<bool>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut flags = Vec::new();
+    let mut stack = Vec::new();
+    let mut buffer = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Eof) => return Ok(flags),
+            Ok(Event::Start(start)) => {
+                let preserve = start
+                    .try_get_attribute("xml:space")
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                    .is_some_and(|attribute| {
+                        attribute
+                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                            .is_ok_and(|value| value == "preserve")
+                    });
+                let ordinal = flags.len();
+                flags.push(preserve);
+                stack.push(ordinal);
+            }
+            Ok(Event::End(_)) => {
+                stack.pop();
+            }
+            Ok(Event::Text(text))
+                if text
+                    .as_ref()
+                    .as_bytes()
+                    .iter()
+                    .any(|byte| !matches!(*byte, b' ' | 0x09 | 0x0d | 0x0a)) =>
+            {
+                if let Some(&parent) = stack.last() {
+                    flags[parent] = true;
+                }
+            }
+            Ok(Event::GeneralRef(_) | Event::CData(_)) => {
+                if let Some(&parent) = stack.last() {
+                    flags[parent] = true;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        }
+        buffer.clear();
+    }
 }
 
 /// Write already-escaped text as an element text event.
@@ -498,6 +571,44 @@ mod tests {
         let source = r#"<?xml version="1.0" encoding="UTF-8"?><p:sld xmlns:p="p"><p:sp><a:p><a:r><a:t>Hi</a:t></a:r></a:p></p:sp></p:sld>"#;
         let once = pretty_print_xml(source).unwrap();
         assert_eq!(once, pretty_print_xml(&once).unwrap());
+    }
+
+    #[test]
+    fn formatting_keeps_mixed_content_verbatim() {
+        for (source, expected) in [
+            ("<r><p>text<b/><c/></p></r>", "<p>text<b/><c/></p>"),
+            ("<r><p>a<b><i/></b></p></r>", "<p>a<b><i/></b></p>"),
+            (
+                "<r><p>a<!--c--><?pi x?><b/></p></r>",
+                "<p>a<!--c--><?pi x?><b/></p>",
+            ),
+        ] {
+            let formatted = pretty_print_xml(source).unwrap();
+            assert!(formatted.contains(expected), "{formatted}");
+        }
+    }
+
+    #[test]
+    fn formatting_respects_xml_space_preserve() {
+        let formatted = pretty_print_xml(r#"<r><t xml:space="preserve"><x/><y/></t></r>"#).unwrap();
+        assert!(
+            formatted.contains(r#"<t xml:space="preserve"><x/><y/></t>"#),
+            "{formatted}"
+        );
+        let escaped =
+            pretty_print_xml(r#"<r><t xml:space="pres&#x65;rve"><x/><y/></t></r>"#).unwrap();
+        assert!(
+            escaped.contains(r#"<t xml:space="pres&#x65;rve"><x/><y/></t>"#),
+            "{escaped}"
+        );
+    }
+
+    #[test]
+    fn formatting_still_indents_element_only_content() {
+        assert_eq!(
+            pretty_print_xml("<r><a/><b/></r>").unwrap(),
+            "<r>\n  <a/>\n  <b/>\n</r>"
+        );
     }
 
     #[test]

@@ -163,6 +163,43 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> io::Result<Option<std::pa
     Ok(path.is_file().then_some(path))
 }
 
+fn editor_mode(config: &crossterm_keybind::toml::Table) -> io::Result<EditorMode> {
+    let Some(editor) = config.get("editor") else {
+        return EditorMode::from_config(None);
+    };
+    let editor = editor
+        .as_table()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "editor must be a table"))?;
+    let mode = editor
+        .get("mode")
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "editor.mode must be a string; expected 'vim' or 'emacs'",
+                )
+            })
+        })
+        .transpose()?;
+    EditorMode::from_config(mode)
+}
+
+fn binding_conflict(key: &str, actions: &[Action]) -> Option<io::Error> {
+    if actions.len() <= 1
+        || (actions.len() == 2
+            && actions.contains(&Action::OpenContent)
+            && actions.contains(&Action::Confirm))
+    {
+        return None;
+    }
+    let first = actions.first()?;
+    let second = actions.get(1)?;
+    Some(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("key \"{key}\" is bound to both {first:?} and {second:?}"),
+    ))
+}
+
 pub fn load(path: Option<&Path>) -> io::Result<EditorMode> {
     let Some(path) = path else {
         Action::init_and_load(None::<crossterm_keybind::toml::Value>).map_err(io::Error::other)?;
@@ -172,17 +209,36 @@ pub fn load(path: Option<&Path>) -> io::Result<EditorMode> {
     let text = fs::read_to_string(path)?;
     let mut config: crossterm_keybind::toml::Table =
         crossterm_keybind::toml::from_str(&text).map_err(io::Error::other)?;
-    let editor_mode = config
-        .get("editor")
-        .and_then(crossterm_keybind::toml::Value::as_table)
-        .and_then(|editor| editor.get("mode"))
-        .and_then(crossterm_keybind::toml::Value::as_str);
-    let mode = EditorMode::from_config(editor_mode)?;
+    let mode = editor_mode(&config)?;
     let keybindings = config.remove("keybindings").unwrap_or_else(|| {
         crossterm_keybind::toml::Value::Table(crossterm_keybind::toml::Table::new())
     });
+    let mut configured_bindings = Vec::new();
+    if let crossterm_keybind::toml::Value::Table(table) = &keybindings {
+        for value in table.values() {
+            if let Some(values) = value.as_array() {
+                configured_bindings.extend(
+                    values
+                        .iter()
+                        .filter_map(crossterm_keybind::toml::Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+        }
+    }
 
     Action::init_and_load(Some(keybindings)).map_err(io::Error::other)?;
+    for key in configured_bindings {
+        let binding: Result<crossterm_keybind::KeyBinding, _> =
+            crossterm_keybind::toml::Value::String(key.clone()).try_into();
+        let Ok(binding) = binding else {
+            continue;
+        };
+        let event = KeyEvent::new(binding.code, binding.modifiers);
+        if let Some(error) = binding_conflict(&key, &Action::dispatch(&event)) {
+            return Err(error);
+        }
+    }
     Ok(mode)
 }
 
@@ -382,11 +438,34 @@ pub fn generate(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, emacs_editor_owns};
+    use super::{Action, binding_conflict, editor_mode, emacs_editor_owns};
     use crossterm_keybind::{
         KeyBindTrait,
         event::{KeyCode, KeyEvent, KeyModifiers},
     };
+
+    #[test]
+    fn binding_conflict_reports_key_and_actions() {
+        let error = binding_conflict("x", &[Action::ExtractPart, Action::OpenPartExternally])
+            .expect("overlapping actions should be rejected");
+        assert_eq!(
+            error.to_string(),
+            "key \"x\" is bound to both ExtractPart and OpenPartExternally"
+        );
+        assert!(binding_conflict("Enter", &[Action::OpenContent, Action::Confirm]).is_none());
+    }
+
+    #[test]
+    fn malformed_editor_mode_is_rejected() {
+        let config: crossterm_keybind::toml::Table =
+            crossterm_keybind::toml::from_str("[editor]\nmode = 3").unwrap();
+        let error = editor_mode(&config).expect_err("numeric editor mode must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "editor.mode must be a string; expected 'vim' or 'emacs'"
+        );
+    }
 
     /// The bindings are a process-wide table that is filled exactly once, as at
     /// startup; a second `init_and_load` would drop the default aliases.

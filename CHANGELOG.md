@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Preserve mixed-content XML when formatting editable parts, and retain filtered tree labels after edits.
+- Ignore mouse motion for focus changes, clamp metadata-link navigation, and restore the terminal after panics.
+- Bound external-editor reads, tolerate unreadable content-search parts, and report successful no-clobber saves correctly.
+- Require a known OPC `officeDocument` relationship type.
+- Keep directory paths grouped in package trees, summary links aligned across embedded newlines, and cancel content searches when cleared or dismissed.
+- Ignore embedded ZIP records during archive preflight and activate the metadata link highlighted after selection changes.
+- Discover Word, Excel, and PowerPoint summaries and Excel shared strings through OPC relationships and content types.
+- Bound central-directory checks, diff computation, and summary parsing; narrow live path filtering without lowercasing every part.
+- Reject malformed editor modes and conflicting keybindings, and hit-test metadata links using rendered scroll and terminal display cells.
+- Coalesce superseded package, preview, and content-search work to keep rapid navigation responsive.
+
 ## [0.2.2] - 2026-11-22
 
 ### Fixed
