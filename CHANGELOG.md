@@ -6,8 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Report OSC 7577 resume commands for the open file and optional comparison/config in supporting terminals.
+
 ### Fixed
 
+- Fall back to the running executable path when oox is launched by an explicit path or build tool.
 - Preserve mixed-content XML when formatting editable parts, and retain filtered tree labels after edits.
 - Ignore mouse motion for focus changes, clamp metadata-link navigation, and restore the terminal after panics.
 - Bound external-editor reads, tolerate unreadable content-search parts, and report successful no-clobber saves correctly.
