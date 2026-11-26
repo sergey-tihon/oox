@@ -2,6 +2,7 @@
 //! See <https://www.superlogical.com/rex/docs/build/program-resume>.
 
 use std::{
+    ffi::OsStr,
     io::{self, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -12,7 +13,7 @@ use sha2::{Digest, Sha256};
 const TOKEN_ENV: &str = "OSC7577_TOKEN";
 const MAX_SEQUENCE_BYTES: usize = 2048;
 const MAX_ARGV_ELEMENTS: usize = 64;
-/// Bare name looked up on PATH at resume time, as the spec prefers; survives reinstalls.
+/// Preferred when the app was invoked by this bare PATH command.
 const PROGRAM: &str = "oox";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,9 +122,25 @@ fn absolute_utf8(path: &Path) -> Option<String> {
         .ok()
 }
 
+fn resume_program_for(invoked_as: &OsStr, executable: &Path) -> Option<String> {
+    if invoked_as == OsStr::new(PROGRAM) {
+        Some(PROGRAM.to_owned())
+    } else {
+        absolute_utf8(executable)
+    }
+}
+
+fn resume_program() -> Option<String> {
+    let invoked_as = std::env::args_os().next()?;
+    let executable = std::env::current_exe().ok()?;
+    resume_program_for(&invoked_as, &executable)
+}
+
 /// Holds the token and what the terminal currently has from this process.
 pub struct Reporter {
     token: String,
+    /// Bare for PATH launches; absolute for explicit or build-tool launches.
+    program: Option<String>,
     /// `--config` exactly as given on the command line; absolutized when a command is built.
     config: Option<PathBuf>,
     /// oox never changes directory, so the startup cwd is the resume cwd.
@@ -138,6 +155,7 @@ impl Reporter {
     pub fn new(token: String, config: Option<&Path>) -> Self {
         Self {
             token,
+            program: resume_program(),
             config: config.map(Path::to_path_buf),
             cwd: std::env::current_dir()
                 .ok()
@@ -168,7 +186,7 @@ impl Reporter {
         self.source = Some((file_path.to_owned(), compare_path.map(Path::to_path_buf)));
 
         let command = (|| {
-            let mut argv = vec![PROGRAM.to_owned()];
+            let mut argv = vec![self.program.clone()?];
             if let Some(config) = &self.config {
                 argv.push("--config".to_owned());
                 argv.push(absolute_utf8(config)?);
@@ -236,6 +254,19 @@ mod tests {
     }
 
     #[test]
+    fn selects_bare_or_absolute_resume_program() {
+        let executable = std::env::current_exe().expect("current executable");
+        assert_eq!(
+            resume_program_for(OsStr::new(PROGRAM), &executable).as_deref(),
+            Some(PROGRAM)
+        );
+        assert_eq!(
+            resume_program_for(OsStr::new("./target/debug/oox"), &executable),
+            absolute_utf8(&executable)
+        );
+    }
+
+    #[test]
     fn formats_spec_vectors() {
         assert_eq!(
             format_report(
@@ -256,6 +287,7 @@ mod tests {
                 "\x1b]7577;pid=74877:time=1795543200:argv=bnZpbQ==,LVM=,L2hvbWUvdXNlci8ubG9jYWwvc3RhdGUvbnZpbS9zZXNzaW9ucy84ZjJjMWQudmlt:mac=9dbb99bfb856749a87563839d7ce9062818d78cf25909db93f309e0cd3b1909b\x1b\\"
             )
         );
+        #[cfg(unix)]
         assert_eq!(
             format_report(
                 &command(&["lazygit"], Some("/home/user/src/project")),
@@ -332,6 +364,7 @@ mod tests {
     fn reporter_syncs_changed_commands_and_clears() {
         let before = unix_time().expect("system time");
         let mut reporter = Reporter::new("test-token-0123456789abcdef".to_owned(), None);
+        reporter.program = Some(PROGRAM.to_owned());
         let mut output = Vec::new();
 
         reporter.sync("/tmp/a.pptx", None, &mut output).unwrap();
@@ -377,6 +410,7 @@ mod tests {
             "test-token-0123456789abcdef".to_owned(),
             Some(Path::new("/tmp/oox.toml")),
         );
+        configured.program = Some(PROGRAM.to_owned());
         let mut config_output = Vec::new();
         configured
             .sync(
@@ -409,6 +443,7 @@ mod tests {
         );
 
         let mut clear_reporter = Reporter::new("test-token-0123456789abcdef".to_owned(), None);
+        clear_reporter.program = Some(PROGRAM.to_owned());
         let mut clear_output = Vec::new();
         clear_reporter.clear(&mut clear_output).unwrap();
         assert!(clear_output.is_empty());
@@ -428,6 +463,7 @@ mod tests {
         assert_eq!(clear_output.len(), clear_len);
 
         let mut unreportable = Reporter::new("test-token-0123456789abcdef".to_owned(), None);
+        unreportable.program = Some(PROGRAM.to_owned());
         let mut invalid_output = Vec::new();
         unreportable
             .sync("/tmp/line\nbreak.pptx", None, &mut invalid_output)
