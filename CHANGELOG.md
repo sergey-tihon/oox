@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Report OSC 7577 resume commands for the open file and optional comparison/config in supporting terminals.
+
 ### Fixed
 
 - Preserve mixed-content XML when formatting editable parts, and retain filtered tree labels after edits.

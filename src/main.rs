@@ -32,6 +32,7 @@ mod keybindings;
 mod layout;
 mod package;
 mod preview;
+mod resume;
 mod summary;
 mod ui;
 mod worker;
@@ -70,6 +71,7 @@ fn install_panic_hook() {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let resume_token = resume::take_token();
     let cli = Cli::parse();
     if cli.generate_config {
         let path = match cli.config.as_deref() {
@@ -113,12 +115,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         keybindings::EditorMode::Emacs => EditorEventHandler::emacs_mode(),
     };
     let mut terminal_guard = TerminalGuard { terminal };
+    let mut resume = resume_token.map(|token| resume::Reporter::new(token, cli.config.as_deref()));
     run_app(
         &mut terminal_guard.terminal,
         &mut app,
         &mut editor_handler,
         editor_mode,
+        &mut resume,
     )?;
+    if let Some(resume) = resume.as_mut() {
+        resume.clear(terminal_guard.terminal.backend_mut())?;
+    }
     Ok(())
 }
 
@@ -522,12 +529,30 @@ fn is_noop_event(event: &Event) -> bool {
         || matches!(event, Event::Key(key) if key.kind == event::KeyEventKind::Release)
 }
 
+/// Tell a terminal that supports OSC 7577 how to reopen what is open now.
+fn sync_resume(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    app: &App,
+    resume: &mut Option<resume::Reporter>,
+) -> io::Result<()> {
+    match resume {
+        Some(resume) => resume.sync(
+            &app.file_path,
+            app.compare_path.as_deref(),
+            terminal.backend_mut(),
+        ),
+        None => Ok(()),
+    }
+}
+
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
     app: &mut App,
     editor_handler: &mut EditorEventHandler,
     editor_mode: keybindings::EditorMode,
+    resume: &mut Option<resume::Reporter>,
 ) -> io::Result<()> {
+    sync_resume(terminal, app, resume)?;
     // Redraw-on-change: render once, then again only when the worker reports new
     // state or a terminal event arrives. Idle polling no longer repaints at 20 fps.
     let mut redraw = true;
@@ -535,6 +560,7 @@ fn run_app(
     loop {
         if app.poll_worker() {
             redraw = true;
+            sync_resume(terminal, app, resume)?;
         }
         ensure_emacs_insert_mode(&mut app.editor.state, editor_mode);
         // The requested part has to be on screen before the editor can take over.
