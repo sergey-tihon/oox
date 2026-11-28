@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed
+
+- Remove the Repo Assist GitHub Agentic Workflow and its generated lock files.
+
 ### Added
 
 - Report OSC 7577 resume commands for the open file and optional comparison/config in supporting terminals.
